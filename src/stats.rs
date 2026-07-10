@@ -76,11 +76,7 @@ impl Tool {
     }
 
     fn avg_ms(&self) -> u64 {
-        if self.calls == 0 {
-            0
-        } else {
-            self.total_ms / self.calls
-        }
+        self.total_ms.checked_div(self.calls).unwrap_or(0)
     }
 }
 
@@ -368,11 +364,7 @@ pub struct ToolStat {
 #[cfg(feature = "dashboard")]
 impl ToolStat {
     pub fn avg_ms(&self) -> u64 {
-        if self.calls == 0 {
-            0
-        } else {
-            self.total_ms / self.calls
-        }
+        self.total_ms.checked_div(self.calls).unwrap_or(0)
     }
 }
 
@@ -618,10 +610,7 @@ mod tests {
             "truncated"
         );
         assert_eq!(classify_outcome(&Ok("no hits\n".into()), 10), "low_yield");
-        assert_eq!(
-            classify_outcome(&Ok("big answer".repeat(100).into()), 500),
-            "ok"
-        );
+        assert_eq!(classify_outcome(&Ok("big answer".repeat(100)), 500), "ok");
     }
 
     #[test]

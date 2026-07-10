@@ -721,7 +721,7 @@ fn main() {
                                   "description": "Append improvement-signals section. Default true." }
                 }
             }),
-            handler: Box::new(move |args| stats::report(args)),
+            handler: Box::new(stats::report),
         },
         mcp::Tool {
             name: "mas_post",

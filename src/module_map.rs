@@ -71,18 +71,18 @@ pub fn build(root: &Path, args: &Value) -> Result<String, String> {
     let filtered = filter_cross(&cross, min_edge);
     let visible = visible_modules(&focus, &sym_count, &filtered);
 
-    let out = render(
-        &paths,
+    let out = render(&RenderCtx {
+        paths: &paths,
         depth,
-        &sym_count,
-        &filtered,
-        &edge_samples,
-        &visible,
-        &focus,
+        sym_count: &sym_count,
+        cross: &filtered,
+        edge_samples: &edge_samples,
+        visible: &visible,
+        focus: &focus,
         sample_cap,
         max,
         budget,
-    );
+    });
     stats::record("module_map", adj.scanned_bytes / 4, (out.len() / 4) as u64);
     Ok(out)
 }
@@ -129,7 +129,7 @@ fn visible_modules(
             vis.insert(m.clone());
         }
     }
-    for ((from, to), _) in cross {
+    for (from, to) in cross.keys() {
         if from.starts_with(focus) || to.starts_with(focus) {
             vis.insert(from.clone());
             vis.insert(to.clone());
@@ -183,18 +183,30 @@ fn format_samples(samples: &[(String, String)], cap: usize) -> String {
         .join(", ")
 }
 
-fn render(
-    paths: &[String],
+struct RenderCtx<'a> {
+    paths: &'a [String],
     depth: Option<usize>,
-    sym_count: &BTreeMap<String, usize>,
-    cross: &BTreeMap<(String, String), usize>,
-    edge_samples: &BTreeMap<(String, String), Vec<(String, String)>>,
-    visible: &BTreeSet<String>,
-    focus: &str,
+    sym_count: &'a BTreeMap<String, usize>,
+    cross: &'a BTreeMap<(String, String), usize>,
+    edge_samples: &'a BTreeMap<(String, String), Vec<(String, String)>>,
+    visible: &'a BTreeSet<String>,
+    focus: &'a str,
     sample_cap: usize,
     max: usize,
     budget: usize,
-) -> String {
+}
+
+fn render(ctx: &RenderCtx<'_>) -> String {
+    let paths = ctx.paths;
+    let depth = ctx.depth;
+    let sym_count = ctx.sym_count;
+    let cross = ctx.cross;
+    let edge_samples = ctx.edge_samples;
+    let visible = ctx.visible;
+    let focus = ctx.focus;
+    let sample_cap = ctx.sample_cap;
+    let max = ctx.max;
+    let budget = ctx.budget;
     let depth_note = depth
         .map(|d| format!("depth {d}"))
         .unwrap_or_else(|| "full dir".to_string());
@@ -227,19 +239,18 @@ fn render(
         total_b.cmp(&total_a).then_with(|| a.0.cmp(b.0))
     });
 
-    let mut shown = 0usize;
-    for (mod_name, count) in modules {
-        if shown >= max {
+    for (idx, (mod_name, count)) in modules.into_iter().enumerate() {
+        if idx >= max {
             out.push_str(&format!(
                 "… (+{} more modules; raise \"max\")\n",
-                mod_count - shown
+                mod_count - idx
             ));
             break;
         }
         let out_n = edge_sum(by_from.get(mod_name));
         let in_n = edge_sum(by_to.get(mod_name));
         let block = format!("{mod_name}/  ({count} symbols, {out_n} out / {in_n} in)\n");
-        if out.len() / 4 + block.len() / 4 > budget && shown > 0 {
+        if out.len() / 4 + block.len() / 4 > budget && idx > 0 {
             out.push_str("… (truncated by token_budget)\n");
             break;
         }
@@ -299,7 +310,6 @@ fn render(
         }
 
         out.push('\n');
-        shown += 1;
     }
     out
 }

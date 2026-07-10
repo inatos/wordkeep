@@ -255,10 +255,9 @@ fn render(paths: &[String], stale_days: u64, items: &[Item], max: usize, budget:
         out.push_str("(no unused symbols in scope)\n");
         return out;
     }
-    let mut shown = 0usize;
-    for it in items {
-        if shown >= max {
-            out.push_str(&format!("… (+{} more; raise \"max\")\n", total - shown));
+    for (idx, it) in items.iter().enumerate() {
+        if idx >= max {
+            out.push_str(&format!("… (+{} more; raise \"max\")\n", total - idx));
             break;
         }
         let tags = caveat_tags(
@@ -277,12 +276,11 @@ fn render(paths: &[String], stale_days: u64, items: &[Item], max: usize, budget:
             sig,
             tags
         );
-        if out.len() / 4 + line.len() / 4 > budget && shown > 0 {
+        if out.len() / 4 + line.len() / 4 > budget && idx > 0 {
             out.push_str("… (truncated by token_budget)\n");
             break;
         }
         out.push_str(&line);
-        shown += 1;
     }
     out
 }
@@ -329,7 +327,7 @@ mod tests {
 
     #[test]
     fn confidence_sort_stale_clean_first() {
-        let mut items = vec![
+        let mut items = [
             Item {
                 rel: "a.cpp".into(),
                 kind: DefKind::Function,

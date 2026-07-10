@@ -312,9 +312,8 @@ fn render(ty: &str, l: &Layout, budget: usize) -> String {
         out.push_str("  (none)\n");
     }
     let mut used = out.len() / 4;
-    let mut shown = 0usize;
     let mut non_pod = 0usize;
-    for f in &l.fields {
+    for (idx, f) in l.fields.iter().enumerate() {
         if f.non_pod.is_some() {
             non_pod += 1;
         }
@@ -323,15 +322,14 @@ fn render(ty: &str, l: &Layout, budget: usize) -> String {
             None => format!("  {:<30} {}\n", f.ty, f.name),
         };
         let lt = row.len() / 4;
-        if used + lt > budget && shown > 0 {
+        if used + lt > budget && idx > 0 {
             out.push_str(&format!(
                 "  … (+{} more; raise token_budget)\n",
-                l.fields.len() - shown
+                l.fields.len() - idx
             ));
             break;
         }
         used += lt;
-        shown += 1;
         out.push_str(&row);
     }
 

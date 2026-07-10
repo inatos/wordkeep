@@ -491,7 +491,7 @@ pub fn read(_root: &Path, args: &Value) -> Result<String, String> {
     if let Some(sid) = since_id {
         filtered.retain(|e| e.id > sid);
     }
-    filtered.sort_by(|a, b| b.id.cmp(&a.id));
+    filtered.sort_by_key(|e| std::cmp::Reverse(e.id));
 
     let distilled: u64 = s
         .entries

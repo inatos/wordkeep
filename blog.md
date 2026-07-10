@@ -34,6 +34,26 @@ the extractor.
 That mindset matches how I work on performance-sensitive code: measure the hot
 path, cache what does not change, and prefer exact parsers over guessing.
 
+### Measured results (anonymized, July 2026)
+
+I ran wordkeep as the first MCP server in a large private polyglot codebase
+(C++, Rust, Python, GLSL, docs) for **29 days** and **627 tool calls**. Figures
+below use wordkeep's built-in heuristic: **about four characters per token**.
+They are estimates, not billing numbers.
+
+| Metric | Value |
+| --- | --- |
+| Distilled (est.) | 240,170,437 tokens |
+| Returned (est.) | 314,693 tokens |
+| Estimated reduction | ~99.9% |
+
+Top tools by estimated tokens saved: `symbol_context`, `symbol_refs`,
+`knowledge_search`, `diff_map`, `repo_map`.
+
+**Caveats:** token counts are heuristic; truncation and tool errors can skew
+per-call ratios; your tree size and agent habits will differ. Run `stats` on
+your own repo for a week before trusting any aggregate.
+
 ## What it helps with
 
 **Call graph before a signature change.** `call_graph` gives one hop of callers

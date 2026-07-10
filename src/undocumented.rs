@@ -109,10 +109,9 @@ fn render(paths: &[String], items: &[Item], max: usize, budget: usize) -> String
         out.push_str("(every function/record in scope has a leading doc comment)\n");
         return out;
     }
-    let mut shown = 0usize;
-    for it in items {
-        if shown >= max {
-            out.push_str(&format!("… (+{} more; raise \"max\")\n", total - shown));
+    for (idx, it) in items.iter().enumerate() {
+        if idx >= max {
+            out.push_str(&format!("… (+{} more; raise \"max\")\n", total - idx));
             break;
         }
         let sig = squeeze(&it.signature, 100);
@@ -124,12 +123,11 @@ fn render(paths: &[String], items: &[Item], max: usize, budget: usize) -> String
             it.kind.label(),
             sig
         );
-        if out.len() / 4 + line.len() / 4 > budget && shown > 0 {
+        if out.len() / 4 + line.len() / 4 > budget && idx > 0 {
             out.push_str("… (truncated by token_budget)\n");
             break;
         }
         out.push_str(&line);
-        shown += 1;
     }
     out
 }

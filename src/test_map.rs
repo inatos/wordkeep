@@ -79,12 +79,11 @@ pub fn build(root: &Path, args: &Value) -> Result<String, String> {
         filtered.len()
     ));
     let mut used = out.len() / 4;
-    let mut shown = 0usize;
-    for fr in &filtered {
-        if shown >= max {
+    for (idx, fr) in filtered.iter().enumerate() {
+        if idx >= max {
             out.push_str(&format!(
                 "  … (+{} more; raise \"max\")\n",
-                filtered.len() - shown
+                filtered.len() - idx
             ));
             break;
         }
@@ -100,15 +99,14 @@ pub fn build(root: &Path, args: &Value) -> Result<String, String> {
             fr.rel, fr.defs, fr.calls, fr.refs
         );
         let lt = row.len() / 4;
-        if used + lt > budget && shown > 0 {
+        if used + lt > budget && idx > 0 {
             out.push_str(&format!(
                 "  … (+{} more; raise token_budget)\n",
-                filtered.len() - shown
+                filtered.len() - idx
             ));
             break;
         }
         used += lt;
-        shown += 1;
         out.push_str(&row);
     }
 

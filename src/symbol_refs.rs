@@ -32,10 +32,12 @@ const NAME_KINDS_CPP: [&str; 5] = [
     "qualified_identifier",
 ];
 
+type OccCacheMap = HashMap<String, (u64, Vec<Occ>)>;
+
 /// Process-lifetime memo: absolute path → (mtime_ns, all occurrences). The
 /// occurrence list is large but ephemeral, so it lives in memory only (unlike
 /// `call_graph`, whose distilled edges are small enough to persist on disk).
-static OCC_CACHE: OnceLock<Mutex<HashMap<String, (u64, Vec<Occ>)>>> = OnceLock::new();
+static OCC_CACHE: OnceLock<Mutex<OccCacheMap>> = OnceLock::new();
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Role {

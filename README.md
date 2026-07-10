@@ -132,6 +132,10 @@ Every tool records **distilled** (estimated tokens to read raw material) vs
 **returned** (what it actually emitted). Call `stats` to inspect savings.
 Figures use a ~4 characters per token heuristic.
 
+In a 29-day trial on a large private polyglot codebase (627 calls), wordkeep
+estimated **240M distilled vs 315K returned** (~99.9% reduction). Methodology and
+caveats: [blog.md](blog.md#measured-results-anonymized-july-2026).
+
 ## Docs map
 
 - [docs/getting-started.md](docs/getting-started.md) - first run and MCP wiring

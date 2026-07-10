@@ -59,7 +59,7 @@ pub fn is_pruned(entry: &DirEntry, prune: &HashSet<String>) -> bool {
         && entry
             .file_name()
             .to_str()
-            .map_or(false, |n| prune.contains(n))
+            .is_some_and(|n| prune.contains(n))
 }
 
 /// Walk `base`, yielding files only and skipping pruned directory subtrees.

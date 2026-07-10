@@ -58,7 +58,7 @@ pub fn build(root: &Path, args: &Value) -> Result<String, String> {
         .map(|p| p.to_string_lossy().replace('\\', "/"))
         .unwrap_or_else(|_| info.rel.clone());
 
-    let diff = match git_diff(root, &gitref, &[rel_top.clone()], context) {
+    let diff = match git_diff(root, &gitref, std::slice::from_ref(&rel_top), context) {
         Ok(d) => d,
         Err(msg) => {
             let out = format!("symbol_diff - {msg}");
@@ -88,31 +88,31 @@ pub fn build(root: &Path, args: &Value) -> Result<String, String> {
     if let (Some(lang), Some(old_src)) = (lang, git_show(root, &gitref, &rel_top)) {
         if let Some((old_sig, old_body)) = old_body_for_symbol(&old_src, lang, &info.name) {
             if body_only(&old_sig, &info.signature) {
-                let out = render_body_excerpt(
-                    &gitref,
-                    &info.name,
-                    &info.rel,
-                    info.line,
-                    info.end_line,
-                    &old_body,
-                    &info.body,
+                let out = render_body_excerpt(&BodyExcerpt {
+                    gitref: &gitref,
+                    name: &info.name,
+                    rel: &info.rel,
+                    start: info.line,
+                    end: info.end_line,
+                    old_body: &old_body,
+                    new_body: &info.body,
                     budget,
-                );
+                });
                 stats::record("symbol_diff", baseline / 4, (out.len() / 4) as u64);
                 return Ok(out);
             }
-            let out = render_signature_change(
-                &gitref,
-                &info.name,
-                &info.rel,
-                info.line,
-                info.end_line,
-                &old_sig,
-                &info.signature,
-                &matched,
-                show_body.then_some((&old_body, info.body.as_str())),
+            let out = render_signature_change(&SigChange {
+                gitref: &gitref,
+                name: &info.name,
+                rel: &info.rel,
+                start: info.line,
+                end: info.end_line,
+                old_sig: &old_sig,
+                new_sig: &info.signature,
+                hunks: &matched,
+                bodies: show_body.then_some((&old_body, info.body.as_str())),
                 budget,
-            );
+            });
             stats::record("symbol_diff", baseline / 4, (out.len() / 4) as u64);
             return Ok(out);
         }
@@ -201,52 +201,78 @@ fn hunk_new_range(line: &str) -> Option<(usize, usize)> {
     Some((start, count))
 }
 
-fn render_body_excerpt(
-    gitref: &str,
-    name: &str,
-    rel: &str,
+struct BodyExcerpt<'a> {
+    gitref: &'a str,
+    name: &'a str,
+    rel: &'a str,
     start: usize,
     end: usize,
-    old_body: &str,
-    new_body: &str,
+    old_body: &'a str,
+    new_body: &'a str,
     budget: usize,
-) -> String {
+}
+
+struct SigChange<'a> {
+    gitref: &'a str,
+    name: &'a str,
+    rel: &'a str,
+    start: usize,
+    end: usize,
+    old_sig: &'a str,
+    new_sig: &'a str,
+    hunks: &'a [&'a Hunk],
+    bodies: Option<(&'a str, &'a str)>,
+    budget: usize,
+}
+
+fn render_body_excerpt(excerpt: &BodyExcerpt<'_>) -> String {
+    let BodyExcerpt {
+        gitref,
+        name,
+        rel,
+        start,
+        end,
+        old_body,
+        new_body,
+        budget,
+    } = excerpt;
     let mut out =
         format!("symbol_diff - \"{name}\" at {rel}:{start}-{end}  (vs {gitref}, body-only)\n\n");
     out.push_str(&format!("--- old ({gitref}) ---\n"));
-    append_capped(&mut out, old_body, budget);
+    append_capped(&mut out, old_body, *budget);
     out.push('\n');
     out.push_str("+++ new (working) ---\n");
-    append_capped(&mut out, new_body, budget);
+    append_capped(&mut out, new_body, *budget);
     out
 }
 
-fn render_signature_change(
-    gitref: &str,
-    name: &str,
-    rel: &str,
-    start: usize,
-    end: usize,
-    old_sig: &str,
-    new_sig: &str,
-    hunks: &[&Hunk],
-    bodies: Option<(&str, &str)>,
-    budget: usize,
-) -> String {
+fn render_signature_change(change: &SigChange<'_>) -> String {
+    let SigChange {
+        gitref,
+        name,
+        rel,
+        start,
+        end,
+        old_sig,
+        new_sig,
+        hunks,
+        bodies,
+        budget,
+    } = change;
     let mut out = format!(
         "symbol_diff - \"{name}\" at {rel}:{start}-{end}  (vs {gitref}, signature changed)\n\n"
     );
     out.push_str("signature:\n");
     out.push_str(&format!("- {old_sig}\n"));
     out.push_str(&format!("+ {new_sig}\n\n"));
-    append_hunks(&mut out, hunks, budget);
+    append_hunks(&mut out, hunks, *budget);
     if let Some((old_body, new_body)) = bodies {
         out.push('\n');
         out.push_str(&format!("--- old body ({gitref}) ---\n"));
-        append_capped(&mut out, old_body, budget);
+        append_capped(&mut out, old_body, *budget);
         out.push('\n');
         out.push_str("+++ new body (working) ---\n");
-        append_capped(&mut out, new_body, budget);
+        append_capped(&mut out, new_body, *budget);
     }
     out
 }
@@ -324,18 +350,18 @@ mod tests {
             new_count: 2,
             lines: vec!["-old line".to_string(), "+new line".to_string()],
         };
-        let out = render_signature_change(
-            "HEAD",
-            "foo",
-            "src/a.cpp",
-            10,
-            15,
-            "void foo(int x)",
-            "void foo(int x, int y)",
-            &[&h],
-            Some(("old body", "new body")),
-            1200,
-        );
+        let out = render_signature_change(&SigChange {
+            gitref: "HEAD",
+            name: "foo",
+            rel: "src/a.cpp",
+            start: 10,
+            end: 15,
+            old_sig: "void foo(int x)",
+            new_sig: "void foo(int x, int y)",
+            hunks: &[&h],
+            bodies: Some(("old body", "new body")),
+            budget: 1200,
+        });
         assert!(out.contains("signature changed"));
         assert!(out.contains("- void foo(int x)"));
         assert!(out.contains("+ void foo(int x, int y)"));

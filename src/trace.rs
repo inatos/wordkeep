@@ -56,10 +56,10 @@ pub fn summary(root: &Path, args: &Value) -> Result<String, String> {
 
     let grand: f64 = rows.iter().map(|r| r.total_ns).sum();
     match sort_by.as_str() {
-        "mean" => rows.sort_by(|a, b| b.mean_ns.total_cmp(&a.mean_ns)),
-        "max" => rows.sort_by(|a, b| b.max_ns.total_cmp(&a.max_ns)),
-        "count" => rows.sort_by(|a, b| b.counts.cmp(&a.counts)),
-        _ => rows.sort_by(|a, b| b.total_ns.total_cmp(&a.total_ns)),
+        "mean" => rows.sort_by_key(|r| std::cmp::Reverse(r.mean_ns.to_bits())),
+        "max" => rows.sort_by_key(|r| std::cmp::Reverse(r.max_ns.to_bits())),
+        "count" => rows.sort_by_key(|r| std::cmp::Reverse(r.counts)),
+        _ => rows.sort_by_key(|r| std::cmp::Reverse(r.total_ns.to_bits())),
     }
 
     let rel = file

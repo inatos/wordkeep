@@ -65,20 +65,18 @@ pub fn build(root: &Path, args: &Value) -> Result<String, String> {
 
     let mut out = format!("outline - {rel}  ({total} symbol(s))\n\n");
     let mut used = out.len() / 4;
-    let mut shown = 0usize;
-    for (off, sym) in &located {
+    for (idx, (off, sym)) in located.iter().enumerate() {
         let line = line_of(&starts, *off);
         let row = format!("  {line:>5}  {sym}\n");
         let lt = row.len() / 4;
-        if used + lt > budget && shown > 0 {
+        if used + lt > budget && idx > 0 {
             out.push_str(&format!(
                 "  … (+{} more; raise token_budget)\n",
-                total - shown
+                total - idx
             ));
             break;
         }
         used += lt;
-        shown += 1;
         out.push_str(&row);
     }
 
