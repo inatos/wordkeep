@@ -42,7 +42,8 @@ jobs:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --release --locked --target ${{ matrix.target }}
-      - name: Package
+      - name: Package (tar.gz)
+        if: matrix.archive == 'tar.gz'
         shell: bash
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
@@ -50,12 +51,17 @@ jobs:
           mkdir -p "$STAGING"
           cp "target/${{ matrix.target }}/release/${{ matrix.bin }}" "$STAGING/"
           cp README.md LICENSE CHANGELOG.md "$STAGING/"
-          if [ "${{ matrix.archive }}" = "zip" ]; then
-            (cd "$STAGING/.." && zip -r "../${STAGING}.zip" "$(basename "$STAGING")")
-            mv "${STAGING}.zip" artifact.zip
-          else
-            tar -czf artifact.tar.gz -C "$(dirname "$STAGING")" "$(basename "$STAGING")"
-          fi
+          tar -czf artifact.tar.gz -C "$(dirname "$STAGING")" "$(basename "$STAGING")"
+      - name: Package (zip)
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          $version = "$env:GITHUB_REF_NAME".Substring(1)
+          $staging = "wordkeep-$version-${{ matrix.target }}"
+          New-Item -ItemType Directory -Force -Path $staging | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/${{ matrix.bin }}" $staging/
+          Copy-Item README.md, LICENSE, CHANGELOG.md $staging/
+          Compress-Archive -Path $staging -DestinationPath artifact.zip -Force
       - uses: actions/upload-artifact@v4
         with:
           name: wordkeep-${{ matrix.target }}
