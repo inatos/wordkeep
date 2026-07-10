@@ -8,6 +8,10 @@ Works with Cursor, VS Code Copilot, Claude Desktop, Zed, and other MCP clients.
 
 See [blog.md](./blog.md) for project rationale, architecture decisions, and the problems solved during development.
 
+![Wordkeep terminal dashboard showing per-tool token displacement, recent activity, and health metrics](docs/dashboard.png)
+
+*Live dashboard for per-tool token displacement, recent activity, and health signals.*
+
 ## Install
 
 ### Prebuilt binary (recommended)
