@@ -15,7 +15,16 @@ pub fn validate_rel_path(rel: &str) -> Result<String, String> {
     if norm.is_empty() {
         return Err("path must not be empty".into());
     }
-    if Path::new(&norm).is_absolute() {
+    if Path::new(&norm).is_absolute() || norm.starts_with('/') {
+        return Err(format!("path must be relative to --root: {norm}"));
+    }
+    // Reject drive-letter prefixes (e.g. C: or C:/) on all platforms.
+    if norm
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic())
+        && norm.as_bytes().get(1) == Some(&b':')
+    {
         return Err(format!("path must be relative to --root: {norm}"));
     }
     if norm.split('/').any(|c| c == "..") {
@@ -293,6 +302,7 @@ mod tests {
     fn validate_rel_path_rejects_traversal_and_absolute() {
         assert!(validate_rel_path("../etc/passwd").is_err());
         assert!(validate_rel_path("/etc/passwd").is_err());
+        assert!(validate_rel_path("C:/Windows/System32").is_err());
         assert_eq!(validate_rel_path("src/foo.rs").unwrap(), "src/foo.rs");
     }
 
