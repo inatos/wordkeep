@@ -6,6 +6,8 @@ tools over stdio (JSON-RPC).
 
 Works with Cursor, VS Code Copilot, Claude Desktop, Zed, and other MCP clients.
 
+See [blog.md](./blog.md) for project rationale, architecture decisions, and the problems solved during development.
+
 ## Install
 
 ### Prebuilt binary (recommended)
