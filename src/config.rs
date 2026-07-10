@@ -19,10 +19,7 @@ pub fn validate_rel_path(rel: &str) -> Result<String, String> {
         return Err(format!("path must be relative to --root: {norm}"));
     }
     // Reject drive-letter prefixes (e.g. C: or C:/) on all platforms.
-    if norm
-        .chars()
-        .next()
-        .is_some_and(|c| c.is_ascii_alphabetic())
+    if norm.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
         && norm.as_bytes().get(1) == Some(&b':')
     {
         return Err(format!("path must be relative to --root: {norm}"));
