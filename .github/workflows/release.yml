@@ -48,24 +48,26 @@ jobs:
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
           STAGING="wordkeep-${VERSION}-${{ matrix.target }}"
+          ARCHIVE="${STAGING}.tar.gz"
           mkdir -p "$STAGING"
           cp "target/${{ matrix.target }}/release/${{ matrix.bin }}" "$STAGING/"
           cp README.md LICENSE CHANGELOG.md "$STAGING/"
-          tar -czf artifact.tar.gz -C "$(dirname "$STAGING")" "$(basename "$STAGING")"
+          tar -czf "$ARCHIVE" -C "$(dirname "$STAGING")" "$(basename "$STAGING")"
       - name: Package (zip)
         if: matrix.archive == 'zip'
         shell: pwsh
         run: |
           $version = "$env:GITHUB_REF_NAME".Substring(1)
           $staging = "wordkeep-$version-${{ matrix.target }}"
+          $archive = "$staging.zip"
           New-Item -ItemType Directory -Force -Path $staging | Out-Null
           Copy-Item "target/${{ matrix.target }}/release/${{ matrix.bin }}" $staging/
           Copy-Item README.md, LICENSE, CHANGELOG.md $staging/
-          Compress-Archive -Path $staging -DestinationPath artifact.zip -Force
+          Compress-Archive -Path $staging -DestinationPath $archive -Force
       - uses: actions/upload-artifact@v4
         with:
           name: wordkeep-${{ matrix.target }}
-          path: artifact.*
+          path: wordkeep-*-${{ matrix.target }}.*
 
   release:
     name: publish
@@ -79,7 +81,7 @@ jobs:
       - name: Checksums
         run: |
           cd dist
-          find . -maxdepth 2 -type f \( -name '*.tar.gz' -o -name '*.zip' \) -print0 \
+          find . -type f \( -name 'wordkeep-*.tar.gz' -o -name 'wordkeep-*.zip' \) -print0 \
             | sort -z \
             | xargs -0 sha256sum > SHA256SUMS.txt
           cat SHA256SUMS.txt
