@@ -1,0 +1,9 @@
+{
+  "servers": {
+    "wordkeep": {
+      "type": "stdio",
+      "command": "/absolute/path/to/wordkeep",
+      "args": ["--root", "${workspaceFolder}"]
+    }
+  }
+}

@@ -1,0 +1,4 @@
+{
+  "default_paths": ["src"],
+  "test_command": "ctest -R"
+}

@@ -1,0 +1,21 @@
+Vendored tree-sitter grammar for Daslang (daScript).
+
+Upstream:  https://github.com/GaijinEntertainment/daScript
+Path:      tree-sitter-daslang/src/{parser.c,scanner.c,tree_sitter/parser.h}
+License:   BSD 3-Clause (see LICENSE in this directory)
+
+parser.c is generated from grammar.js by the tree-sitter CLI; it is committed
+here because the grammar publishes no Rust bindings / crate. It is compiled by
+build.rs (via the `cc` crate) only when the `daslang` cargo feature is enabled,
+and exposed through the `tree_sitter_daslang()` entry point. Without the feature,
+Daslang falls back to the dependency-free line scanner in src/repo_map.rs.
+
+DIALECT CAVEAT: this grammar only parses daScript's gen2 *brace* syntax
+(`def f() : int { return 1 }`). It ERRORs on the classic *indentation* syntax
+(`def f` then an indented block), which many real-world `.das` trees still use.
+So for indentation-style scripts the default line scanner is the one that
+actually maps declarations; the grammar is here for repos that adopt the
+brace dialect. Keep the feature OFF by default.
+
+To refresh: re-download the three files above from upstream master and rebuild
+with `--features daslang`. Do not hand-edit parser.c.

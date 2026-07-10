@@ -1,0 +1,83 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            archive: tar.gz
+            bin: wordkeep
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive: zip
+            bin: wordkeep.exe
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            archive: tar.gz
+            bin: wordkeep
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            archive: tar.gz
+            bin: wordkeep
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Package
+        shell: bash
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          STAGING="wordkeep-${VERSION}-${{ matrix.target }}"
+          mkdir -p "$STAGING"
+          cp "target/${{ matrix.target }}/release/${{ matrix.bin }}" "$STAGING/"
+          cp README.md LICENSE CHANGELOG.md "$STAGING/"
+          if [ "${{ matrix.archive }}" = "zip" ]; then
+            (cd "$STAGING/.." && zip -r "../${STAGING}.zip" "$(basename "$STAGING")")
+            mv "${STAGING}.zip" artifact.zip
+          else
+            tar -czf artifact.tar.gz -C "$(dirname "$STAGING")" "$(basename "$STAGING")"
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wordkeep-${{ matrix.target }}
+          path: artifact.*
+
+  release:
+    name: publish
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        run: |
+          cd dist
+          find . -maxdepth 2 -type f \( -name '*.tar.gz' -o -name '*.zip' \) -print0 \
+            | sort -z \
+            | xargs -0 sha256sum > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/**/*
+          generate_release_notes: true

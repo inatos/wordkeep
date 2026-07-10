@@ -1,0 +1,5 @@
+/target
+
+# fastembed downloads the ONNX model (~88 MB) into a local cache when the
+# `embeddings` feature runs; never commit it.
+/.fastembed_cache
