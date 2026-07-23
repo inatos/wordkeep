@@ -161,3 +161,127 @@ fn wordkeep_root_env_selects_target_repo() {
     let _ = std::fs::remove_dir_all(&cache);
     let _ = std::fs::remove_dir_all(&cwd);
 }
+
+#[test]
+fn profiles_route_paths_and_knowledge_roots() {
+    let root = temp("profiles");
+    let cache = temp("cache_prof");
+    let cwd = temp("cwd_prof");
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&cache);
+    std::fs::create_dir_all(&cwd).unwrap();
+    write_consumer_repo(&root);
+    std::fs::create_dir_all(root.join("tools/kkbp")).unwrap();
+    std::fs::write(root.join("tools/kkbp/pipe.rs"), "pub fn bake() {}\n").unwrap();
+    std::fs::write(
+        root.join(".wordkeep/config.json"),
+        r#"{
+          "default_paths":["src"],
+          "path_profiles":{"engine":["src"],"kkbp":["tools/kkbp"]},
+          "profile_hints":{"kkbp":["kkbp","bake"]},
+          "knowledge_write_roots":["notes"],
+          "artifact_roots":["artifacts"]
+        }"#,
+    )
+    .unwrap();
+    std::fs::create_dir_all(root.join("notes")).unwrap();
+    std::fs::create_dir_all(root.join("artifacts")).unwrap();
+    std::fs::write(root.join("artifacts/shot.png"), b"not-a-real-png").unwrap();
+
+    let mapped = tool_text(
+        &root,
+        &cache,
+        &cwd,
+        "repo_map",
+        json!({ "profile": "kkbp" }),
+    );
+    assert!(
+        mapped.contains("pipe.rs") || mapped.contains("bake"),
+        "{mapped}"
+    );
+
+    let upsert = tool_text(
+        &root,
+        &cache,
+        &cwd,
+        "knowledge_upsert",
+        json!({
+            "path": "notes/session.md",
+            "heading": "Handoff",
+            "body": "profile routing works"
+        }),
+    );
+    assert!(upsert.contains("knowledge_upsert"), "{upsert}");
+    assert!(root.join("notes/session.md").is_file());
+
+    let arts = tool_text(
+        &root,
+        &cache,
+        &cwd,
+        "artifact_index",
+        json!({ "refresh": true }),
+    );
+    assert!(arts.contains("artifact_index"), "{arts}");
+
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&cache);
+    let _ = std::fs::remove_dir_all(&cwd);
+}
+
+#[test]
+fn workspace_mas_isolation_across_roots() {
+    let root_a = temp("iso_a");
+    let root_b = temp("iso_b");
+    let cache = temp("cache_iso");
+    let cwd = temp("cwd_iso");
+    let _ = std::fs::remove_dir_all(&root_a);
+    let _ = std::fs::remove_dir_all(&root_b);
+    let _ = std::fs::remove_dir_all(&cache);
+    std::fs::create_dir_all(&cwd).unwrap();
+    write_consumer_repo(&root_a);
+    write_consumer_repo(&root_b);
+
+    let _ = tool_text(
+        &root_a,
+        &cache,
+        &cwd,
+        "mas_post",
+        json!({
+            "session": "shared-name",
+            "role": "planner",
+            "summary": "only in A"
+        }),
+    );
+    let read_b = tool_text(
+        &root_b,
+        &cache,
+        &cwd,
+        "mas_read",
+        json!({ "session": "shared-name" }),
+    );
+    assert!(
+        read_b.contains("not found") || read_b.contains("no matching") || read_b.contains("error:"),
+        "{read_b}"
+    );
+
+    let _ = std::fs::remove_dir_all(&root_a);
+    let _ = std::fs::remove_dir_all(&root_b);
+    let _ = std::fs::remove_dir_all(&cache);
+    let _ = std::fs::remove_dir_all(&cwd);
+}
+
+#[test]
+fn commit_scope_degrades_without_git() {
+    let root = temp("nongit_scope");
+    let cache = temp("cache_scope");
+    let cwd = temp("cwd_scope");
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&cache);
+    std::fs::create_dir_all(&cwd).unwrap();
+    write_consumer_repo(&root);
+    let out = tool_text(&root, &cache, &cwd, "commit_scope", json!({}));
+    assert!(out.contains("commit_scope"), "{out}");
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&cache);
+    let _ = std::fs::remove_dir_all(&cwd);
+}

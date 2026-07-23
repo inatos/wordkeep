@@ -10,8 +10,8 @@
 //!
 //! Alongside the running totals each tool keeps high-water marks, per-call latency,
 //! outcome counters (truncation, error, low-yield), and a capped rolling event log.
-//! The optional `dashboard` reads `savings.json` live. On-disk schema is `version: 3`;
-//! v1/v2 files load fine (missing fields default to zero / empty).
+//! The optional `dashboard` reads `savings.json` live. On-disk schema is `version: 4`;
+//! v1–v3 files load fine (missing fields default to zero / empty / no workspace).
 
 use serde_json::{json, Value};
 use std::cell::RefCell;
@@ -20,6 +20,7 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::cache;
+use crate::workspace;
 
 const FILE: &str = "savings.json";
 
@@ -81,13 +82,14 @@ impl Tool {
 }
 
 #[derive(Clone)]
-struct Event {
-    ts: u64,
-    tool: String,
-    baseline: u64,
-    returned: u64,
-    elapsed_ms: u64,
-    outcome: String,
+pub struct Event {
+    pub ts: u64,
+    pub tool: String,
+    pub baseline: u64,
+    pub returned: u64,
+    pub elapsed_ms: u64,
+    pub outcome: String,
+    pub workspace_id: String,
 }
 
 struct Store {
@@ -98,10 +100,20 @@ struct Store {
 
 static STATS: OnceLock<Mutex<Store>> = OnceLock::new();
 static REGISTRY: OnceLock<Vec<&'static str>> = OnceLock::new();
+static WORKSPACE_ID: OnceLock<String> = OnceLock::new();
 
 /// Register all MCP tool names (for never-called insights in `stats`).
 pub fn init_registry(names: Vec<&'static str>) {
     let _ = REGISTRY.set(names);
+}
+
+/// Bind telemetry events to a workspace (call once from `main`).
+pub fn set_workspace_root(root: &std::path::Path) {
+    let _ = WORKSPACE_ID.set(workspace::workspace_id(root));
+}
+
+fn workspace_id_str() -> String {
+    WORKSPACE_ID.get().cloned().unwrap_or_default()
 }
 
 fn registry() -> &'static [&'static str] {
@@ -128,6 +140,7 @@ impl Store {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn observe(
         &mut self,
         tool: &str,
@@ -136,6 +149,7 @@ impl Store {
         elapsed_ms: u64,
         outcome: &str,
         ts: u64,
+        workspace_id: &str,
     ) {
         self.tools
             .entry(tool.to_string())
@@ -148,6 +162,7 @@ impl Store {
             returned,
             elapsed_ms,
             outcome: outcome.to_string(),
+            workspace_id: workspace_id.to_string(),
         });
         while self.events.len() > EVENT_CAP {
             self.events.pop_front();
@@ -197,6 +212,11 @@ impl Store {
                         .get("outcome")
                         .and_then(Value::as_str)
                         .unwrap_or("ok")
+                        .to_string(),
+                    workspace_id: ev
+                        .get("workspace_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
                         .to_string(),
                 });
             }
@@ -251,11 +271,12 @@ impl Store {
                     "returned": e.returned,
                     "elapsed_ms": e.elapsed_ms,
                     "outcome": e.outcome,
+                    "workspace_id": e.workspace_id,
                 })
             })
             .collect();
         let doc = json!({
-            "version": 3,
+            "version": 4,
             "since": self.since,
             "tools": Value::Object(tools),
             "events": events,
@@ -302,8 +323,9 @@ pub fn finish(tool: &str, elapsed_ms: u64, result: &Result<String, String>) {
     let (baseline, returned) = PENDING.with(|p| p.borrow_mut().take()).unwrap_or((0, 0));
     let outcome = classify_outcome(result, returned);
     let now = now_secs();
+    let ws = workspace_id_str();
     if let Ok(mut s) = cell().lock() {
-        s.observe(tool, baseline, returned, elapsed_ms, outcome, now);
+        s.observe(tool, baseline, returned, elapsed_ms, outcome, now, &ws);
         s.save();
     }
     let saved = baseline.saturating_sub(returned);
@@ -312,6 +334,19 @@ pub fn finish(tool: &str, elapsed_ms: u64, result: &Result<String, String>) {
          (saved ~{saved}, {}%, {elapsed_ms}ms, {outcome})",
         pct(saved, baseline)
     );
+}
+
+/// Events for a workspace since `since_ts` (exclusive lower bound when > 0).
+pub fn events_since(root: &std::path::Path, since_ts: u64) -> Vec<Event> {
+    let wid = workspace::workspace_id(root);
+    let Ok(s) = cell().lock() else {
+        return Vec::new();
+    };
+    s.events
+        .iter()
+        .filter(|e| e.ts > since_ts && (e.workspace_id.is_empty() || e.workspace_id == wid))
+        .cloned()
+        .collect()
 }
 
 /// `stats` tool handler: render cumulative savings + improvement signals.
@@ -436,7 +471,30 @@ pub(crate) fn pct(saved: u64, baseline: u64) -> u64 {
     }
 }
 
+/// Format a count for `stats` / dashboard display.
+///
+/// Below one million: grouped digits (`120,500`). At/above 1M / 1B / 1T / 1Q:
+/// compact suffix form with up to two decimals (`3.25M`, `1.23B`).
 pub(crate) fn commafy(n: u64) -> String {
+    const MILLION: u64 = 1_000_000;
+    const BILLION: u64 = 1_000_000_000;
+    const TRILLION: u64 = 1_000_000_000_000;
+    const QUADRILLION: u64 = 1_000_000_000_000_000;
+    if n >= MILLION {
+        let (div, suffix) = if n >= QUADRILLION {
+            (QUADRILLION as f64, "Q")
+        } else if n >= TRILLION {
+            (TRILLION as f64, "T")
+        } else if n >= BILLION {
+            (BILLION as f64, "B")
+        } else {
+            (MILLION as f64, "M")
+        };
+        let value = n as f64 / div;
+        let raw = format!("{value:.2}");
+        let trimmed = raw.trim_end_matches('0').trim_end_matches('.');
+        return format!("{trimmed}{suffix}");
+    }
     let s = n.to_string();
     let bytes = s.as_bytes();
     let len = bytes.len();
@@ -590,12 +648,18 @@ mod tests {
     }
 
     #[test]
-    fn commafy_groups_thousands() {
+    fn commafy_groups_thousands_and_abbreviates_large() {
         assert_eq!(commafy(0), "0");
         assert_eq!(commafy(42), "42");
         assert_eq!(commafy(1_000), "1,000");
         assert_eq!(commafy(120_500), "120,500");
-        assert_eq!(commafy(1_234_567), "1,234,567");
+        assert_eq!(commafy(999_999), "999,999");
+        assert_eq!(commafy(1_000_000), "1M");
+        assert_eq!(commafy(3_250_000), "3.25M");
+        assert_eq!(commafy(3_200_000), "3.2M");
+        assert_eq!(commafy(1_234_567_890), "1.23B");
+        assert_eq!(commafy(3_250_000_000_000), "3.25T");
+        assert_eq!(commafy(1_500_000_000_000_000), "1.5Q");
     }
 
     #[test]

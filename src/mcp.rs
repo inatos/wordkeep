@@ -1,9 +1,10 @@
 //! Minimal MCP server over stdio.
 //!
-//! Implements just what a tool-only server needs from the spec: the `initialize`
-//! handshake, `tools/list`, `tools/call`, and `ping`. Messages are newline-delimited
-//! JSON-RPC 2.0 on stdin/stdout (the MCP stdio transport). All logging goes to stderr
-//! so it never corrupts the protocol stream on stdout.
+//! Implements what a tools+resources server needs from the spec: the `initialize`
+//! handshake, `tools/list`, `tools/call`, `resources/list`, `resources/read`, and
+//! `ping`. Messages are newline-delimited JSON-RPC 2.0 on stdin/stdout (the MCP
+//! stdio transport). All logging goes to stderr so it never corrupts the protocol
+//! stream on stdout.
 
 use serde_json::{json, Value};
 use std::io::{self, BufRead, Write};
@@ -18,8 +19,17 @@ pub struct Tool {
     pub handler: Handler,
 }
 
+pub struct Resource {
+    pub uri: &'static str,
+    pub name: &'static str,
+    pub description: &'static str,
+    pub mime_type: &'static str,
+    pub text: &'static str,
+}
+
 pub struct Server {
     pub tools: Vec<Tool>,
+    pub resources: Vec<Resource>,
     pub server_name: String,
     pub server_version: String,
 }
@@ -63,6 +73,8 @@ impl Server {
                 "initialize" => self.handle_initialize(&params, id),
                 "tools/list" => self.handle_list(id),
                 "tools/call" => self.handle_call(&params, id),
+                "resources/list" => self.handle_resources_list(id),
+                "resources/read" => self.handle_resources_read(&params, id),
                 "ping" => ok_result(id, json!({})),
                 other => err_response(id, -32601, &format!("method not found: {other}")),
             };
@@ -85,7 +97,10 @@ impl Server {
             id,
             json!({
                 "protocolVersion": pv,
-                "capabilities": { "tools": { "listChanged": false } },
+                "capabilities": {
+                    "tools": { "listChanged": false },
+                    "resources": { "listChanged": false, "subscribe": false }
+                },
                 "serverInfo": {
                     "name": self.server_name.clone(),
                     "version": self.server_version.clone()
@@ -131,6 +146,53 @@ impl Server {
             None => err_response(id, -32602, &format!("unknown tool: {name}")),
         }
     }
+
+    fn handle_resources_list(&self, id: Value) -> Value {
+        let resources: Vec<Value> = self
+            .resources
+            .iter()
+            .map(|r| {
+                json!({
+                    "uri": r.uri,
+                    "name": r.name,
+                    "description": r.description,
+                    "mimeType": r.mime_type,
+                })
+            })
+            .collect();
+        ok_result(id, json!({ "resources": resources }))
+    }
+
+    fn handle_resources_read(&self, params: &Value, id: Value) -> Value {
+        let uri = params.get("uri").and_then(Value::as_str).unwrap_or("");
+        let canonical = normalize_resource_uri(uri);
+        match self
+            .resources
+            .iter()
+            .find(|r| r.uri == canonical || r.uri == uri)
+        {
+            Some(r) => ok_result(
+                id,
+                json!({
+                    "contents": [{
+                        "uri": r.uri,
+                        "mimeType": r.mime_type,
+                        "text": r.text,
+                    }]
+                }),
+            ),
+            None => err_response(id, -32002, &format!("resource not found: {uri}")),
+        }
+    }
+}
+
+/// Accept `wordkeep://README` as an alias of the canonical `wordkeep://readme`.
+pub fn normalize_resource_uri(uri: &str) -> &str {
+    if uri.eq_ignore_ascii_case("wordkeep://readme") || uri == "wordkeep://README" {
+        "wordkeep://readme"
+    } else {
+        uri
+    }
 }
 
 fn ok_result(id: Value, result: Value) -> Value {
@@ -139,4 +201,25 @@ fn ok_result(id: Value, result: Value) -> Value {
 
 fn err_response(id: Value, code: i64, message: &str) -> Value {
     json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn readme_alias_normalizes() {
+        assert_eq!(
+            normalize_resource_uri("wordkeep://README"),
+            "wordkeep://readme"
+        );
+        assert_eq!(
+            normalize_resource_uri("wordkeep://readme"),
+            "wordkeep://readme"
+        );
+        assert_eq!(
+            normalize_resource_uri("wordkeep://other"),
+            "wordkeep://other"
+        );
+    }
 }

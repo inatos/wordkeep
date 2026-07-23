@@ -10,7 +10,8 @@ See [blog.md](./blog.md) for project rationale, architecture decisions, and the 
 
 ![Wordkeep terminal dashboard showing per-tool token displacement, recent activity, and health metrics](docs/dashboard.png)
 
-*Live dashboard for per-tool token displacement, recent activity, and health signals.*
+*Live dashboard for per-tool token displacement, recent activity, and health signals.
+Large counts abbreviate as `3.25M` / `1.23B` / `3.25T` once they pass a million.*
 
 ## Install
 
@@ -59,13 +60,17 @@ Copy [`.wordkeep/config.example.json`](.wordkeep/config.example.json) to your
 ```json
 {
   "default_paths": ["src", "pkg/lib"],
+  "path_profiles": { "engine": ["src"], "tools": ["tools"] },
   "test_command": "ctest -R"
 }
 ```
 
-- `default_paths`: searched when a tool omits `paths` (fallback: `["src"]`).
+- `default_paths` / `path_profiles` / `profile`: searched when a tool omits `paths`
+  (see [docs/configuration.md](docs/configuration.md)).
 - `test_command`: prefix printed by `test_map` filter hints and pitfall verify
   lines.
+- Continuity: `artifact_roots`, `commit_scopes`, `mas.*`, defects/runs — see
+  [docs/designs/session_continuity.md](docs/designs/session_continuity.md).
 
 Environment variables:
 
@@ -76,9 +81,11 @@ Environment variables:
 | `WORDKEEP_TRACY_CSVEXPORT` | Override `tracy-csvexport` binary for `.tracy` captures |
 | `WORDKEEP_MAS_ENTRY_TOKENS` | Per-entry cap for MAS blackboard posts (default ~400) |
 
+CLI: `wordkeep run-record …` records gate metadata without executing commands.
+
 ## What you get
 
-28 MCP tools, including:
+36 MCP tools + `wordkeep://readme` resource, including:
 
 | Tool | Use when you need |
 | --- | --- |
@@ -87,7 +94,10 @@ Environment variables:
 | `symbol_refs` | Where a symbol is defined, called, referenced |
 | `call_graph` / `call_path` | Caller/callee blast radius or shortest chain |
 | `symbol_context` | Body + one hop of graph + layout in one call |
-| `knowledge_search` | Relevant docs/rules for a question |
+| `knowledge_search` | Relevant docs/rules (and boosted open defects) |
+| `session_handoff` | Paste-ready next-session prime |
+| `defect_list` / `run_history` | Unresolved blockers and recent gate evidence |
+| `session_pressure` | Heuristic context-pressure signal |
 | `test_map` | Narrowest tests after a change |
 | `stats` | Measured token displacement per tool |
 

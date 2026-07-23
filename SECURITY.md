@@ -17,7 +17,17 @@ Do not file public issues for undisclosed vulnerabilities.
 
 wordkeep runs locally as an MCP stdio subprocess. It reads files under the `--root` workspace you configure and writes only to:
 
-- validated paths under `.wordkeep/`, `docs/`, and `.cursor/rules/` via `knowledge_upsert`
-- cache files under your platform cache directory (`$XDG_CACHE_HOME/wordkeep/` or `%LOCALAPPDATA%/wordkeep/`)
+- validated paths under `.wordkeep/`, `docs/`, `.cursor/rules/`, root `README.md`, and configured `knowledge_write_roots` via `knowledge_upsert`
+- `.wordkeep/defects.json` via `defect_upsert`
+- cache files under your platform cache directory (`$XDG_CACHE_HOME/wordkeep/` or `%LOCALAPPDATA%/wordkeep/`), including workspace-scoped MAS/run/artifact stores
+
+It does **not**:
+
+- execute commands recorded by `run_record` / `wordkeep run-record`
+- stage or commit via `commit_scope`
+- follow artifact symlinks outside `--root`
+- grade image quality from `artifact_index`
 
 Treat `--root` like any local code-execution tool: point it only at repositories you trust.
+
+MCP resource `wordkeep://readme` (alias `wordkeep://README`) serves the packaged README text only.

@@ -1,13 +1,16 @@
 # Tool reference
 
-All tools accept optional `token_budget` (approximate max response tokens).
-Path-accepting tools use `paths` or `.wordkeep/config.json` `default_paths`.
+All tools accept optional `token_budget` (approximate max response tokens) where noted.
+Path-accepting tools use `paths`, optional `profile`, or `.wordkeep/config.json`
+`path_profiles` / `default_paths` (see [configuration.md](configuration.md)).
+
+**Surface:** 36 tools + MCP resource `wordkeep://readme`.
 
 ## Navigation
 
 | Tool | Required args | Returns |
 | --- | --- | --- |
-| `repo_map` | optional `paths` | Namespaces, types, function signatures per file |
+| `repo_map` | optional `paths` / `profile` | Namespaces, types, function signatures per file |
 | `outline` | `file` or `path` | Single-file symbol list with line numbers |
 | `symbol_refs` | `symbol` | Definitions, calls, references (tree-sitter classified) |
 | `call_graph` | `symbol` | One hop of callers and callees |
@@ -29,13 +32,14 @@ Path-accepting tools use `paths` or `.wordkeep/config.json` `default_paths`.
 | `big_functions` | optional `paths`, `min_lines` | Largest functions by line span |
 | `undocumented` | optional `paths` | Exported symbols lacking doc comments |
 | `test_map` | `symbol` | Test files referencing the symbol |
+| `commit_scope` | optional `large_file_bytes` | Read-only dirty-path groups + warnings |
 
 ## Knowledge and docs
 
 | Tool | Required args | Returns |
 | --- | --- | --- |
-| `knowledge_search` | `query` | BM25 (optional semantic rerank) over docs/rules |
-| `knowledge_upsert` | `path`, `heading`, `body` | Write/update markdown section |
+| `knowledge_search` | `query` | BM25 (+ optional defects boost / semantic rerank) |
+| `knowledge_upsert` | `path` + mode fields | Write/update markdown section |
 
 ## Performance and workflow
 
@@ -44,20 +48,33 @@ Path-accepting tools use `paths` or `.wordkeep/config.json` `default_paths`.
 | `trace_summary` | optional `file`, `dir`, `baseline` | Hottest Tracy zones or diff |
 | `trace_profile` | optional trace args | Hitch workflow: trace + diff_map + index_stale |
 | `integration_hooks` | optional `query`, `from`, `to` | Curated hooks + optional call_path |
-| `index_stale` | optional `ref` | Whether disk indexes may lag git |
-| `stats` | optional `reset`, `insights` | Token displacement telemetry |
+| `index_stale` | optional `ref`, `paths` / `profile` | Whether disk indexes may lag git / miss coverage |
+| `stats` | optional `reset`, `insights` | Token displacement telemetry (counts ≥1M → `3.25M` / `1.23B` / …) |
+| `run_record` | `command` | Metadata-only gate/run write (also CLI `run-record`) |
+| `run_history` | optional filters | Recent runs; flags missing logs/artifacts |
+| `artifact_index` | optional `roots` / `query` | Artifact metadata index (no image grading) |
+| `session_pressure` | optional `session` | Heuristic context-pressure level |
+| `defect_upsert` | `summary` | Structured defect create/update |
+| `defect_list` | optional filters | Unresolved defects (`eyeball_fail` first) |
 
 ## Multi-agent (MAS)
 
 | Tool | Purpose |
 | --- | --- |
-| `mas_post` | Append compact entry to session blackboard |
+| `mas_post` | Append compact entry (`kind`, `commands`, `constraints`, handoff spill) |
 | `mas_read` | Read entries (filter by recipient, role, round, tag) |
 | `mas_status` | Round bookkeeping and convergence hint |
-| `mas_finalize` | Close session; optional `promote` to `.wordkeep/notes/` |
+| `mas_finalize` | Close session; optional promote + handoff prompt |
+| `session_handoff` | Paste-ready next-session prime (works on finalized sessions) |
 
-See [designs/recursive_mas.md](designs/recursive_mas.md) for the typical
-planner/solver/critic loop.
+See [designs/recursive_mas.md](designs/recursive_mas.md) and
+[designs/session_continuity.md](designs/session_continuity.md).
+
+## MCP resources
+
+| URI | Content |
+| --- | --- |
+| `wordkeep://readme` | Packaged README (alias: `wordkeep://README`) |
 
 ## Languages
 

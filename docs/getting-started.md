@@ -48,7 +48,9 @@ Reload the editor after editing MCP config so the server respawns.
 
 In the **project you are coding in** (not necessarily the wordkeep repo), copy
 [`.wordkeep/config.example.json`](../.wordkeep/config.example.json) to
-`.wordkeep/config.json` and set `default_paths` to where your source lives.
+`.wordkeep/config.json` and set `default_paths` / `path_profiles` to where your
+source lives. Prefer profiles so specialty trees (e.g. pipelines) are not scanned
+on every default engine query.
 
 Optional: add `.wordkeep/integration-hooks.md` for curated cross-module wiring
 (see [examples/integration-hooks.example.md](../examples/integration-hooks.example.md)).
@@ -57,10 +59,10 @@ Optional: add `.wordkeep/integration-hooks.md` for curated cross-module wiring
 
 Ask your agent to try:
 
-1. `repo_map` with `{}` (uses `default_paths`)
+1. `repo_map` with `{}` (uses `default_paths` / profile)
 2. `outline` with `{ "file": "src/main.rs" }` (or your entry file)
 3. `symbol_refs` with `{ "symbol": "YourFunction" }`
-4. `stats` to see token displacement
+4. `session_pressure` / `stats` to see continuity + token displacement
 
 ## 5. Smoke test from a shell
 
@@ -69,13 +71,17 @@ cargo build --release   # if building from source
 printf '%s\n' \
   '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' \
   '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}' \
+  '{"jsonrpc":"2.0","id":3,"method":"resources/list","params":{}}' \
   | wordkeep --root /path/to/your/repo
 ```
 
-You should see `wordkeep` in `serverInfo` and 28 tools in `tools/list`.
+You should see `wordkeep` in `serverInfo`, **36** tools in `tools/list`, and
+`wordkeep://readme` in `resources/list`. **Reload the MCP client** after upgrading
+so it rediscovers the new surface.
 
 ## Next steps
 
 - [configuration.md](configuration.md) for env vars and cache layout
+- [designs/session_continuity.md](designs/session_continuity.md) for handoffs/defects/runs
 - [tools.md](tools.md) for per-tool arguments
 - [onboarding.md](onboarding.md) for how wordkeep differs from grep-and-read

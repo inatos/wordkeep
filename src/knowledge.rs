@@ -11,7 +11,7 @@ use std::path::Path;
 use std::sync::{Mutex, OnceLock};
 
 use crate::cache::{self, DiskMap};
-use crate::{stats, walk};
+use crate::{config, defects, stats, walk};
 
 #[cfg(feature = "embeddings")]
 mod embed;
@@ -66,9 +66,36 @@ pub fn search(root: &Path, args: &Value) -> Result<String, String> {
         .get("token_budget")
         .and_then(Value::as_u64)
         .unwrap_or(1200) as usize;
-    let roots = crate::config::doc_roots_from_args(args)?;
+    let roots = config::doc_roots_from_args(root, args)?;
+    let include_defects = args
+        .get("include_defects")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
 
-    let (chunks, indexed_bytes) = index(root, &roots);
+    let (mut chunks, indexed_bytes) = index(root, &roots);
+    let mut defect_boosts: HashMap<usize, f64> = HashMap::new();
+    if include_defects {
+        for d in defects::unresolved(root) {
+            let boost = defects::boost_for_status(&d.status);
+            if boost <= 0.0 {
+                continue;
+            }
+            let (path, heading, body) = defects::defect_chunk_text(&d);
+            let mut tf = HashMap::new();
+            for t in tokenize(&format!("{heading} {body}")) {
+                *tf.entry(t).or_insert(0u32) += 1;
+            }
+            let len = tf.values().sum();
+            defect_boosts.insert(chunks.len(), boost);
+            chunks.push(Chunk {
+                path,
+                heading,
+                body,
+                tf,
+                len,
+            });
+        }
+    }
     if chunks.is_empty() {
         stats::record("knowledge_search", indexed_bytes / 4, 0);
         return Ok("knowledge_search: no documents indexed".into());
@@ -100,6 +127,9 @@ pub fn search(root: &Path, args: &Value) -> Result<String, String> {
             let n_qi = *df.get(qt.as_str()).unwrap_or(&0) as f64;
             let idf = ((n - n_qi + 0.5) / (n_qi + 0.5) + 1.0).ln();
             score += idf * (f * (K1 + 1.0)) / (f + K1 * (1.0 - B + B * dl / avgdl));
+        }
+        if let Some(boost) = defect_boosts.get(&i) {
+            score *= boost;
         }
         if score > 0.0 {
             scored.push((score, i));
@@ -165,7 +195,8 @@ pub fn search(root: &Path, args: &Value) -> Result<String, String> {
 }
 
 /// Write or update a markdown section so the next `knowledge_search` can retrieve it.
-/// Restricted to `.cursor/rules/`, `docs/`, and `.wordkeep/notes/` under the repo root.
+/// Restricted to `.cursor/rules/`, `docs/`, `.wordkeep/notes/`, root `README.md`,
+/// and any configured `knowledge_write_roots`.
 pub fn upsert(root: &Path, args: &Value) -> Result<String, String> {
     let rel = args
         .get("path")
@@ -178,25 +209,48 @@ pub fn upsert(root: &Path, args: &Value) -> Result<String, String> {
         .and_then(Value::as_str)
         .unwrap_or("upsert_section");
 
+    if mode != "upsert_section"
+        && mode != "append_section"
+        && mode != "replace_file"
+        && mode != "pitfall"
+    {
+        return Err(format!(
+            "unknown mode {mode:?}; use upsert_section, append_section, replace_file, or pitfall"
+        ));
+    }
+
     let (heading, body) = if mode == "pitfall" {
+        let mut missing = Vec::new();
         let symptom = args
             .get("symptom")
             .and_then(Value::as_str)
             .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .ok_or("symptom is required for mode pitfall")?;
+            .filter(|s| !s.is_empty());
+        if symptom.is_none() {
+            missing.push("symptom");
+        }
         let root_cause = args
             .get("root_cause")
             .and_then(Value::as_str)
             .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .ok_or("root_cause is required for mode pitfall")?;
+            .filter(|s| !s.is_empty());
+        if root_cause.is_none() {
+            missing.push("root_cause");
+        }
         let fix = args
             .get("fix")
             .and_then(Value::as_str)
             .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .ok_or("fix is required for mode pitfall")?;
+            .filter(|s| !s.is_empty());
+        if fix.is_none() {
+            missing.push("fix");
+        }
+        if !missing.is_empty() {
+            return Err(format!("mode pitfall requires: {}", missing.join(", ")));
+        }
+        let symptom = symptom.unwrap();
+        let root_cause = root_cause.unwrap();
+        let fix = fix.unwrap();
         let heading = args
             .get("heading")
             .and_then(Value::as_str)
@@ -215,39 +269,35 @@ pub fn upsert(root: &Path, args: &Value) -> Result<String, String> {
             let tag = tag.trim_start_matches('[').trim_end_matches(']');
             body.push_str(&format!(
                 "\n**Verify:** `{}`\n",
-                crate::config::test_filter_hint(root, tag)
+                config::test_filter_hint(root, tag)
             ));
         }
         (heading, body)
     } else {
+        let mut missing = Vec::new();
         let heading = args
             .get("heading")
             .and_then(Value::as_str)
             .map(str::trim)
             .filter(|s| !s.is_empty())
-            .ok_or("heading is required")?
-            .to_string();
+            .map(String::from);
+        if heading.is_none() {
+            missing.push("heading");
+        }
         let body = args
             .get("body")
             .and_then(Value::as_str)
-            .ok_or("body is required")?
-            .trim()
-            .to_string();
-        if body.is_empty() {
-            return Err("body is required".into());
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(String::from);
+        if body.is_none() {
+            missing.push("body");
         }
-        (heading, body)
+        if !missing.is_empty() {
+            return Err(format!("mode {mode} requires: {}", missing.join(", ")));
+        }
+        (heading.unwrap(), body.unwrap())
     };
-
-    if mode != "upsert_section"
-        && mode != "append_section"
-        && mode != "replace_file"
-        && mode != "pitfall"
-    {
-        return Err(format!(
-            "unknown mode {mode:?}; use upsert_section, append_section, replace_file, or pitfall"
-        ));
-    }
     let write_mode = if mode == "pitfall" {
         "upsert_section"
     } else {
@@ -318,14 +368,19 @@ fn pitfall_heading_from_symptom(symptom: &str) -> String {
 }
 
 fn resolve_upsert_path(root: &Path, rel: &str) -> Result<std::path::PathBuf, String> {
-    let norm = crate::config::validate_rel_path(rel.trim().trim_start_matches(['/', '\\']))?;
-    let allowed = UPSERT_ROOTS
-        .iter()
-        .any(|p| norm == *p || norm.starts_with(&format!("{p}/")));
+    let norm = config::validate_rel_path(rel.trim().trim_start_matches(['/', '\\']))?;
+    let extra = config::knowledge_write_roots(root);
+    let mut allowed_roots: Vec<String> = UPSERT_ROOTS.iter().map(|s| (*s).to_string()).collect();
+    allowed_roots.extend(extra);
+    // Root README.md is always writable (not arbitrary **/README.md).
+    let allowed = norm.eq_ignore_ascii_case("README.md")
+        || allowed_roots
+            .iter()
+            .any(|p| norm == *p || norm.starts_with(&format!("{p}/")));
     if !allowed {
         return Err(format!(
-            "path must be under one of: {}",
-            UPSERT_ROOTS.join(", ")
+            "path must be README.md or under one of: {}",
+            allowed_roots.join(", ")
         ));
     }
     let ext_ok = norm
@@ -730,7 +785,26 @@ mod tests {
             &json!({"path": "src/main.cpp", "heading": "X", "body": "y"}),
         )
         .unwrap_err();
-        assert!(err2.contains("must be under"), "{err2}");
+        assert!(
+            err2.contains("must be under") || err2.contains("README.md"),
+            "{err2}"
+        );
+    }
+
+    #[test]
+    fn upsert_reports_all_missing_mode_fields() {
+        let dir = std::env::temp_dir().join(format!("cbtest_kbup_miss_{}", std::process::id()));
+        let err = upsert(&dir, &json!({"path": "docs/x.md", "mode": "pitfall"})).unwrap_err();
+        assert!(err.contains("symptom"), "{err}");
+        assert!(err.contains("root_cause"), "{err}");
+        assert!(err.contains("fix"), "{err}");
+        let err2 = upsert(
+            &dir,
+            &json!({"path": "docs/x.md", "mode": "upsert_section"}),
+        )
+        .unwrap_err();
+        assert!(err2.contains("heading"), "{err2}");
+        assert!(err2.contains("body"), "{err2}");
     }
 
     #[test]

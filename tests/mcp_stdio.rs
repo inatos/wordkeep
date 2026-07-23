@@ -208,9 +208,104 @@ fn lists_all_tools() {
         "mas_read",
         "mas_status",
         "mas_finalize",
+        "session_handoff",
+        "defect_upsert",
+        "defect_list",
+        "run_record",
+        "run_history",
+        "artifact_index",
+        "session_pressure",
+        "commit_scope",
     ] {
         assert!(names.contains(&n), "missing tool {n}: {names:?}");
     }
+    assert_eq!(
+        names.len(),
+        36,
+        "expected 36 tools, got {}: {names:?}",
+        names.len()
+    );
+}
+
+#[test]
+fn resources_list_and_read_readme() {
+    let mut s = Server::start();
+    let init = s.call(json!({
+        "jsonrpc": "2.0", "id": 1, "method": "initialize",
+        "params": { "protocolVersion": "2025-06-18" }
+    }));
+    assert!(
+        init["result"]["capabilities"]["resources"].is_object(),
+        "resources capability missing: {init}"
+    );
+    let list = s.call(json!({ "jsonrpc": "2.0", "id": 2, "method": "resources/list" }));
+    let resources = list["result"]["resources"].as_array().expect("resources");
+    assert!(
+        resources.iter().any(|r| r["uri"] == "wordkeep://readme"),
+        "{list}"
+    );
+    let read = s.call(json!({
+        "jsonrpc": "2.0", "id": 3, "method": "resources/read",
+        "params": { "uri": "wordkeep://README" }
+    }));
+    let text = read["result"]["contents"][0]["text"].as_str().unwrap_or("");
+    assert!(
+        text.contains("wordkeep") || text.contains("Wordkeep"),
+        "{read}"
+    );
+}
+
+#[test]
+fn continuity_tools_smoke() {
+    let mut s = Server::start();
+    let _ = s.tool_text(
+        "defect_upsert",
+        json!({
+            "id": "eyeball-cloak",
+            "summary": "cloak points up",
+            "status": "eyeball_fail",
+            "subsystem": "kkbp",
+            "acceptance": ["drapes over shoulder"]
+        }),
+    );
+    let listed = s.tool_text("defect_list", json!({}));
+    assert!(listed.contains("eyeball-cloak"), "{listed}");
+    let _ = s.tool_text(
+        "run_record",
+        json!({
+            "id": "gate-1",
+            "command": "validate_character_goldens.sh",
+            "status": "passed",
+            "tags": ["kkbp"]
+        }),
+    );
+    let hist = s.tool_text("run_history", json!({ "tag": "kkbp" }));
+    assert!(hist.contains("gate-1"), "{hist}");
+    let pressure = s.tool_text("session_pressure", json!({}));
+    assert!(
+        pressure.contains("session_pressure") && pressure.contains("level="),
+        "{pressure}"
+    );
+    let _ = s.tool_text(
+        "mas_post",
+        json!({
+            "session": "cont-test",
+            "role": "planner",
+            "kind": "handoff",
+            "summary": "continue fidelity",
+            "commands": ["cargo test"],
+            "constraints": ["do not edit plan file"]
+        }),
+    );
+    let handoff = s.tool_text("session_handoff", json!({ "session": "cont-test" }));
+    assert!(
+        handoff.contains("Next-session prime") || handoff.contains("Priority defects"),
+        "{handoff}"
+    );
+    let scope = s.tool_text("commit_scope", json!({}));
+    assert!(scope.contains("commit_scope"), "{scope}");
+    let arts = s.tool_text("artifact_index", json!({}));
+    assert!(arts.contains("artifact_index"), "{arts}");
 }
 
 #[test]

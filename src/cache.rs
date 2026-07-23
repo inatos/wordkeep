@@ -13,6 +13,13 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::SystemTime;
 
+/// Shared lock for tests that mutate `XDG_CACHE_HOME`.
+#[cfg(test)]
+pub fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// Root directory for all on-disk caches.
 pub fn dir() -> PathBuf {
     let base = std::env::var_os("XDG_CACHE_HOME")

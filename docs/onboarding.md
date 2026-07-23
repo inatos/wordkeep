@@ -113,6 +113,7 @@ the point: it turns "trust me, this helps" into a number you can watch. The
 [dashboard](../README.md#dashboard) (`cargo run --features dashboard -- dashboard`)
 renders the same counters as a live terminal UI - per-tool savings, single-call
 watermarks, a rolling activity log, and a health panel - refreshing once a second.
+Counts ≥1M compact to `3.25M` / `1.23B` / `3.25T` (shared with the `stats` tool).
 
 Two design rules follow from this:
 
