@@ -1,9 +1,9 @@
 //! Recursive MAS blackboard - session-scoped, token-capped state handoff between
 //! subagents (Planner/Critic/Solver) without re-pasting bulky text.
 //!
-//! Sessions live under `$XDG_CACHE_HOME/wordkeep/mas/<session>.json`. Each call
-//! reloads from disk so subagents that spawn separate MCP processes still share
-//! state; writes are atomic (temp + rename).
+//! Sessions live under `$XDG_CACHE_HOME/wordkeep/workspaces/<id>/mas/<session>.json`.
+//! Legacy global `$XDG_CACHE_HOME/wordkeep/mas/` files are migrated on first access.
+//! Writes are atomic (temp + rename).
 
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -11,27 +11,35 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::{cache, knowledge, stats};
+use crate::{config, defects, knowledge, runs, session_pressure, stats, workspace};
 
-const STORE_VERSION: u64 = 1;
+const STORE_VERSION: u64 = 2;
 const DEFAULT_MAX_ROUNDS: u64 = 3;
 const DEFAULT_ENTRY_TOKENS: usize = 400;
 const DEFAULT_READ_BUDGET: usize = 1200;
 
 static SESSION_CACHE: OnceLock<Mutex<HashMap<String, Session>>> = OnceLock::new();
 
+fn cache_key(root: &Path, session: &str) -> String {
+    format!("{}::{session}", workspace::workspace_id(root))
+}
+
 #[derive(Clone, Debug)]
 struct Entry {
     id: u64,
     round: u64,
     role: String,
+    kind: String,
     ts: u64,
     summary: String,
     claims: Vec<String>,
     decisions: Vec<String>,
     open_questions: Vec<String>,
     anchors: Vec<String>,
+    commands: Vec<String>,
+    constraints: Vec<String>,
     handoff_to: Option<String>,
+    note_ref: Option<String>,
     tags: Vec<String>,
     approved: Option<bool>,
 }
@@ -67,12 +75,8 @@ fn entry_token_cap() -> usize {
         .unwrap_or(DEFAULT_ENTRY_TOKENS)
 }
 
-fn mas_dir() -> PathBuf {
-    cache::dir().join("mas")
-}
-
-fn session_path(session: &str) -> PathBuf {
-    mas_dir().join(format!("{session}.json"))
+fn session_path(root: &Path, session: &str) -> Result<PathBuf, String> {
+    workspace::migrate_mas_session(root, session)
 }
 
 /// Validate session id: slug `[A-Za-z0-9._-]`, no `/`, no `..`.
@@ -150,13 +154,17 @@ fn entry_to_value(e: &Entry) -> Value {
         "id": e.id,
         "round": e.round,
         "role": e.role,
+        "kind": e.kind,
         "ts": e.ts,
         "summary": e.summary,
         "claims": e.claims,
         "decisions": e.decisions,
         "open_questions": e.open_questions,
         "anchors": e.anchors,
+        "commands": e.commands,
+        "constraints": e.constraints,
         "handoff_to": e.handoff_to,
+        "note_ref": e.note_ref,
         "tags": e.tags,
         "approved": e.approved,
     })
@@ -167,6 +175,11 @@ fn entry_from_value(v: &Value) -> Option<Entry> {
         id: v.get("id").and_then(Value::as_u64)?,
         round: v.get("round").and_then(Value::as_u64).unwrap_or(1),
         role: v.get("role").and_then(Value::as_str)?.to_string(),
+        kind: v
+            .get("kind")
+            .and_then(Value::as_str)
+            .unwrap_or("note")
+            .to_string(),
         ts: v.get("ts").and_then(Value::as_u64).unwrap_or(0),
         summary: v
             .get("summary")
@@ -177,15 +190,19 @@ fn entry_from_value(v: &Value) -> Option<Entry> {
         decisions: string_array(v, "decisions"),
         open_questions: string_array(v, "open_questions"),
         anchors: string_array(v, "anchors"),
+        commands: string_array(v, "commands"),
+        constraints: string_array(v, "constraints"),
         handoff_to: optional_str(v, "handoff_to"),
+        note_ref: optional_str(v, "note_ref"),
         tags: string_array(v, "tags"),
         approved: v.get("approved").and_then(Value::as_bool),
     })
 }
 
-fn session_to_value(s: &Session) -> Value {
+fn session_to_value(root: &Path, s: &Session) -> Value {
     json!({
         "version": STORE_VERSION,
+        "workspace_id": workspace::workspace_id(root),
         "session": s.session,
         "created": s.created,
         "updated": s.updated,
@@ -228,14 +245,15 @@ fn session_from_value(v: &Value) -> Option<Session> {
     })
 }
 
-fn load_session(session: &str) -> Result<Option<Session>, String> {
+fn load_session(root: &Path, session: &str) -> Result<Option<Session>, String> {
     validate_session_id(session)?;
+    let key = cache_key(root, session);
     if let Ok(cache) = cache_cell().lock() {
-        if let Some(s) = cache.get(session) {
+        if let Some(s) = cache.get(&key) {
             return Ok(Some(s.clone()));
         }
     }
-    let path = session_path(session);
+    let path = session_path(root, session)?;
     if !path.exists() {
         return Ok(None);
     }
@@ -247,23 +265,28 @@ fn load_session(session: &str) -> Result<Option<Session>, String> {
         .map(Some)
 }
 
-fn save_session(s: &Session) -> Result<(), String> {
-    let path = session_path(&s.session);
-    write_atomic(&path, &session_to_value(s))?;
+fn save_session(root: &Path, s: &Session) -> Result<(), String> {
+    let path = session_path(root, &s.session)?;
+    write_atomic(&path, &session_to_value(root, s))?;
     if let Ok(mut cache) = cache_cell().lock() {
-        cache.insert(s.session.clone(), s.clone());
+        cache.insert(cache_key(root, &s.session), s.clone());
     }
     Ok(())
 }
 
-fn get_or_create_session(session: &str, max_rounds: Option<u64>) -> Result<Session, String> {
+fn get_or_create_session(
+    root: &Path,
+    session: &str,
+    max_rounds: Option<u64>,
+) -> Result<Session, String> {
     validate_session_id(session)?;
+    let key = cache_key(root, session);
     if let Ok(cache) = cache_cell().lock() {
-        if let Some(s) = cache.get(session) {
+        if let Some(s) = cache.get(&key) {
             return Ok(s.clone());
         }
     }
-    if let Some(mut s) = load_session(session)? {
+    if let Some(mut s) = load_session(root, session)? {
         if let Some(mr) = max_rounds {
             s.max_rounds = mr.max(1);
         }
@@ -375,8 +398,26 @@ fn cap_entry_fields(
     }
 }
 
+fn spill_note(
+    root: &Path,
+    session: &str,
+    entry_id: u64,
+    full_text: &str,
+) -> Result<String, String> {
+    let rel = format!(".wordkeep/notes/mas-{session}-handoff-{entry_id}.md");
+    let heading = format!("MAS handoff spill {session}#{entry_id}");
+    let upsert_args = json!({
+        "path": rel,
+        "heading": heading,
+        "body": full_text,
+        "mode": "replace_file",
+    });
+    knowledge::upsert(root, &upsert_args)?;
+    Ok(rel)
+}
+
 /// Append a compact entry to a session blackboard.
-pub fn post(_root: &Path, args: &Value) -> Result<String, String> {
+pub fn post(root: &Path, args: &Value) -> Result<String, String> {
     let session = required_str(args, "session")?;
     let role = required_str(args, "role")?;
     let mut summary = required_str(args, "summary")?;
@@ -384,15 +425,18 @@ pub fn post(_root: &Path, args: &Value) -> Result<String, String> {
     let mut decisions = string_array(args, "decisions");
     let mut open_questions = string_array(args, "open_questions");
     let anchors = string_array(args, "anchors");
+    let mut commands = string_array(args, "commands");
+    let mut constraints = string_array(args, "constraints");
     let handoff_to = optional_str(args, "handoff_to");
     let tags = string_array(args, "tags");
     let approved = args.get("approved").and_then(Value::as_bool);
+    let kind = optional_str(args, "kind").unwrap_or_else(|| "note".into());
 
     let max_rounds = args
         .get("max_rounds")
         .and_then(Value::as_u64)
         .map(|r| r.max(1));
-    let mut s = get_or_create_session(&session, max_rounds)?;
+    let mut s = get_or_create_session(root, &session, max_rounds)?;
 
     if s.status == "final" {
         return Err(format!(
@@ -406,14 +450,63 @@ pub fn post(_root: &Path, args: &Value) -> Result<String, String> {
         ));
     }
 
-    let cap = entry_token_cap();
-    cap_entry_fields(
-        &mut summary,
-        &mut claims,
-        &mut decisions,
-        &mut open_questions,
-        cap,
+    let is_handoff = kind.eq_ignore_ascii_case("handoff");
+    let cap = if is_handoff {
+        config::mas_handoff_tokens(root)
+    } else {
+        entry_token_cap()
+    };
+
+    let full_for_spill = format!(
+        "{summary}
+
+claims: {claims:?}
+decisions: {decisions:?}
+open_questions: {open_questions:?}
+commands: {commands:?}
+constraints: {constraints:?}
+"
     );
+    let pre_tokens = estimate_tokens(&full_for_spill);
+    let mut note_ref = optional_str(args, "note_ref");
+    let mut spilled = false;
+    if is_handoff && pre_tokens > cap {
+        // Spill full text to notes; keep a bounded blackboard summary.
+        let id_preview = s.next_id;
+        note_ref = Some(spill_note(root, &session, id_preview, &full_for_spill)?);
+        spilled = true;
+        summary = truncate_to_tokens(&summary, cap.saturating_sub(40));
+        if let Some(nr) = &note_ref {
+            summary = format!(
+                "{summary}
+(full handoff spilled to {nr})"
+            );
+        }
+        claims.clear();
+        decisions.clear();
+        open_questions.clear();
+        commands.clear();
+        constraints.clear();
+    } else {
+        cap_entry_fields(
+            &mut summary,
+            &mut claims,
+            &mut decisions,
+            &mut open_questions,
+            cap,
+        );
+        // Also bound commands/constraints lightly.
+        while estimate_tokens(&commands.join("\n")) + estimate_tokens(&summary) > cap
+            && !commands.is_empty()
+        {
+            commands.pop();
+        }
+        while estimate_tokens(&constraints.join("\n")) + estimate_tokens(&summary) > cap
+            && !constraints.is_empty()
+        {
+            constraints.pop();
+        }
+    }
 
     let id = s.next_id;
     s.next_id += 1;
@@ -422,13 +515,17 @@ pub fn post(_root: &Path, args: &Value) -> Result<String, String> {
         id,
         round: s.round,
         role: role.clone(),
+        kind: kind.clone(),
         ts: now,
         summary: summary.clone(),
         claims: claims.clone(),
         decisions: decisions.clone(),
         open_questions: open_questions.clone(),
         anchors,
+        commands: commands.clone(),
+        constraints: constraints.clone(),
         handoff_to: handoff_to.clone(),
+        note_ref: note_ref.clone(),
         tags,
         approved,
     };
@@ -442,22 +539,26 @@ pub fn post(_root: &Path, args: &Value) -> Result<String, String> {
 
     s.entries.push(entry);
     s.updated = now;
-    save_session(&s)?;
+    save_session(root, &s)?;
 
-    let out = format!(
-        "mas_post - session {session}, entry id={id}, round {}/{}, role {role:?}{}",
-        s.round,
-        s.max_rounds,
-        handoff_to
-            .map(|h| format!(", handoff_to {h:?}"))
-            .unwrap_or_default()
+    let mut out = format!(
+        "mas_post - session {session}, entry id={id}, round {}/{}, role {role:?}, kind {kind:?}",
+        s.round, s.max_rounds,
     );
+    if let Some(h) = handoff_to {
+        out.push_str(&format!(", handoff_to {h:?}"));
+    }
+    if spilled {
+        if let Some(nr) = note_ref {
+            out.push_str(&format!(", spilled_to {nr}"));
+        }
+    }
     stats::record("mas_post", distilled as u64, estimate_tokens(&out) as u64);
     Ok(out)
 }
 
 /// Read session blackboard entries, token-budgeted, newest-first.
-pub fn read(_root: &Path, args: &Value) -> Result<String, String> {
+pub fn read(root: &Path, args: &Value) -> Result<String, String> {
     let session = required_str(args, "session")?;
     let budget = args
         .get("token_budget")
@@ -469,7 +570,7 @@ pub fn read(_root: &Path, args: &Value) -> Result<String, String> {
     let tag = optional_str(args, "tag");
     let since_id = args.get("since_id").and_then(Value::as_u64);
 
-    let s = load_session(&session)?.ok_or_else(|| format!("session {session} not found"))?;
+    let s = load_session(root, &session)?.ok_or_else(|| format!("session {session} not found"))?;
 
     let mut filtered: Vec<&Entry> = s.entries.iter().collect();
     if let Some(r) = &recipient {
@@ -526,7 +627,7 @@ pub fn read(_root: &Path, args: &Value) -> Result<String, String> {
 }
 
 /// Recursion bookkeeping: round, per-role counts, convergence hint.
-pub fn status(_root: &Path, args: &Value) -> Result<String, String> {
+pub fn status(root: &Path, args: &Value) -> Result<String, String> {
     let session = required_str(args, "session")?;
     let max_rounds = args
         .get("max_rounds")
@@ -537,8 +638,8 @@ pub fn status(_root: &Path, args: &Value) -> Result<String, String> {
         .and_then(Value::as_bool)
         .unwrap_or(false);
 
-    let mut s = get_or_create_session(&session, max_rounds)?;
-    let existed = load_session(&session)?.is_some();
+    let mut s = get_or_create_session(root, &session, max_rounds)?;
+    let existed = load_session(root, &session)?.is_some();
 
     if advance {
         if s.status == "final" {
@@ -552,9 +653,9 @@ pub fn status(_root: &Path, args: &Value) -> Result<String, String> {
         }
         s.round += 1;
         s.updated = now_secs();
-        save_session(&s)?;
+        save_session(root, &s)?;
     } else if !existed {
-        save_session(&s)?;
+        save_session(root, &s)?;
     }
 
     let counts = role_counts(&s.entries);
@@ -591,6 +692,157 @@ pub fn status(_root: &Path, args: &Value) -> Result<String, String> {
     Ok(out)
 }
 
+/// Snapshot used by session_pressure / handoff.
+#[derive(Clone, Debug)]
+#[allow(dead_code)]
+pub struct SessionSnapshot {
+    pub status: String,
+    pub round: u64,
+    pub max_rounds: u64,
+    pub rounds_remaining: u64,
+    pub open_questions: usize,
+    pub entries: usize,
+    pub result: Option<String>,
+}
+
+/// Load a lightweight session snapshot (None if missing).
+pub fn session_snapshot(root: &Path, session: &str) -> Result<Option<SessionSnapshot>, String> {
+    let Some(s) = load_session(root, session)? else {
+        return Ok(None);
+    };
+    let open_questions = s
+        .entries
+        .iter()
+        .rev()
+        .find(|e| e.role.eq_ignore_ascii_case("critic"))
+        .map(|e| e.open_questions.len())
+        .unwrap_or_else(|| {
+            s.entries
+                .last()
+                .map(|e| e.open_questions.len())
+                .unwrap_or(0)
+        });
+    Ok(Some(SessionSnapshot {
+        status: s.status.clone(),
+        round: s.round,
+        max_rounds: s.max_rounds,
+        rounds_remaining: s.max_rounds.saturating_sub(s.round),
+        open_questions,
+        entries: s.entries.len(),
+        result: s.result.clone(),
+    }))
+}
+
+fn format_handoff_prompt(root: &Path, s: &Session, extra_result: Option<&str>) -> String {
+    let mut anchors = Vec::new();
+    let mut commands = Vec::new();
+    let mut constraints = Vec::new();
+    let mut open_q = Vec::new();
+    let mut decisions = Vec::new();
+    for e in &s.entries {
+        anchors.extend(e.anchors.iter().cloned());
+        commands.extend(e.commands.iter().cloned());
+        constraints.extend(e.constraints.iter().cloned());
+        open_q.extend(e.open_questions.iter().cloned());
+        decisions.extend(e.decisions.iter().cloned());
+    }
+    anchors.sort();
+    anchors.dedup();
+    commands.sort();
+    commands.dedup();
+    constraints.sort();
+    constraints.dedup();
+
+    let defects = defects::unresolved(root);
+    let recent_runs = runs::recent(root, 5);
+
+    let mut out = String::new();
+    out.push_str("# Next-session prime (Wordkeep handoff)\n\n");
+    out.push_str(&format!(
+        "Workspace: {}\nSession: {} (status={}, round {}/{})\n\n",
+        workspace::workspace_id(root),
+        s.session,
+        s.status,
+        s.round,
+        s.max_rounds
+    ));
+    if let Some(r) = extra_result.or(s.result.as_deref()) {
+        out.push_str("## Result / goal\n\n");
+        out.push_str(r);
+        out.push_str("\n\n");
+    }
+    out.push_str("## Priority defects (unresolved)\n\n");
+    if defects.is_empty() {
+        out.push_str("(none)\n\n");
+    } else {
+        for d in defects.iter().take(12) {
+            out.push_str(&format!("- [{}] {} — {}\n", d.status, d.id, d.summary));
+        }
+        out.push('\n');
+    }
+    out.push_str("## Recent gate runs\n\n");
+    if recent_runs.is_empty() {
+        out.push_str("(none recorded)\n\n");
+    } else {
+        for r in &recent_runs {
+            out.push_str(&format!("- [{}] {} — {}\n", r.status, r.id, r.command));
+        }
+        out.push('\n');
+    }
+    if !decisions.is_empty() {
+        out.push_str("## Decisions\n\n");
+        for d in decisions.iter().rev().take(12) {
+            out.push_str(&format!("- {d}\n"));
+        }
+        out.push('\n');
+    }
+    if !open_q.is_empty() {
+        out.push_str("## Open questions\n\n");
+        for q in open_q.iter().rev().take(12) {
+            out.push_str(&format!("- {q}\n"));
+        }
+        out.push('\n');
+    }
+    if !anchors.is_empty() {
+        out.push_str("## Anchors\n\n");
+        out.push_str(&format!("{}\n\n", anchors.join(", ")));
+    }
+    if !commands.is_empty() {
+        out.push_str("## Commands\n\n");
+        for c in &commands {
+            out.push_str(&format!("- `{c}`\n"));
+        }
+        out.push('\n');
+    }
+    if !constraints.is_empty() {
+        out.push_str("## Constraints\n\n");
+        for c in &constraints {
+            out.push_str(&format!("- {c}\n"));
+        }
+        out.push('\n');
+    }
+    // Recent handoff-kind entries
+    let handoffs: Vec<_> = s
+        .entries
+        .iter()
+        .filter(|e| e.kind.eq_ignore_ascii_case("handoff"))
+        .collect();
+    if !handoffs.is_empty() {
+        out.push_str("## Handoff notes\n\n");
+        for e in handoffs.iter().rev().take(3) {
+            out.push_str(&format!("### entry {} ({})\n{}\n", e.id, e.role, e.summary));
+            if let Some(nr) = &e.note_ref {
+                out.push_str(&format!("note_ref: {nr}\n"));
+            }
+            out.push('\n');
+        }
+    }
+    out.push_str(
+        "## Suggested first tools\n\n         1. `defect_list`\n         2. `session_pressure`\n         3. `run_history`\n         4. `knowledge_search` for the active subsystem\n"
+    );
+    out
+}
+
 /// Finalize a session and optionally promote the result to `.wordkeep/notes/`.
 pub fn finalize(root: &Path, args: &Value) -> Result<String, String> {
     let session = required_str(args, "session")?;
@@ -598,19 +850,26 @@ pub fn finalize(root: &Path, args: &Value) -> Result<String, String> {
     let promote = args
         .get("promote")
         .and_then(Value::as_bool)
-        .unwrap_or(false);
+        .unwrap_or_else(|| config::mas_auto_promote(root));
+    let include_prompt = args
+        .get("include_handoff_prompt")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
     let note_path = optional_str(args, "note_path");
     let note_heading = optional_str(args, "note_heading");
 
-    let mut s = load_session(&session)?.ok_or_else(|| format!("session {session} not found"))?;
-    if s.status == "final" {
-        return Err(format!("session {session} is already finalized"));
+    let mut s =
+        load_session(root, &session)?.ok_or_else(|| format!("session {session} not found"))?;
+    if s.status != "final" {
+        s.status = "final".into();
+        s.result = Some(result.clone());
+        s.updated = now_secs();
+        save_session(root, &s)?;
+    } else if s.result.is_none() {
+        s.result = Some(result.clone());
+        s.updated = now_secs();
+        save_session(root, &s)?;
     }
-
-    s.status = "final".into();
-    s.result = Some(result.clone());
-    s.updated = now_secs();
-    save_session(&s)?;
 
     let mut out = format!(
         "mas_finalize - session {session} marked final ({} entries, round {}/{})\n",
@@ -640,10 +899,59 @@ pub fn finalize(root: &Path, args: &Value) -> Result<String, String> {
         }
     }
 
+    if include_prompt {
+        let prompt = format_handoff_prompt(root, &s, Some(&result));
+        out.push_str("\n--- paste-ready next-session prompt ---\n");
+        out.push_str(&prompt);
+        let _ = session_pressure::mark_handoff(root);
+    }
+
     let distilled = estimate_tokens(&result) + s.entries.len() * 64;
     stats::record(
         "mas_finalize",
         distilled as u64,
+        estimate_tokens(&out) as u64,
+    );
+    Ok(out)
+}
+
+/// Build a paste-ready next-session prompt from MAS + defects + runs.
+/// Works for already-finalized sessions. May finalize + promote in one call.
+pub fn session_handoff(root: &Path, args: &Value) -> Result<String, String> {
+    let session = required_str(args, "session")?;
+    let finalize_now = args
+        .get("finalize")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let promote = args
+        .get("promote")
+        .and_then(Value::as_bool)
+        .unwrap_or_else(|| config::mas_auto_promote(root));
+    let result = optional_str(args, "result");
+
+    if finalize_now {
+        let result = result.clone().unwrap_or_else(|| "session handoff".into());
+        let fin_args = json!({
+            "session": session,
+            "result": result,
+            "promote": promote,
+            "include_handoff_prompt": true,
+            "note_path": optional_str(args, "note_path"),
+            "note_heading": optional_str(args, "note_heading"),
+        });
+        return finalize(root, &fin_args);
+    }
+
+    let s = load_session(root, &session)?.ok_or_else(|| format!("session {session} not found"))?;
+    let prompt = format_handoff_prompt(root, &s, result.as_deref());
+    let _ = session_pressure::mark_handoff(root);
+    let out = format!(
+        "session_handoff - session {session} status={}\n\n{}",
+        s.status, prompt
+    );
+    stats::record(
+        "session_handoff",
+        s.entries.len() as u64 * 64,
         estimate_tokens(&out) as u64,
     );
     Ok(out)
@@ -665,6 +973,7 @@ mod tests {
 
     fn with_cache<F: FnOnce()>(f: F) {
         let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _cache_guard = crate::cache::test_env_lock();
         let cache_home = isolated_cache();
         std::env::set_var("XDG_CACHE_HOME", &cache_home);
         if let Ok(mut c) = cache_cell().lock() {
@@ -693,7 +1002,7 @@ mod tests {
                 "summary": long,
             });
             post(Path::new("."), &args).unwrap();
-            let s = load_session("cap-test").unwrap().unwrap();
+            let s = load_session(Path::new("."), "cap-test").unwrap().unwrap();
             assert!(s.entries[0].summary.contains("(truncated)"));
         });
     }
@@ -716,7 +1025,7 @@ mod tests {
                 &json!({"session": "round-test", "advance_round": true}),
             )
             .unwrap();
-            let s = load_session("round-test").unwrap().unwrap();
+            let s = load_session(Path::new("."), "round-test").unwrap().unwrap();
             assert_eq!(s.round, 2);
             status(
                 Path::new("."),
@@ -834,11 +1143,11 @@ mod tests {
             .unwrap();
             let out = finalize(
                 Path::new("."),
-                &json!({"session": "fin-test", "result": "ship it"}),
+                &json!({"session": "fin-test", "result": "ship it", "include_handoff_prompt": false}),
             )
             .unwrap();
             assert!(out.contains("marked final"));
-            let s = load_session("fin-test").unwrap().unwrap();
+            let s = load_session(Path::new("."), "fin-test").unwrap().unwrap();
             assert_eq!(s.status, "final");
             assert_eq!(s.result.as_deref(), Some("ship it"));
             post(
@@ -846,6 +1155,34 @@ mod tests {
                 &json!({"session": "fin-test", "role": "planner", "summary": "nope"}),
             )
             .unwrap_err();
+        });
+    }
+
+    #[test]
+    fn handoff_overflow_spills_to_notes() {
+        with_cache(|| {
+            let root = std::env::temp_dir().join(format!("wk_mas_spill_{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(root.join(".wordkeep")).unwrap();
+            let long = "word ".repeat(2000);
+            let out = post(
+                &root,
+                &json!({
+                    "session": "spill-test",
+                    "role": "planner",
+                    "kind": "handoff",
+                    "summary": long,
+                }),
+            )
+            .unwrap();
+            assert!(out.contains("spilled_to") || out.contains("handoff"));
+            let s = load_session(&root, "spill-test").unwrap().unwrap();
+            assert!(
+                s.entries[0].note_ref.is_some()
+                    || s.entries[0].summary.contains("truncated")
+                    || s.entries[0].summary.contains("spilled")
+            );
+            let _ = std::fs::remove_dir_all(&root);
         });
     }
 }

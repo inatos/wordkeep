@@ -3,6 +3,48 @@
 All notable changes to wordkeep are documented here. The project follows
 [Semantic Versioning](https://semver.org/).
 
+## [0.2.0] - 2026-07-23
+
+Session continuity upgrade: durable handoffs, defects, run evidence, path
+profiles, MCP resources. **36 tools** (28 → 36). Backward compatible with
+0.1.0 stores and configs.
+
+### Added
+
+- Workspace-scoped cache under `wordkeep/workspaces/<root-hash>/` with legacy
+  MAS migration on first access.
+- Path profiles: `path_profiles`, `default_profile`, `profile_hints`; resolution
+  order `paths` → `profile` → keyword hint → `default_paths`.
+- `session_handoff` — paste-ready next-session prime from MAS/defects/runs.
+- `defect_upsert` / `defect_list` — structured `.wordkeep/defects.json` registry;
+  unresolved defects boosted in `knowledge_search` (opt out via `include_defects`).
+- `run_record` / `run_history` plus CLI `wordkeep run-record` (metadata only).
+- `artifact_index` — metadata over configured `artifact_roots` (no image grading).
+- `session_pressure` — heuristic `low|medium|high|critical` pressure proxy.
+- `commit_scope` — read-only git dirty-path grouping by `commit_scopes`.
+- MCP `resources/list` + `resources/read` for `wordkeep://readme` (alias
+  `wordkeep://README`).
+- Design note: [docs/designs/session_continuity.md](docs/designs/session_continuity.md).
+
+### Changed
+
+- MAS entries gain `kind`, `commands`, `constraints`, `note_ref`; `kind:handoff`
+  uses a larger token cap and spills overflow to `.wordkeep/notes/`.
+- `mas_finalize` emits a handoff prompt by default; optional config
+  `mas.auto_promote`.
+- `knowledge_upsert` validates mode first, reports all missing fields together,
+  and allows root `README.md` plus `knowledge_write_roots`.
+- `index_stale` is profile/path aware and distinguishes self-refreshable cache
+  misses from rebuild-needed cases.
+- Stats events carry `workspace_id` (store version 4).
+- `stats` / dashboard counts abbreviate at ≥1M / 1B / 1T / 1Q (`3.25M`, `1.23B`).
+
+### Security
+
+- Artifact scans never follow symlinks outside `--root`.
+- `commit_scope` never stages or commits.
+- Knowledge writes remain allowlisted (README + configured roots only).
+
 ## [0.1.0] - 2026-07-10
 
 First public release.

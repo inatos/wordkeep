@@ -15,24 +15,29 @@ speak JSON tool calls and text payloads - not arbitrary latent buffers.
 
 ## What wordkeep implements instead
 
-A **session-scoped blackboard** under `$XDG_CACHE_HOME/wordkeep/mas/<session>.json`:
+A **session-scoped blackboard** under
+`$XDG_CACHE_HOME/wordkeep/workspaces/<root-hash>/mas/<session>.json`
+(legacy global `wordkeep/mas/` files migrate on first access):
 
 | Tool | Role |
 | --- | --- |
-| `mas_post` | Append a compact entry (summary, claims, decisions, open questions, anchors, `handoff_to`, tags, `approved`) |
+| `mas_post` | Append a compact entry (summary, claims, decisions, open questions, anchors, `commands`, `constraints`, `kind`, `handoff_to`, tags, `approved`) |
 | `mas_read` | Read entries token-budgeted, newest-first; filter by `recipient`, `role`, `round`, `tag`, `since_id` |
 | `mas_status` | Round bookkeeping, per-role counts, convergence hint; `advance_round: true` closes a loop |
-| `mas_finalize` | Mark session done, store consolidated `result`; optional `promote: true` writes `.wordkeep/notes/` for `knowledge_search` |
+| `mas_finalize` | Mark session done, store consolidated `result`; optional `promote`; emits paste-ready handoff prompt by default |
+| `session_handoff` | Build the same handoff template without requiring a fresh finalize (or finalize+promote in one call) |
 
 Design constraints (see `src/mas.rs`):
 
-- **Token caps** - per-entry default ~400 tokens (`WORDKEEP_MAS_ENTRY_TOKENS`); read budget default ~1200.
+- **Token caps** - per-entry default ~400 tokens (`WORDKEEP_MAS_ENTRY_TOKENS`); `kind: "handoff"` uses ~1600 (`mas.handoff_tokens`); overflow spills full text to `.wordkeep/notes/` and keeps a bounded blackboard summary/`note_ref`.
 - **Disk-backed** - each MCP subagent may spawn a fresh process; sessions reload from disk so handoffs still work.
+- **Workspace-scoped** - sessions from different `--root` trees never collide.
 - **Atomic writes** - temp file + rename; session ids validated as slugs (no `/`, no `..`).
 - **Honest telemetry** - blackboard I/O goes through the same `stats` distilled/returned accounting as other tools.
 
 This is the MCP-feasible analog: structured, bounded state instead of re-pasting prior
-agent output into chat.
+agent output into chat. Cross-session continuity (defects, runs, pressure) is documented
+in [session_continuity.md](session_continuity.md).
 
 ## Typical loop
 

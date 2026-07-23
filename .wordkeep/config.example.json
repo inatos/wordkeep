@@ -1,4 +1,24 @@
 {
   "default_paths": ["src", "pkg/lib"],
+  "default_profile": "engine",
+  "path_profiles": {
+    "engine": ["src", "pkg/lib"],
+    "tools": ["tools"]
+  },
+  "profile_hints": {
+    "tools": ["tools/", "kkbp"]
+  },
+  "default_doc_roots": [".cursor/rules", "docs", ".github", "README.md"],
+  "artifact_roots": [],
+  "knowledge_write_roots": [".wordkeep/notes"],
+  "commit_scopes": {
+    "src": ["src/"],
+    "docs": ["docs/", ".cursor/rules/"]
+  },
+  "large_file_bytes": 5242880,
+  "mas": {
+    "auto_promote": false,
+    "handoff_tokens": 1600
+  },
   "test_command": "ctest -R"
 }

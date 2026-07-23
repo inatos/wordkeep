@@ -33,6 +33,14 @@
 //!   * mas_read         - read token-budgeted blackboard entries for subagent handoff
 //!   * mas_status       - recursion round bookkeeping and convergence hint
 //!   * mas_finalize     - finalize a session and optionally promote to knowledge notes
+//!   * session_handoff  - paste-ready next-session prime from MAS/defects/runs
+//!   * defect_upsert    - structured defect registry write
+//!   * defect_list      - list unresolved defects (eyeball_fail first)
+//!   * run_record       - metadata-only gate/run history write
+//!   * run_history      - filter recent runs and missing artifacts
+//!   * artifact_index   - metadata index over configured artifact roots
+//!   * session_pressure - heuristic context-pressure signal
+//!   * commit_scope     - read-only git dirty-path grouping
 //!
 //! Languages: C/C++, GLSL, Rust, Python, C#, and TypeScript via tree-sitter (GLSL
 //! through tree-sitter-glsl, a tree-sitter-c fork sharing the C node kinds;
@@ -47,14 +55,17 @@
 //! tree-sitter trees within a session), `symbol_def` (shared definition locator),
 //! `walk` (skips build/vendor/target and .gitignore'd dirs), `stats` (savings).
 
+mod artifacts;
 mod big_functions;
 mod cache;
 mod call_graph;
 mod call_path;
+mod commit_scope;
 mod config;
 #[cfg(feature = "dashboard")]
 mod dashboard;
 mod dead_code;
+mod defects;
 mod diff_map;
 mod doc_comment;
 mod include_graph;
@@ -68,6 +79,8 @@ mod mcp;
 mod module_map;
 mod outline;
 mod repo_map;
+mod runs;
+mod session_pressure;
 mod stats;
 mod symbol_context;
 mod symbol_def;
@@ -80,6 +93,7 @@ mod type_layout;
 mod undocumented;
 mod usage_examples;
 mod walk;
+mod workspace;
 
 use serde_json::json;
 use std::path::PathBuf;
@@ -104,6 +118,7 @@ fn main() {
         .unwrap_or_else(|| PathBuf::from("."));
 
     let mut want_dashboard = false;
+    let mut run_record_args: Option<Vec<String>> = None;
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
         match arg.as_str() {
@@ -113,14 +128,26 @@ fn main() {
                 }
             }
             "dashboard" => want_dashboard = true,
+            "run-record" => {
+                run_record_args = Some(it.collect());
+                break;
+            }
             "--help" | "-h" => {
                 eprintln!(
                     "wordkeep [--root <workspace>]   speak MCP over stdio (default)\n\
+                     wordkeep run-record [flags]     record gate/run metadata (no command exec)\n\
                      wordkeep dashboard              live savings dashboard (build --features dashboard)"
                 );
                 return;
             }
             _ => {}
+        }
+    }
+
+    if let Some(argv) = run_record_args {
+        match runs::cli_record(&root, &argv) {
+            Ok(()) => return,
+            Err(code) => std::process::exit(code),
         }
     }
 
@@ -143,6 +170,7 @@ fn main() {
     }
 
     eprintln!("[wordkeep] root = {}", root.display());
+    stats::set_workspace_root(&root);
 
     let root_map = root.clone();
     let root_outline = root.clone();
@@ -170,7 +198,15 @@ fn main() {
     let root_mas_post = root.clone();
     let root_mas_read = root.clone();
     let root_mas_status = root.clone();
-    let root_mas_finalize = root;
+    let root_mas_finalize = root.clone();
+    let root_session_handoff = root.clone();
+    let root_defect_upsert = root.clone();
+    let root_defect_list = root.clone();
+    let root_run_record = root.clone();
+    let root_run_history = root.clone();
+    let root_artifact_index = root.clone();
+    let root_session_pressure = root.clone();
+    let root_commit_scope = root;
 
     let raw_tools = vec![
         mcp::Tool {
@@ -183,7 +219,9 @@ fn main() {
                 "type": "object",
                 "properties": {
                     "paths": { "type": "array", "items": { "type": "string" },
-                               "description": "Subdirs (relative to root) to map. Default: .wordkeep/config.json default_paths, else src only." },
+                               "description": "Subdirs (relative to root) to map. Default: profile / default_paths / src." },
+                    "profile": { "type": "string",
+                                 "description": "Named path_profiles entry from .wordkeep/config.json (ignored when paths is set)." },
                     "pattern": { "type": "string",
                                  "description": "Case-insensitive substring filter on file path." },
                     "token_budget": { "type": "integer",
@@ -576,7 +614,9 @@ fn main() {
                                "description": "Natural-language or keyword query." },
                     "k": { "type": "integer", "description": "Chunks to return. Default 5." },
                     "roots": { "type": "array", "items": { "type": "string" },
-                               "description": "Doc roots to search. Default .cursor/rules, docs, .github, README.md." },
+                               "description": "Doc roots to search. Default default_doc_roots or .cursor/rules, docs, .github, README.md." },
+                    "include_defects": { "type": "boolean",
+                                         "description": "Boost unresolved .wordkeep/defects.json into results. Default true." },
                     "token_budget": { "type": "integer",
                                       "description": "Approx max tokens to return. Default 1200." },
                     "semantic": { "type": "boolean",
@@ -588,21 +628,21 @@ fn main() {
         },
         mcp::Tool {
             name: "knowledge_upsert",
-            description: "Write or update a markdown section under .cursor/rules/, docs/, or \
-                          .wordkeep/notes/ so the next knowledge_search can retrieve it. Default \
-                          mode upsert_section replaces an existing # heading body or appends a new \
-                          section. mode pitfall formats symptom/root_cause/fix (+ optional test_tag) \
-                          into a searchable pitfall entry. Use instead of hand-editing rules when \
-                          recording session findings.",
+            description: "Write or update a markdown section under .cursor/rules/, docs/, \
+                          .wordkeep/notes/, root README.md, or configured knowledge_write_roots \
+                          so the next knowledge_search can retrieve it. Default mode upsert_section \
+                          replaces an existing # heading body or appends a new section. mode pitfall \
+                          formats symptom/root_cause/fix (+ optional test_tag). Reports all missing \
+                          mode-specific fields together.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "path": { "type": "string",
-                              "description": "Relative path (.md/.mdc). Must be under .cursor/rules, docs, or .wordkeep/notes." },
+                              "description": "Relative path (.md/.mdc). README.md or under allowed write roots." },
                     "heading": { "type": "string",
-                                 "description": "Section heading (written as # heading). Optional for mode pitfall (defaults from symptom)." },
+                                 "description": "Section heading (written as # heading). Required except mode pitfall." },
                     "body": { "type": "string",
-                              "description": "Markdown body for the section (no leading #). Not used for mode pitfall." },
+                              "description": "Markdown body for the section (no leading #). Required except mode pitfall." },
                     "description": { "type": "string",
                                        "description": "Frontmatter description when creating a new .mdc file." },
                     "always_apply": { "type": "boolean",
@@ -747,6 +787,14 @@ fn main() {
                                         "description": "Optional unresolved questions." },
                     "anchors": { "type": "array", "items": { "type": "string" },
                                  "description": "Optional file:line refs." },
+                    "commands": { "type": "array", "items": { "type": "string" },
+                                  "description": "Optional shell/commands to preserve across sessions." },
+                    "constraints": { "type": "array", "items": { "type": "string" },
+                                     "description": "Optional hard constraints for the next agent." },
+                    "kind": { "type": "string",
+                              "description": "note (default ~400 tok) or handoff (~1600 tok; overflow spills to notes)." },
+                    "note_ref": { "type": "string",
+                                  "description": "Optional link to a spilled/full note path." },
                     "handoff_to": { "type": "string",
                                     "description": "Role that should read this entry next." },
                     "tags": { "type": "array", "items": { "type": "string" },
@@ -806,7 +854,8 @@ fn main() {
             name: "mas_finalize",
             description: "Mark a Recursive-MAS session final, store the consolidated result, and \
                           optionally promote it to .wordkeep/notes/ via knowledge_upsert so \
-                          knowledge_search can recall the decision later.",
+                          knowledge_search can recall the decision later. Also emits a paste-ready \
+                          next-session handoff prompt by default.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -814,7 +863,9 @@ fn main() {
                     "result": { "type": "string",
                                 "description": "Final consolidated answer. Required." },
                     "promote": { "type": "boolean",
-                                 "description": "Write result to .wordkeep/notes/. Default false." },
+                                 "description": "Write result to .wordkeep/notes/. Default from config mas.auto_promote, else false." },
+                    "include_handoff_prompt": { "type": "boolean",
+                                 "description": "Append paste-ready next-session prompt. Default true." },
                     "note_path": { "type": "string",
                                    "description": "Relative note path when promote is true. Default .wordkeep/notes/mas-<session>.md." },
                     "note_heading": { "type": "string",
@@ -823,6 +874,146 @@ fn main() {
                 "required": ["session", "result"]
             }),
             handler: Box::new(move |args| mas::finalize(&root_mas_finalize, args)),
+        },
+        mcp::Tool {
+            name: "session_handoff",
+            description: "Format a deterministic, paste-ready next-session prime prompt from MAS \
+                          state, unresolved defects, recent gate runs, anchors, commands, and \
+                          constraints. Works for already-finalized sessions; may finalize+promote \
+                          in one call when finalize:true.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "session": { "type": "string", "description": "MAS session slug. Required." },
+                    "result": { "type": "string", "description": "Optional goal/result override." },
+                    "finalize": { "type": "boolean", "description": "Also finalize the session. Default false." },
+                    "promote": { "type": "boolean", "description": "When finalize, promote to notes." },
+                    "note_path": { "type": "string" },
+                    "note_heading": { "type": "string" }
+                },
+                "required": ["session"]
+            }),
+            handler: Box::new(move |args| mas::session_handoff(&root_session_handoff, args)),
+        },
+        mcp::Tool {
+            name: "defect_upsert",
+            description: "Create or update a structured defect in .wordkeep/defects.json \
+                          (open|gated|eyeball_fail|done). Open eyeball defects are boosted in \
+                          knowledge_search so they outrank stale gate-passed prose.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string", "description": "Stable id; auto-generated when omitted." },
+                    "summary": { "type": "string", "description": "Short defect summary. Required." },
+                    "status": { "type": "string", "description": "open|gated|eyeball_fail|done. Default open." },
+                    "subsystem": { "type": "string" },
+                    "acceptance": { "type": "array", "items": { "type": "string" } },
+                    "evidence": { "type": "array", "items": { "type": "string" } },
+                    "anchors": { "type": "array", "items": { "type": "string" } },
+                    "tags": { "type": "array", "items": { "type": "string" } }
+                },
+                "required": ["summary"]
+            }),
+            handler: Box::new(move |args| defects::upsert(&root_defect_upsert, args)),
+        },
+        mcp::Tool {
+            name: "defect_list",
+            description: "List defects (default: unresolved). Ordered eyeball_fail → open → gated → done.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "include_done": { "type": "boolean", "description": "Include done defects. Default false." },
+                    "status": { "type": "string" },
+                    "subsystem": { "type": "string" },
+                    "tag": { "type": "string" },
+                    "query": { "type": "string" }
+                }
+            }),
+            handler: Box::new(move |args| defects::list(&root_defect_list, args)),
+        },
+        mcp::Tool {
+            name: "run_record",
+            description: "Record gate/run metadata only (never executes commands). Prefer the \
+                          `wordkeep run-record` CLI from shell gates when MCP is unavailable.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string" },
+                    "command": { "type": "string", "description": "Command string that was run. Required." },
+                    "status": { "type": "string", "description": "running|passed|failed|cancelled." },
+                    "exit_code": { "type": "integer" },
+                    "duration_ms": { "type": "integer" },
+                    "summary": { "type": "string" },
+                    "log_path": { "type": "string" },
+                    "key_failures": { "type": "array", "items": { "type": "string" } },
+                    "artifacts": { "type": "array", "items": { "type": "string" } },
+                    "tags": { "type": "array", "items": { "type": "string" } },
+                    "defect_ids": { "type": "array", "items": { "type": "string" } }
+                },
+                "required": ["command"]
+            }),
+            handler: Box::new(move |args| runs::record(&root_run_record, args)),
+        },
+        mcp::Tool {
+            name: "run_history",
+            description: "List recent run records; flags missing logs/artifacts.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "status": { "type": "string" },
+                    "tag": { "type": "string" },
+                    "limit": { "type": "integer", "description": "Max runs to show. Default 20." }
+                }
+            }),
+            handler: Box::new(move |args| runs::history(&root_run_history, args)),
+        },
+        mcp::Tool {
+            name: "artifact_index",
+            description: "Index metadata under configured artifact_roots (path/mtime/size/type, \
+                          PNG dimensions, shallow JSON keys). Indexes evidence; does NOT grade images. \
+                          Never follows symlinks outside the workspace.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "roots": { "type": "array", "items": { "type": "string" },
+                               "description": "Override artifact_roots from config." },
+                    "query": { "type": "string" },
+                    "kind": { "type": "string" },
+                    "newest": { "type": "boolean" },
+                    "refresh": { "type": "boolean", "description": "Rescan roots. Default false (use cache)." },
+                    "limit": { "type": "integer" },
+                    "token_budget": { "type": "integer" }
+                }
+            }),
+            handler: Box::new(move |args| artifacts::index(&root_artifact_index, args)),
+        },
+        mcp::Tool {
+            name: "session_pressure",
+            description: "Heuristic context-pressure proxy (low|medium|high|critical) from tool \
+                          events since last durable handoff, error/truncation rate, MAS open \
+                          questions/round budget, unresolved defects, and failed runs. Host turn \
+                          count / true context-window usage is unavailable.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "session": { "type": "string", "description": "Optional MAS session to include in scoring." }
+                }
+            }),
+            handler: Box::new(move |args| session_pressure::report(&root_session_pressure, args)),
+        },
+        mcp::Tool {
+            name: "commit_scope",
+            description: "Read-only: group git status --porcelain paths by configured commit_scopes \
+                          and warn about secrets, generated dirs, binaries, and large files. \
+                          Never stages or commits.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "large_file_bytes": { "type": "integer",
+                                          "description": "Override large-file warning threshold." }
+                }
+            }),
+            handler: Box::new(move |args| commit_scope::propose(&root_commit_scope, args)),
         },
     ];
 
@@ -841,8 +1032,18 @@ fn main() {
         })
         .collect();
 
+    const README_RESOURCE: &str = include_str!("../README.md");
+    let resources = vec![mcp::Resource {
+        uri: "wordkeep://readme",
+        name: "Wordkeep README",
+        description: "Canonical Wordkeep README (also accepted as wordkeep://README).",
+        mime_type: "text/markdown",
+        text: README_RESOURCE,
+    }];
+
     let server = mcp::Server {
         tools,
+        resources,
         server_name: "wordkeep".to_string(),
         server_version: env!("CARGO_PKG_VERSION").to_string(),
     };
