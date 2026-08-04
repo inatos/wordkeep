@@ -44,7 +44,8 @@ pub(crate) fn analyze(root: &Path, config: &WikiConfig) -> Result<Value, String>
                 if link.is_external {
                     continue;
                 }
-                let Some(target) = resolve_internal(&document.relative, &link.target, &paths) else {
+                let Some(target) = resolve_internal(&document.relative, &link.target, &paths)
+                else {
                     broken.push(json!({
                         "source": document.relative,
                         "heading": section.heading,

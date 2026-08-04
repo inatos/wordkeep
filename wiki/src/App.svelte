@@ -14,6 +14,7 @@
     savePage,
     search,
     snippetOf,
+    type DashboardActivity,
     type DashboardPayload,
     type GardenPayload,
     type OutlineSection,
@@ -49,6 +50,7 @@
     | 'avg_ms'
     | 'trunc_count'
     | 'error_count'
+    | 'invalid_count'
     | 'baseline_tokens'
     | 'returned_tokens'
     | 'saved'
@@ -824,6 +826,14 @@
     return sortDir === 'asc' ? ' ↑' : ' ↓';
   }
 
+  function activityTitle(event: DashboardActivity): string {
+    const help = toolHelp(event.tool);
+    if (event.outcome === 'ok') return help;
+    const reason = (event.reason || '').trim();
+    if (reason) return `${event.outcome}: ${reason}`;
+    return `${help}\nOutcome: ${event.outcome}`;
+  }
+
   function toolValue(tool: DashboardTool, key: SortKey): string | number {
     switch (key) {
       case 'name':
@@ -836,6 +846,8 @@
         return tool.trunc_count;
       case 'error_count':
         return tool.error_count;
+      case 'invalid_count':
+        return tool.invalid_count ?? 0;
       case 'baseline_tokens':
         return tool.baseline_tokens;
       case 'returned_tokens':
@@ -2264,6 +2276,15 @@
                     <button
                       type="button"
                       class="sort-btn"
+                      title={COLUMN_HELP.inv}
+                      onclick={() => toggleSort('invalid_count')}
+                      >Inv{sortMark('invalid_count')}</button
+                    >
+                  </th>
+                  <th>
+                    <button
+                      type="button"
+                      class="sort-btn"
                       title={COLUMN_HELP.distill}
                       onclick={() => toggleSort('baseline_tokens')}
                       >Distill{sortMark('baseline_tokens')}</button
@@ -2326,6 +2347,7 @@
                     <td title={COLUMN_HELP.avg_ms}>{tool.avg_ms}ms</td>
                     <td title={COLUMN_HELP.trunc}>{tool.trunc_count || '—'}</td>
                     <td title={COLUMN_HELP.err}>{tool.error_count || '—'}</td>
+                    <td title={COLUMN_HELP.inv}>{tool.invalid_count || '—'}</td>
                     <td title={COLUMN_HELP.distill}
                       >{tool.baseline_fmt ?? tool.baseline_tokens}</td
                     >
@@ -2368,28 +2390,48 @@
                 >
                 Recent activity
               </h3>
-              <ul class="plain activity">
-                {#each dashboard.activity || [] as event}
-                  <li title={toolHelp(event.tool)}>
-                    <code class="ago">{event.ago}</code>
-                    <code title={toolHelp(event.tool)}>{event.tool}</code>
-                    <span class="muted">{event.elapsed_ms}ms</span>
-                    <span class="good"
-                      >+{event.baseline_fmt ?? event.baseline} → {event.returned_fmt ??
-                        event.returned}</span
-                    >
-                    {#if event.outcome !== 'ok'}
-                      <span
-                        class="chip warn"
-                        title="Call outcome: {event.outcome}"
-                        >{event.outcome}</span
+              <div class="table-wrap">
+                <table class="dash-table">
+                  <thead>
+                    <tr>
+                      <th class="static" title="Time since the call">When</th>
+                      <th class="static" title="MCP tool name">Tool</th>
+                      <th class="static" title="Wall time for the call">Ms</th>
+                      <th class="static" title="Estimated tokens without wordkeep">Distill</th>
+                      <th class="static" title="Tokens actually returned">Return</th>
+                      <th class="static" title="Call outcome (ok / trunc / error / low-yield)"
+                        >Outcome</th
                       >
-                    {/if}
-                  </li>
-                {:else}
-                  <li class="muted">No recent MCP events.</li>
-                {/each}
-              </ul>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {#each dashboard.activity || [] as event}
+                      <tr title={activityTitle(event)}>
+                        <td class="muted">{event.ago}</td>
+                        <td class="tool-name"
+                          ><code title={activityTitle(event)}>{event.tool}</code></td
+                        >
+                        <td>{event.elapsed_ms}ms</td>
+                        <td class="good">{event.baseline_fmt ?? event.baseline}</td>
+                        <td>{event.returned_fmt ?? event.returned}</td>
+                        <td>
+                          {#if event.outcome !== 'ok'}
+                            <span class="chip warn" title={activityTitle(event)}
+                              >{event.outcome}</span
+                            >
+                          {:else}
+                            <span class="muted">ok</span>
+                          {/if}
+                        </td>
+                      </tr>
+                    {:else}
+                      <tr>
+                        <td colspan="6" class="muted">No recent MCP events.</td>
+                      </tr>
+                    {/each}
+                  </tbody>
+                </table>
+              </div>
             </div>
             <div>
               <h3
@@ -2407,20 +2449,39 @@
                 >
                 Health signals
               </h3>
-              <ul class="plain signals">
-                {#each dashboard.health?.signals || [] as signal}
-                  <li
-                    class={`signal-${signal.kind}`}
-                    title={`${signal.label}: ${signal.value ?? '—'}${signal.detail ? ` (${signal.detail})` : ''}`}
-                  >
-                    <span class="muted">{signal.label}</span>
-                    <strong>{signal.value ?? '—'}</strong>
-                    {#if signal.detail}
-                      <code>{signal.detail}</code>
-                    {/if}
-                  </li>
-                {/each}
-              </ul>
+              <div class="table-wrap">
+                <table class="dash-table">
+                  <thead>
+                    <tr>
+                      <th class="static" title="Signal category">Signal</th>
+                      <th class="static" title="Primary value">Value</th>
+                      <th class="static" title="Related tool or note">Detail</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {#each dashboard.health?.signals || [] as signal}
+                      <tr
+                        class={`signal-${signal.kind}`}
+                        title={`${signal.label}: ${signal.value ?? '—'}${signal.detail ? ` (${signal.detail})` : ''}`}
+                      >
+                        <td class="muted">{signal.label}</td>
+                        <td class="signal-value">{signal.value ?? '—'}</td>
+                        <td>
+                          {#if signal.detail}
+                            <code>{signal.detail}</code>
+                          {:else}
+                            <span class="muted">—</span>
+                          {/if}
+                        </td>
+                      </tr>
+                    {:else}
+                      <tr>
+                        <td colspan="3" class="muted">No health signals yet.</td>
+                      </tr>
+                    {/each}
+                  </tbody>
+                </table>
+              </div>
             </div>
           </div>
         {/if}
@@ -3433,8 +3494,7 @@
     font-size: 0.95em;
   }
   .metric.good code,
-  .dash-table .good,
-  .activity .good {
+  .dash-table .good {
     color: #7dce9a;
   }
   .table-wrap {
@@ -3468,6 +3528,9 @@
     background: rgba(0, 0, 0, 0.18);
     padding: 0;
   }
+  .dash-table thead th.static {
+    padding: 0.4rem 0.55rem;
+  }
   .sort-btn {
     width: 100%;
     border: 0;
@@ -3490,6 +3553,9 @@
     font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
     letter-spacing: 0.02em;
   }
+  .dash-table .tool-name {
+    text-align: left;
+  }
   .dash-table .tool-name code {
     font-size: 0.9em;
   }
@@ -3498,24 +3564,11 @@
     grid-template-columns: 1.4fr 1fr;
     gap: 1rem;
   }
-  .activity li,
-  .signals li {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 0.45rem;
-    align-items: baseline;
-    padding: 0.28rem 0;
-    border-bottom: 1px solid rgba(255, 255, 255, 0.04);
-  }
-  .activity .ago {
-    min-width: 2.4rem;
-    color: var(--muted);
-  }
-  .signal-ok strong {
+  .dash-table tr.signal-ok .signal-value {
     color: #7dce9a;
   }
-  .signal-warn strong,
-  .signal-danger strong {
+  .dash-table tr.signal-warn .signal-value,
+  .dash-table tr.signal-danger .signal-value {
     color: #e87b7b;
   }
   .cmd-row {

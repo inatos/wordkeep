@@ -100,6 +100,7 @@ export type DashboardTool = {
   avg_ms: number;
   trunc_count: number;
   error_count: number;
+  invalid_count?: number;
   low_yield_count?: number;
   baseline_tokens: number;
   baseline_fmt?: string;
@@ -125,6 +126,7 @@ export type DashboardActivity = {
   returned: number;
   saved: number;
   outcome: string;
+  reason?: string | null;
   baseline_fmt?: string;
   returned_fmt?: string;
 };

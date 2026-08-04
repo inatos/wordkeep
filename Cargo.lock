@@ -4131,11 +4131,11 @@ dependencies = [
 
 [[package]]
 name = "wordkeep-knowledge"
-version = "0.1.0"
+version = "0.3.0"
 
 [[package]]
 name = "wordkeep-wiki"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "axum",
  "clap",

@@ -3,7 +3,7 @@
 All notable changes to wordkeep are documented here. The project follows
 [Semantic Versioning](https://semver.org/).
 
-## [0.3.0] - 2026-08-03
+## [0.3.0] - 2026-08-04
 
 Telemetry truthfulness, `diff_map` hot-path fix, shared Markdown knowledge
 crate, and the `wordkeep-wiki` companion (Meilisearch + dark Svelte UI).
@@ -34,11 +34,23 @@ crate, and the `wordkeep-wiki` companion (Meilisearch + dark Svelte UI).
   baseline floors.
 - `knowledge_search` chunking uses `wordkeep-knowledge` (fenced `#` ignored).
 - Workspace Cargo members: `.`, `crates/wordkeep-knowledge`, `crates/wordkeep-wiki`.
+- Validation / missing-arg `Err`s classify as **`invalid`** (not `error`) so
+  health “error-prone” tracks real failures.
+- `defect_list` distill baseline uses on-disk store size (not a tiny per-row
+  guess) to avoid false net-negative.
+- Standalone terminal dashboard keeps embedded `savings.json` events (no longer
+  drops the ring when `STATS` is unset).
+- `savings.json` v5 flush re-embeds the capped events ring (with optional
+  `reason`) so the wiki GUI stays in sync without the live MCP process.
 
 ### Fixed
 
 - `session_pressure` event window no longer capped at the 200-event ring
   (reads append-only jsonl).
+- Terminal dashboard **Recent activity** empty while GUI showed events
+  (`read_snapshot` discarded loaded events).
+- Non-ok activity outcomes now persist a short `reason` (first line of the
+  error / hint) for GUI hover tooltips.
 
 ### Notes
 
@@ -47,10 +59,13 @@ crate, and the `wordkeep-wiki` companion (Meilisearch + dark Svelte UI).
   billing.
 - Wiki UI/API now includes instant search, TOC/deep links, recent files, link
   garden health, local search telemetry (raw queries remain opt-in), GUI
-  dashboard, editor tabs, frontmatter tag CRUD + colors, and searchable
+  dashboard (tools + **Inv** column; activity/health as tables; error hover
+  reasons), editor tabs, frontmatter tag CRUD + colors, and searchable
   kind/root/tag/recent comboboxes.
 - Future wiki user-state persistence: Turso/libSQL (not required for MVP).
 - No separate vector DB; Meilisearch hybrid/vectors optional later.
+- Historical `error_count` aggregates may stay inflated until new calls dominate
+  or `savings.json` is reset; only new outcomes use the Invalid split.
 
 
 ## [0.2.0] - 2026-07-23

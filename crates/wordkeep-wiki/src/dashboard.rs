@@ -22,7 +22,8 @@ pub(crate) fn build() -> Result<Value, String> {
         }));
     }
 
-    let bytes = std::fs::read(&path).map_err(|error| format!("read {}: {error}", path.display()))?;
+    let bytes =
+        std::fs::read(&path).map_err(|error| format!("read {}: {error}", path.display()))?;
     let data: Value = serde_json::from_slice(&bytes)
         .map_err(|error| format!("parse {}: {error}", path.display()))?;
 
@@ -58,10 +59,16 @@ pub(crate) fn build() -> Result<Value, String> {
     let mut returned = 0u64;
     for tool in &tools {
         calls = calls.saturating_add(tool.get("calls").and_then(Value::as_u64).unwrap_or(0));
-        baseline =
-            baseline.saturating_add(tool.get("baseline_tokens").and_then(Value::as_u64).unwrap_or(0));
-        returned =
-            returned.saturating_add(tool.get("returned_tokens").and_then(Value::as_u64).unwrap_or(0));
+        baseline = baseline.saturating_add(
+            tool.get("baseline_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+        );
+        returned = returned.saturating_add(
+            tool.get("returned_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+        );
     }
     let saved = baseline.saturating_sub(returned);
     let pct = pct(saved, baseline);
@@ -85,10 +92,12 @@ pub(crate) fn build() -> Result<Value, String> {
                         .map(|us| us / 1000)
                 })
                 .unwrap_or(0);
-            let outcome = event
-                .get("outcome")
+            let outcome = event.get("outcome").and_then(Value::as_str).unwrap_or("ok");
+            let reason = event
+                .get("reason")
                 .and_then(Value::as_str)
-                .unwrap_or("ok");
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
             Some(json!({
                 "ts": ts,
                 "ago": ago(now, ts),
@@ -98,6 +107,7 @@ pub(crate) fn build() -> Result<Value, String> {
                 "returned": returned,
                 "saved": baseline.saturating_sub(returned),
                 "outcome": outcome,
+                "reason": reason,
                 "baseline_fmt": commafy(baseline),
                 "returned_fmt": commafy(returned)
             }))
@@ -140,10 +150,19 @@ fn tool_row(name: &str, tool: &Value) -> Value {
         .and_then(Value::as_u64)
         .unwrap_or(0);
     let saved = baseline.saturating_sub(returned);
-    let total_ms = tool.get("total_ms").and_then(Value::as_u64).unwrap_or(0);
+    let total_ms = tool
+        .get("total_us")
+        .and_then(Value::as_u64)
+        .map(|us| us / 1000)
+        .or_else(|| tool.get("total_ms").and_then(Value::as_u64))
+        .unwrap_or(0);
     let avg_ms = if calls == 0 { 0 } else { total_ms / calls };
     let trunc = tool.get("trunc_count").and_then(Value::as_u64).unwrap_or(0);
     let errors = tool.get("error_count").and_then(Value::as_u64).unwrap_or(0);
+    let invalid = tool
+        .get("invalid_count")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
     let low_yield = tool
         .get("low_yield_count")
         .and_then(Value::as_u64)
@@ -169,6 +188,7 @@ fn tool_row(name: &str, tool: &Value) -> Value {
         "avg_ms": avg_ms,
         "trunc_count": trunc,
         "error_count": errors,
+        "invalid_count": invalid,
         "low_yield_count": low_yield,
         "baseline_tokens": baseline,
         "baseline_fmt": commafy(baseline),
@@ -265,7 +285,11 @@ fn health_signals(tools: &[Value]) -> Value {
 
     let inverted: Vec<String> = tools
         .iter()
-        .filter(|tool| tool.get("inverted").and_then(Value::as_bool).unwrap_or(false))
+        .filter(|tool| {
+            tool.get("inverted")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        })
         .filter(|tool| {
             let baseline = tool
                 .get("baseline_tokens")
@@ -299,8 +323,7 @@ fn health_signals(tools: &[Value]) -> Value {
 }
 
 fn is_notable_low_yield(calls: u64, low_yield_count: u64) -> bool {
-    calls >= LOW_YIELD_MIN_CALLS
-        && low_yield_count * 100 / calls.max(1) >= LOW_YIELD_RATE_PCT
+    calls >= LOW_YIELD_MIN_CALLS && low_yield_count * 100 / calls.max(1) >= LOW_YIELD_RATE_PCT
 }
 
 fn is_net_negative(baseline: u64, returned: u64) -> bool {

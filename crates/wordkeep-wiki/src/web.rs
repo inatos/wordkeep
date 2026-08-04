@@ -379,9 +379,7 @@ async fn recent(State(state): State<AppState>, Query(query): Query<LimitQuery>) 
             .modified()
             .ok()
             .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|duration| {
-                duration.as_secs() * 1_000_000_000 + u64::from(duration.subsec_nanos())
-            })
+            .map(|duration| duration.as_secs() * 1_000_000_000 + u64::from(duration.subsec_nanos()))
             .unwrap_or(0);
         rows.push((
             mtime_ns,
@@ -414,10 +412,7 @@ struct ClickBody {
     rank: u32,
 }
 
-async fn search_click(
-    State(state): State<AppState>,
-    Json(body): Json<ClickBody>,
-) -> ApiResult {
+async fn search_click(State(state): State<AppState>, Json(body): Json<ClickBody>) -> ApiResult {
     let rank = body.rank.max(1);
     telemetry::record_click(&state.root, rank)
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error))?;

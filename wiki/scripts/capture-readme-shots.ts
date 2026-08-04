@@ -137,14 +137,25 @@ const toolRows = tools
 const activityRows = activity
   .map(
     (e: any) =>
-      `<div class="act"><span class="dim">${esc(e.ago)}</span> <span class="cyan">${esc(e.tool)}</span> <span class="dim">${e.elapsed_ms}ms</span> <span class="good">+${esc(e.baseline_fmt ?? e.baseline)} → ${esc(e.returned_fmt ?? e.returned)}</span></div>`,
+      `<tr>
+      <td class="dim">${esc(e.ago)}</td>
+      <td class="name">${esc(e.tool)}</td>
+      <td>${e.elapsed_ms}ms</td>
+      <td class="good">${esc(e.baseline_fmt ?? e.baseline)}</td>
+      <td>${esc(e.returned_fmt ?? e.returned)}</td>
+      <td class="dim">${esc(e.outcome || 'ok')}</td>
+    </tr>`,
   )
   .join('');
 
 const signalRows = signals
   .map(
     (s: any) =>
-      `<div><span class="dim">${esc(s.label)}</span> <strong class="${esc(s.kind)}">${esc(String(s.value ?? '—'))}</strong> ${s.detail ? `<span class="dim">(${esc(s.detail)})</span>` : ''}</div>`,
+      `<tr>
+      <td class="dim">${esc(s.label)}</td>
+      <td class="${esc(s.kind)}">${esc(String(s.value ?? '—'))}</td>
+      <td class="dim">${s.detail ? esc(s.detail) : '—'}</td>
+    </tr>`,
   )
   .join('');
 
@@ -173,7 +184,6 @@ const html = `<!doctype html>
   td.name { color: #f0f0f0; }
   td.bar { letter-spacing: 0.02em; color: #9ad4a8; }
   .split { display: grid; grid-template-columns: 1.35fr 1fr; gap: 12px; }
-  .act { margin: 2px 0; }
   h1 { font-size: 14px; margin: 0 0 12px; color: #bdbdbd; font-weight: 600; }
 </style>
 </head>
@@ -205,11 +215,25 @@ const html = `<!doctype html>
   <div class="split">
     <div class="panel">
       <div class="title"> recent activity </div>
-      <div class="body">${activityRows || '<div class="dim">no recent events</div>'}</div>
+      <div class="body">
+        <table>
+          <thead><tr>
+            <th>when</th><th>tool</th><th>ms</th><th>distill</th><th>return</th><th>outcome</th>
+          </tr></thead>
+          <tbody>${activityRows || '<tr><td colspan="6" class="dim">no recent events</td></tr>'}</tbody>
+        </table>
+      </div>
     </div>
     <div class="panel">
       <div class="title"> health </div>
-      <div class="body">${signalRows}</div>
+      <div class="body">
+        <table>
+          <thead><tr>
+            <th>signal</th><th>value</th><th>detail</th>
+          </tr></thead>
+          <tbody>${signalRows || '<tr><td colspan="3" class="dim">none</td></tr>'}</tbody>
+        </table>
+      </div>
     </div>
   </div>
 </div>

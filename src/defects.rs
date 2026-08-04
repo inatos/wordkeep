@@ -300,11 +300,12 @@ pub fn list(root: &Path, args: &Value) -> Result<String, String> {
     if defects.is_empty() {
         out.push_str("\n(no matching defects)\n");
     }
-    stats::record(
-        "defect_list",
-        defects.len() as u64 * 32,
-        (out.len() / 4) as u64,
-    );
+    // Distill = on-disk store size (raw JSON), not a per-row guess — the list
+    // output often exceeds a tiny synthetic baseline and falsely flipped net-negative.
+    let store_tokens = std::fs::metadata(store_path(root))
+        .map(|m| m.len() / 4)
+        .unwrap_or(0) as u64;
+    stats::record("defect_list", store_tokens.max(64), (out.len() / 4) as u64);
     Ok(out)
 }
 

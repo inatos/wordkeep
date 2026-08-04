@@ -390,11 +390,16 @@ impl Store {
         } else {
             self.saved_workspace_id.clone()
         };
+        // Keep a capped events ring in savings.json so the wiki GUI (and
+        // standalone dashboard) can show recent activity + outcome reasons
+        // without needing the live MCP process or workspace jsonl path.
+        let events: Vec<Value> = self.events.iter().map(Event::to_jsonl).collect();
         let doc = json!({
             "version": 5,
             "since": self.since,
             "workspace_id": wid,
             "tools": Value::Object(tools),
+            "events": events,
         });
         let dir = cache::dir();
         let _ = std::fs::create_dir_all(&dir);
@@ -552,14 +557,27 @@ fn looks_like_not_found(text: &str) -> bool {
 fn looks_like_invalid(text: &str) -> bool {
     let t = text.to_ascii_lowercase();
     t.contains("is required")
+        || t.contains("requires:")
+        || t.contains("requires ")
         || t.contains("invalid ")
+        || t.contains("unknown mode")
         || t.contains("must be")
         || t.contains("must provide")
+        || t.contains("must end with")
+        || t.contains("expected ")
 }
 
 /// Classify a tool result for telemetry.
 pub fn classify_outcome(result: &Result<String, String>, returned_tokens: u64) -> Outcome {
-    if result.is_err() {
+    // Validation / missing-arg Errs are agent misuse, not tool failures — keep
+    // them off the error-prone health signal so real panics/IO stand out.
+    if let Err(e) = result {
+        if looks_like_invalid(e) {
+            return Outcome::Invalid;
+        }
+        if looks_like_not_found(e) {
+            return Outcome::NotFound;
+        }
         return Outcome::Error;
     }
     let Ok(text) = result else {
@@ -587,8 +605,11 @@ pub fn classify_outcome(result: &Result<String, String>, returned_tokens: u64) -
 ///
 /// `elapsed_us` is wall time in **microseconds** (see `main::instrument`).
 pub fn finish(tool: &str, elapsed_us: u64, result: &Result<String, String>) {
-    let meta = PENDING.with(|p| p.borrow_mut().take()).unwrap_or_default();
+    let mut meta = PENDING.with(|p| p.borrow_mut().take()).unwrap_or_default();
     let outcome = classify_outcome(result, meta.returned);
+    if meta.reason.is_none() {
+        meta.reason = outcome_reason(result, outcome);
+    }
     let now = now_secs();
     let ws = workspace_id_str();
     if let Ok(mut s) = cell().lock() {
@@ -607,6 +628,29 @@ pub fn finish(tool: &str, elapsed_us: u64, result: &Result<String, String>) {
         pct_precise(saved, meta.baseline),
         outcome.as_str(),
     );
+}
+
+/// Short first-line detail for non-ok outcomes (error message, not-found hint, etc.).
+fn outcome_reason(result: &Result<String, String>, outcome: Outcome) -> Option<String> {
+    if matches!(outcome, Outcome::Ok) {
+        return None;
+    }
+    let raw = match result {
+        Err(e) => e.as_str(),
+        Ok(t) => t.as_str(),
+    };
+    let line = raw.lines().next().unwrap_or(raw).trim();
+    if line.is_empty() {
+        return None;
+    }
+    const MAX: usize = 240;
+    let mut chars = line.chars();
+    let truncated: String = chars.by_ref().take(MAX).collect();
+    if chars.next().is_some() {
+        Some(format!("{truncated}…"))
+    } else {
+        Some(truncated)
+    }
 }
 
 /// Events for a workspace since `since_ts` (exclusive lower bound when > 0).
@@ -731,7 +775,8 @@ pub struct Snapshot {
 #[cfg(feature = "dashboard")]
 pub fn read_snapshot() -> Snapshot {
     // Prefer the live in-process store when the MCP server owns it; otherwise
-    // reload aggregates from disk (dashboard subcommand) and recent jsonl events.
+    // reload from disk (dashboard subcommand): v2–v4 embed a rolling `events`
+    // array in savings.json, and v5 keeps recent rows in workspace events.jsonl.
     let (since, tools, mut events, saved_wid) = if let Some(cell) = STATS.get() {
         if let Ok(s) = cell.lock() {
             (
@@ -751,7 +796,12 @@ pub fn read_snapshot() -> Snapshot {
         }
     } else {
         let s = Store::load();
-        (s.since, s.tools, Vec::new(), s.saved_workspace_id)
+        (
+            s.since,
+            s.tools,
+            s.events.into_iter().collect(),
+            s.saved_workspace_id,
+        )
     };
 
     if events.is_empty() {
@@ -1119,6 +1169,14 @@ mod tests {
     fn classify_outcome_tags() {
         assert_eq!(classify_outcome(&Err("x".into()), 100), Outcome::Error);
         assert_eq!(
+            classify_outcome(&Err("symbol is required".into()), 0),
+            Outcome::Invalid
+        );
+        assert_eq!(
+            classify_outcome(&Err("mode pitfall requires: symptom, fix".into()), 0),
+            Outcome::Invalid
+        );
+        assert_eq!(
             classify_outcome(&Ok("… (truncated by token_budget)\n".into()), 500),
             Outcome::Truncated
         );
@@ -1147,6 +1205,23 @@ mod tests {
             classify_outcome(&Ok("big answer".repeat(100)), 500),
             Outcome::Ok
         );
+    }
+
+    #[test]
+    fn outcome_reason_uses_first_line_and_caps() {
+        assert_eq!(
+            outcome_reason(&Err("boom\nmore".into()), Outcome::Error).as_deref(),
+            Some("boom")
+        );
+        assert_eq!(outcome_reason(&Ok("fine".into()), Outcome::Ok), None);
+        assert_eq!(
+            outcome_reason(&Ok("symbol X: not found\nextra".into()), Outcome::NotFound).as_deref(),
+            Some("symbol X: not found")
+        );
+        let long = "x".repeat(300);
+        let clipped = outcome_reason(&Err(long), Outcome::Error).unwrap();
+        assert!(clipped.ends_with('…'));
+        assert_eq!(clipped.chars().count(), 241);
     }
 
     #[test]

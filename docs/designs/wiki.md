@@ -66,9 +66,12 @@ else CMake/`Cargo.toml`/`package.json`, else the workspace folder name.
 - Per-tag colors (picker + hex, `localStorage`) for visual chips
 - Knowledge health: Meilisearch/manifest status, broken/orphan links, duplicate
   headings, search telemetry (latency, no-result rate, click rank)
-- MCP savings dashboard (GUI): overview / sortable tools table / recent activity /
-  health signals via `/api/dashboard`, auto-refresh while the tab is open
+- MCP savings dashboard (GUI): overview / sortable tools table (incl. **Inv**
+  for validation/missing-arg calls) / recent activity + health as tables /
+  outcome hover shows `reason` when present; via `/api/dashboard`, auto-refresh
+  while the tab is open
 - Terminal alternative: `cargo run -p wordkeep --features dashboard -- dashboard`
+  (loads embedded `savings.json` events for Recent activity)
 - README screenshots: `cd wiki && bun run shots` (wiki must serve on `:8787`)
 - Opt-in raw query retention: `WIKI_RETAIN_QUERIES=1` or
   `wiki.retain_search_queries` in `.wordkeep/config.json`
