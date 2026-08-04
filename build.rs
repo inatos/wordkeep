@@ -6,19 +6,32 @@
 //!
 //! Without the feature this is a no-op, so the default build pulls in neither
 //! `cc` work nor the grammar.
+//!
+//! Feature detection uses `CARGO_FEATURE_DASLANG` (not `#[cfg(feature)]`) so the
+//! build script always links the grammar when `cargo test --features daslang`
+//! runs — cfg on build.rs has historically no-op'd in CI and left
+//! `tree_sitter_daslang` undefined at link time.
 
 fn main() {
-    #[cfg(feature = "daslang")]
-    compile_daslang();
+    // Set by Cargo for each activated package feature (UPPER_SNAKE).
+    if std::env::var_os("CARGO_FEATURE_DASLANG").is_some() {
+        compile_daslang();
+    }
 }
 
-#[cfg(feature = "daslang")]
 fn compile_daslang() {
     use std::path::PathBuf;
 
     let dir: PathBuf = ["vendor", "tree-sitter-daslang"].iter().collect();
     let parser = dir.join("parser.c");
     let scanner = dir.join("scanner.c");
+
+    if !parser.is_file() {
+        panic!(
+            "daslang feature enabled but {} is missing — vendor the grammar under vendor/tree-sitter-daslang/",
+            parser.display()
+        );
+    }
 
     println!("cargo:rerun-if-changed={}", parser.display());
     println!("cargo:rerun-if-changed={}", scanner.display());

@@ -51,6 +51,8 @@ crate, and the `wordkeep-wiki` companion (Meilisearch + dark Svelte UI).
   (`read_snapshot` discarded loaded events).
 - Non-ok activity outcomes now persist a short `reason` (first line of the
   error / hint) for GUI hover tooltips.
+- `--features daslang` binary link: explicit `#[link]` for the vendored
+  grammar so the bin (same name as the lib) actually links `tree_sitter_daslang`.
 
 ### Notes
 

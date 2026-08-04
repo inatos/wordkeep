@@ -20,10 +20,15 @@ use tree_sitter::Language;
 
 /// Binding to the vendored Daslang grammar (`vendor/tree-sitter-daslang/`,
 /// compiled by build.rs). Present only with the `daslang` feature.
+///
+/// Explicit `#[link]` is required because this package's lib and bin share the
+/// name `wordkeep`, so Cargo does not auto-link the bin against the lib — and
+/// build-script `rustc-link-lib` alone then fails to reach the binary link line.
 #[cfg(feature = "daslang")]
 mod daslang_ffi {
     use tree_sitter_language::LanguageFn;
 
+    #[link(name = "tree_sitter_daslang", kind = "static")]
     extern "C" {
         fn tree_sitter_daslang() -> *const ();
     }
