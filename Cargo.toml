@@ -1,6 +1,10 @@
+[workspace]
+members = [".", "crates/wordkeep-knowledge", "crates/wordkeep-wiki"]
+resolver = "2"
+
 [package]
 name = "wordkeep"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 rust-version = "1.74"
 description = "Token-budgeted MCP server for coding agents: tree-sitter maps, call graphs, and project docs over stdio."
@@ -34,6 +38,7 @@ dashboard = ["dep:ratatui"]
 [dependencies]
 serde_json = "1"
 walkdir = "2"
+wordkeep-knowledge = { path = "crates/wordkeep-knowledge" }
 tree-sitter = "0.25"
 tree-sitter-cpp = "0.23"
 fastembed = { version = "4", optional = true }
@@ -50,6 +55,11 @@ tree-sitter-c-sharp = "0.23"
 # Only invoked when the `daslang` feature is on (see build.rs); compiles the
 # vendored parser.c + scanner.c.
 cc = "1"
+
+[[example]]
+name = "cold_warm_bench"
+path = "examples/cold_warm_bench.rs"
+required-features = []
 
 [profile.release]
 opt-level = 3

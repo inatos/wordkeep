@@ -1,0 +1,153 @@
+:root {
+  color-scheme: dark;
+  --bg: #120d14;
+  --bg-elevated: #1a141c;
+  --bg-hover: #261c28;
+  --border: #3a2a3c;
+  --text: #f0e6f2;
+  --muted: #a894ab;
+  --accent: #b153b8;
+  --accent-soft: rgba(177, 83, 184, 0.18);
+  --accent-strong: #c96fd0;
+  --ok: #6bcf8e;
+  --warn: #d4a24a;
+  --danger: #e06b7a;
+  --radius: 10px;
+  --ease-snap: cubic-bezier(0.22, 1, 0.36, 1);
+  font-family: "IBM Plex Sans", "Segoe UI", system-ui, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+}
+
+* { box-sizing: border-box; }
+html, body, #app { margin: 0; min-height: 100%; }
+body {
+  background:
+    radial-gradient(1100px 560px at 8% -12%, rgba(177, 83, 184, 0.22), transparent 55%),
+    radial-gradient(900px 480px at 92% 8%, rgba(88, 40, 96, 0.35), transparent 50%),
+    var(--bg);
+}
+button, input, select {
+  font: inherit;
+  color: inherit;
+  transition:
+    border-color 0.16s var(--ease-snap),
+    background-color 0.16s var(--ease-snap),
+    color 0.16s var(--ease-snap),
+    transform 0.12s var(--ease-snap),
+    box-shadow 0.16s var(--ease-snap),
+    opacity 0.16s var(--ease-snap);
+}
+a { color: var(--accent-strong); transition: color 0.16s var(--ease-snap); }
+a:hover { color: #db8fe0; }
+em { background: var(--accent-soft); color: var(--text); font-style: normal; border-radius: 3px; padding: 0 .15em; }
+pre {
+  overflow: auto;
+  padding: 1rem;
+  background: #0a070b;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+code {
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+  font-size: 0.86em;
+  display: inline-block;
+  padding: 0.08em 0.38em;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: rgba(10, 7, 11, 0.85);
+  color: var(--accent-strong);
+  vertical-align: baseline;
+  transition:
+    border-color 0.16s var(--ease-snap),
+    background-color 0.16s var(--ease-snap),
+    color 0.16s var(--ease-snap),
+    box-shadow 0.16s var(--ease-snap),
+    transform 0.12s var(--ease-snap);
+}
+code:hover {
+  border-color: rgba(177, 83, 184, 0.55);
+  background: var(--accent-soft);
+  box-shadow: 0 0 0 1px var(--accent-soft);
+  transform: translateY(-1px);
+}
+code.ok {
+  color: var(--ok);
+  border-color: rgba(107, 207, 142, 0.35);
+}
+article h1, article h2, article h3 { scroll-margin-top: 4rem; }
+.muted { color: var(--muted); }
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: .35rem;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: .2rem .65rem;
+  background: var(--bg-elevated);
+  color: var(--muted);
+  font-size: .85rem;
+  transition: border-color 0.16s var(--ease-snap), background-color 0.16s var(--ease-snap), color 0.16s var(--ease-snap);
+}
+.chip.active { border-color: var(--accent); color: var(--accent-strong); background: var(--accent-soft); }
+
+/* Soft rounded scrollbars (Firefox + Chromium/WebKit) */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(177, 83, 184, 0.45) transparent;
+}
+*::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
+  margin: 4px;
+}
+*::-webkit-scrollbar-thumb {
+  background: linear-gradient(
+    180deg,
+    rgba(177, 83, 184, 0.4),
+    rgba(177, 83, 184, 0.28)
+  );
+  border-radius: 999px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+  min-height: 2rem;
+}
+*::-webkit-scrollbar-thumb:hover {
+  background: linear-gradient(
+    180deg,
+    rgba(201, 111, 208, 0.7),
+    rgba(177, 83, 184, 0.5)
+  );
+  background-clip: padding-box;
+  border: 2px solid transparent;
+}
+*::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+/* Arathyll navbar-brand spin — matches https://arathyll.com/home */
+.navbar-brand.logo {
+  display: inline-block;
+  height: 2.4em;
+  width: 2.4em;
+  flex: 0 0 auto;
+  background-image: url("/arathyll.ico");
+  background-size: contain;
+  background-repeat: no-repeat;
+  background-position: center;
+  animation: logo-animate 20s infinite cubic-bezier(0.04, -0.64, 0.76, 0.35);
+  -webkit-animation: logo-animate 20s infinite cubic-bezier(0.04, -0.64, 0.76, 0.35);
+}
+.navbar-brand.logo:hover {
+  filter: drop-shadow(0 0 8px rgba(177, 83, 184, 0.55));
+}
+@keyframes logo-animate {
+  0% { transform: rotate(0deg); }
+  25% { transform: rotate(90deg); }
+  50% { transform: rotate(180deg); }
+  75% { transform: rotate(270deg); }
+  100% { transform: rotate(360deg); }
+}

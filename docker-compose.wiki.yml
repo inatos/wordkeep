@@ -1,0 +1,14 @@
+services:
+  meilisearch:
+    image: getmeili/meilisearch:v1.15
+    environment:
+      MEILI_ENV: development
+      MEILI_MASTER_KEY: wordkeep_dev_key
+    ports:
+      - "127.0.0.1:7700:7700"
+    volumes:
+      - wordkeep_wiki_meili:/meili_data
+    restart: unless-stopped
+
+volumes:
+  wordkeep_wiki_meili:

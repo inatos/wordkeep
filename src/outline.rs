@@ -42,7 +42,9 @@ pub fn build(root: &Path, args: &Value) -> Result<String, String> {
     };
     let rel = config::rel_path(root, &path);
     let Some(lang) = Lang::from_path(&path) else {
-        return Ok(format!("outline - {rel}: unsupported file type"));
+        let out = format!("outline - {rel}: unsupported file type");
+        stats::record("outline", 0, (out.len() / 4) as u64);
+        return Ok(out);
     };
     let Ok(src) = std::fs::read_to_string(&path) else {
         let out = format!("outline - {rel}: cannot read file");

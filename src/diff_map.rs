@@ -141,14 +141,23 @@ pub fn build(root: &Path, args: &Value) -> Result<String, String> {
         }
     }
 
+    // One whole-tree adjacency (warm-cached) answers every caller lookup —
+    // previously each changed symbol triggered a separate full-tree `one_hop`.
+    let adj = if per_file.is_empty() {
+        None
+    } else {
+        Some(call_graph::adjacency(root, &paths))
+    };
+    let caller_scan = adj.as_ref().map(|a| a.scanned_bytes).unwrap_or(0);
     let out = render(
         &gitref,
         &paths,
-        root,
         &per_file,
+        adj.as_ref(),
         max,
         budget,
         baseline_bytes,
+        caller_scan,
     );
     Ok(out)
 }
@@ -157,11 +166,12 @@ pub fn build(root: &Path, args: &Value) -> Result<String, String> {
 fn render(
     gitref: &str,
     paths: &[String],
-    root: &Path,
     per_file: &[(String, Vec<ChangedSym>)],
+    adj: Option<&call_graph::Adjacency>,
     max: usize,
     budget: usize,
     baseline_bytes: u64,
+    caller_scan: u64,
 ) -> String {
     let total: usize = per_file.iter().map(|(_, v)| v.len()).sum();
     let mut out = format!("diff_map - ref {gitref}  (roots {paths:?})\n\n");
@@ -174,10 +184,7 @@ fn render(
         return out;
     }
 
-    // Resolve callers once per distinct symbol name, capped at `max`, so a wide
-    // diff doesn't walk the tree hundreds of times.
     let mut analyzed = 0usize;
-    let mut caller_scan = 0u64;
     let mut caller_cache: std::collections::HashMap<String, Vec<(String, String, usize)>> =
         std::collections::HashMap::new();
 
@@ -193,13 +200,10 @@ fn render(
             let callers = if let Some(c) = caller_cache.get(&s.name) {
                 Some(c.clone())
             } else if analyzed < max {
-                let hop = call_graph::one_hop(root, &s.name, paths);
-                if caller_scan == 0 {
-                    caller_scan = hop.scanned_bytes;
-                }
+                let list = adj.map(|a| a.callers_of(&s.name)).unwrap_or_default();
                 analyzed += 1;
-                caller_cache.insert(s.name.clone(), hop.callers.clone());
-                Some(hop.callers)
+                caller_cache.insert(s.name.clone(), list.clone());
+                Some(list)
             } else {
                 None
             };

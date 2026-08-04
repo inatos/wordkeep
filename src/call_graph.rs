@@ -297,6 +297,29 @@ pub fn adjacency(root: &Path, paths: &[String]) -> Adjacency {
     }
 }
 
+impl Adjacency {
+    /// Callers of `symbol` as `(caller_name, rel, line)`, matching [`one_hop`].
+    pub fn callers_of(&self, symbol: &str) -> Vec<(String, String, usize)> {
+        let key = seg(symbol);
+        let Some(cs) = self.callers.get(key) else {
+            return Vec::new();
+        };
+        let mut out: Vec<(String, String, usize)> = cs
+            .iter()
+            .map(|name| {
+                let (rel, line) = self
+                    .sites
+                    .get(name)
+                    .cloned()
+                    .unwrap_or_else(|| ("?".into(), 0));
+                (name.clone(), rel, line)
+            })
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
+        out
+    }
+}
+
 /// Languages `call_graph` walks. Daslang is excluded (brace-only grammar; its
 /// scripts are mapped by `repo_map`).
 fn cg_supported(lang: Lang) -> bool {
@@ -965,6 +988,29 @@ mod tests {
         assert!(name_matches("Foo::Bar", "Bar"));
         assert!(name_matches("Bar", "Foo::Bar"));
         assert!(!name_matches("Foo::Baz", "Bar"));
+    }
+
+    #[test]
+    fn callers_of_uses_sites_from_adjacency() {
+        let mut callers = BTreeMap::new();
+        callers.insert(
+            "target".into(),
+            ["run".into(), "tick".into()].into_iter().collect(),
+        );
+        let mut sites = BTreeMap::new();
+        sites.insert("run".into(), ("src/a.cpp".into(), 10));
+        sites.insert("tick".into(), ("src/b.cpp".into(), 20));
+        let adj = Adjacency {
+            callees: BTreeMap::new(),
+            callers,
+            sites,
+            scanned_bytes: 42,
+        };
+        let list = adj.callers_of("ns::target");
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0].0, "run");
+        assert_eq!(list[0].1, "src/a.cpp");
+        assert_eq!(list[1].0, "tick");
     }
 
     #[test]

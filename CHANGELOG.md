@@ -3,6 +3,56 @@
 All notable changes to wordkeep are documented here. The project follows
 [Semantic Versioning](https://semver.org/).
 
+## [0.3.0] - 2026-08-03
+
+Telemetry truthfulness, `diff_map` hot-path fix, shared Markdown knowledge
+crate, and the `wordkeep-wiki` companion (Meilisearch + dark Svelte UI).
+
+### Added
+
+- Telemetry **schema v5**: workspace `events.jsonl`, debounced `savings.json`,
+  microsecond latency, typed outcomes (`ok`/`truncated`/`error`/`not_found`/
+  `empty`/`low_yield`/`invalid`), cache/I/O fields, `stats` JSON format,
+  one-decimal reduction %.
+- Shared crate `wordkeep-knowledge`: fence-aware Markdown chunking, frontmatter,
+  anchors, links, tags.
+- Companion `wordkeep-wiki`: index/watch/serve over Meilisearch; Axum API;
+  dark Svelte 5 UI under `wiki/`; `docker-compose.wiki.yml`.
+- Wiki **Dashboard** tab + `GET /api/dashboard` (MCP savings overview / tools /
+  activity / health) as a GUI alternative to `wordkeep dashboard`.
+- Docs: [docs/performance.md](docs/performance.md),
+  [docs/designs/wiki.md](docs/designs/wiki.md).
+- Example `cold_warm_bench` for cold/warm latency smoke checks.
+- Relevance query fixtures under `tests/fixtures/relevance/`.
+
+### Changed
+
+- `diff_map` builds **one** call-graph adjacency per invocation (was N×
+  `one_hop` full-tree scans).
+- `outline` records stats on unsupported file types.
+- Dashboard health: low-yield and net-negative require meaningful rates /
+  baseline floors.
+- `knowledge_search` chunking uses `wordkeep-knowledge` (fenced `#` ignored).
+- Workspace Cargo members: `.`, `crates/wordkeep-knowledge`, `crates/wordkeep-wiki`.
+
+### Fixed
+
+- `session_pressure` event window no longer capped at the 200-event ring
+  (reads append-only jsonl).
+
+### Notes
+
+- Core MCP binary stays offline by default (no Meilisearch/Axum deps).
+- Token figures remain ~4 chars/token **estimated context avoided**, not
+  billing.
+- Wiki UI/API now includes instant search, TOC/deep links, recent files, link
+  garden health, local search telemetry (raw queries remain opt-in), GUI
+  dashboard, editor tabs, frontmatter tag CRUD + colors, and searchable
+  kind/root/tag/recent comboboxes.
+- Future wiki user-state persistence: Turso/libSQL (not required for MVP).
+- No separate vector DB; Meilisearch hybrid/vectors optional later.
+
+
 ## [0.2.0] - 2026-07-23
 
 Session continuity upgrade: durable handoffs, defects, run evidence, path

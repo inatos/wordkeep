@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="Content-Security-Policy"
+        content="default-src 'self'; connect-src 'self'; style-src 'unsafe-inline'; script-src 'unsafe-inline'">
+  <title>Wordkeep Wiki</title>
+  <style>
+    :root { color-scheme: dark; font-family: system-ui, sans-serif; background: #11151c; color: #e7edf5; }
+    body { margin: 0; display: grid; grid-template-columns: minmax(18rem, 30rem) 1fr; min-height: 100vh; }
+    aside { padding: 1rem; border-right: 1px solid #303744; background: #171c25; }
+    main { padding: 2rem clamp(1rem, 4vw, 4rem); max-width: 70rem; }
+    form { display: flex; gap: .5rem; }
+    input, button { font: inherit; color: inherit; border: 1px solid #414b5c; border-radius: .4rem; padding: .65rem; background: #10141b; }
+    input { flex: 1; min-width: 0; }
+    button { cursor: pointer; background: #263449; }
+    #results { list-style: none; padding: 0; }
+    #results button { display: block; width: 100%; margin: .5rem 0; text-align: left; }
+    #results strong, #results small { display: block; }
+    #results small { color: #9aa7b8; margin-top: .2rem; }
+    article { line-height: 1.65; }
+    article pre { overflow: auto; padding: 1rem; background: #0b0e13; border-radius: .4rem; }
+    article code { color: #b8d7ff; }
+    article a { color: #7db8ff; }
+    .muted { color: #9aa7b8; }
+    @media (max-width: 760px) { body { display: block; } aside { border-right: 0; border-bottom: 1px solid #303744; } }
+  </style>
+</head>
+<body>
+  <aside>
+    <h1>Wordkeep Wiki</h1>
+    <form id="search-form">
+      <input id="query" name="q" type="search" placeholder="Search knowledge…" autofocus>
+      <button type="submit">Search</button>
+    </form>
+    <p id="status" class="muted">Enter a query to search indexed Markdown.</p>
+    <ul id="results"></ul>
+  </aside>
+  <main>
+    <article id="page">
+      <h2>Local knowledge browser</h2>
+      <p class="muted">This embedded page is the fallback UI. Add a production build at <code>wiki/dist</code> to replace it.</p>
+    </article>
+  </main>
+  <script>
+    const form = document.querySelector('#search-form');
+    const query = document.querySelector('#query');
+    const status = document.querySelector('#status');
+    const results = document.querySelector('#results');
+    const page = document.querySelector('#page');
+
+    function resultButton(hit) {
+      const item = document.createElement('li');
+      const button = document.createElement('button');
+      const title = document.createElement('strong');
+      const path = document.createElement('small');
+      title.textContent = hit.heading || '(intro)';
+      path.textContent = hit.path || '';
+      button.append(title, path);
+      button.addEventListener('click', () => openPage(hit.path));
+      item.append(button);
+      return item;
+    }
+
+    async function openPage(path) {
+      status.textContent = `Loading ${path}…`;
+      const response = await fetch(`/api/page?${new URLSearchParams({ path })}`);
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
+      page.innerHTML = data.html;
+      status.textContent = path;
+    }
+
+    form.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      const q = query.value.trim();
+      if (!q) return;
+      results.replaceChildren();
+      status.textContent = 'Searching…';
+      try {
+        const response = await fetch(`/api/search?${new URLSearchParams({ q, limit: '30' })}`);
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
+        const hits = data.hits || [];
+        results.append(...hits.map(resultButton));
+        status.textContent = `${hits.length} result${hits.length === 1 ? '' : 's'}`;
+      } catch (error) {
+        status.textContent = error.message;
+      }
+    });
+  </script>
+</body>
+</html>

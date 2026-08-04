@@ -1,0 +1,8 @@
+[package]
+name = "wordkeep-knowledge"
+version = "0.1.0"
+edition = "2021"
+description = "Shared Markdown parsing and section chunking for Wordkeep."
+license = "MIT"
+
+[dependencies]

@@ -1,0 +1,47 @@
+//! Library test surface for Wordkeep's MCP modules.
+//!
+//! The production entry point remains the lean `wordkeep` stdio binary. Keeping
+//! the modules available as a library target lets `cargo test --lib` exercise
+//! their unit tests without changing the binary's runtime structure.
+
+#![allow(dead_code)]
+
+mod artifacts;
+mod big_functions;
+mod cache;
+pub mod call_graph;
+mod call_path;
+mod commit_scope;
+mod config;
+#[cfg(feature = "dashboard")]
+mod dashboard;
+mod dead_code;
+mod defects;
+pub mod diff_map;
+mod doc_comment;
+mod include_graph;
+mod incremental;
+mod index_stale;
+mod integration_hooks;
+pub mod knowledge;
+mod lang;
+mod mas;
+mod mcp;
+mod module_map;
+mod outline;
+pub mod repo_map;
+mod runs;
+mod session_pressure;
+mod stats;
+mod symbol_context;
+mod symbol_def;
+mod symbol_diff;
+mod symbol_refs;
+mod test_map;
+mod trace;
+mod trace_profile;
+mod type_layout;
+mod undocumented;
+mod usage_examples;
+mod walk;
+mod workspace;

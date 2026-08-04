@@ -12,8 +12,24 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  wiki-ui:
+    name: build wiki ui
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - run: bun install --frozen-lockfile
+        working-directory: wiki
+      - run: bun run build
+        working-directory: wiki
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wiki-dist
+          path: wiki/dist
+
   build:
     name: build (${{ matrix.target }})
+    needs: wiki-ui
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -23,25 +39,33 @@ jobs:
             target: x86_64-unknown-linux-gnu
             archive: tar.gz
             bin: wordkeep
+            wiki_bin: wordkeep-wiki
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             archive: zip
             bin: wordkeep.exe
+            wiki_bin: wordkeep-wiki.exe
           - os: macos-latest
             target: x86_64-apple-darwin
             archive: tar.gz
             bin: wordkeep
+            wiki_bin: wordkeep-wiki
           - os: macos-latest
             target: aarch64-apple-darwin
             archive: tar.gz
             bin: wordkeep
+            wiki_bin: wordkeep-wiki
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
-      - run: cargo build --release --locked --target ${{ matrix.target }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: wiki-dist
+          path: wiki/dist
+      - run: cargo build --release --locked --workspace --target ${{ matrix.target }}
       - name: Package (tar.gz)
         if: matrix.archive == 'tar.gz'
         shell: bash
@@ -49,8 +73,10 @@ jobs:
           VERSION="${GITHUB_REF_NAME#v}"
           STAGING="wordkeep-${VERSION}-${{ matrix.target }}"
           ARCHIVE="${STAGING}.tar.gz"
-          mkdir -p "$STAGING"
+          mkdir -p "$STAGING/wiki"
           cp "target/${{ matrix.target }}/release/${{ matrix.bin }}" "$STAGING/"
+          cp "target/${{ matrix.target }}/release/${{ matrix.wiki_bin }}" "$STAGING/"
+          cp -r wiki/dist "$STAGING/wiki/"
           cp README.md LICENSE CHANGELOG.md "$STAGING/"
           tar -czf "$ARCHIVE" -C "$(dirname "$STAGING")" "$(basename "$STAGING")"
       - name: Package (zip)
@@ -60,8 +86,10 @@ jobs:
           $version = "$env:GITHUB_REF_NAME".Substring(1)
           $staging = "wordkeep-$version-${{ matrix.target }}"
           $archive = "$staging.zip"
-          New-Item -ItemType Directory -Force -Path $staging | Out-Null
+          New-Item -ItemType Directory -Force -Path $staging/wiki | Out-Null
           Copy-Item "target/${{ matrix.target }}/release/${{ matrix.bin }}" $staging/
+          Copy-Item "target/${{ matrix.target }}/release/${{ matrix.wiki_bin }}" $staging/
+          Copy-Item -Recurse wiki/dist $staging/wiki/
           Copy-Item README.md, LICENSE, CHANGELOG.md $staging/
           Compress-Archive -Path $staging -DestinationPath $archive -Force
       - uses: actions/upload-artifact@v4

@@ -393,13 +393,11 @@ fn draw_health(f: &mut Frame, area: Rect, snap: &Snapshot) {
         ]));
     }
 
-    // Net-negative tools: the distilled estimate is smaller than what we
-    // returned, so wordkeep "spent" more tokens than reading the raw material -
-    // usually a cheap tool wrapped in a fixed JSON-RPC envelope. Worth a look.
+    // Low-yield: only when a meaningful share of calls returned ≤ floor.
     let low_yield: Vec<&str> = snap
         .tools
         .iter()
-        .filter(|t| t.low_yield_count > 0)
+        .filter(|t| stats::is_notable_low_yield(t.calls, t.low_yield_count))
         .map(|t| t.name.as_str())
         .collect();
     if !low_yield.is_empty() {
@@ -409,10 +407,11 @@ fn draw_health(f: &mut Frame, area: Rect, snap: &Snapshot) {
         ]));
     }
 
+    // Net-negative: only when distilled baseline is large enough to matter.
     let inverted: Vec<&str> = snap
         .tools
         .iter()
-        .filter(|t| t.baseline_tokens > 0 && t.returned_tokens >= t.baseline_tokens)
+        .filter(|t| stats::is_net_negative(t.baseline_tokens, t.returned_tokens))
         .map(|t| t.name.as_str())
         .collect();
     lines.push(Line::from(""));
@@ -469,7 +468,8 @@ fn outcome_color(outcome: &str) -> Color {
     match outcome {
         "error" => Color::Red,
         "truncated" => Color::Yellow,
-        "low_yield" => Color::DarkGray,
+        "not_found" | "invalid" => Color::Magenta,
+        "empty" | "low_yield" => Color::DarkGray,
         _ => Color::Green,
     }
 }
@@ -513,7 +513,7 @@ mod tests {
             tools: vec![
                 ToolStat {
                     name: "call_path".into(),
-                    calls: 5,
+                    calls: 20,
                     baseline_tokens: 100_000,
                     returned_tokens: 500,
                     peak_baseline: 40_000,
@@ -524,16 +524,17 @@ mod tests {
                     peak_ms: 800,
                     trunc_count: 0,
                     error_count: 0,
-                    low_yield_count: 1,
+                    // ≥25% of ≥10 calls → notable low-yield.
+                    low_yield_count: 6,
                 },
-                // returned >= distilled → should be flagged net-negative.
+                // returned ≥ distilled with baseline ≥ 500 → net-negative.
                 ToolStat {
                     name: "include_graph".into(),
                     calls: 2,
-                    baseline_tokens: 100,
-                    returned_tokens: 400,
-                    peak_baseline: 60,
-                    peak_returned: 300,
+                    baseline_tokens: 600,
+                    returned_tokens: 800,
+                    peak_baseline: 400,
+                    peak_returned: 500,
                     peak_saved: 0,
                     last_ts: 90,
                     total_ms: 40,

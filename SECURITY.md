@@ -31,3 +31,11 @@ It does **not**:
 Treat `--root` like any local code-execution tool: point it only at repositories you trust.
 
 MCP resource `wordkeep://readme` (alias `wordkeep://README`) serves the packaged README text only.
+
+## Wiki companion (`wordkeep-wiki`)
+
+The optional wiki server binds **loopback only** by default (`127.0.0.1`).
+Non-loopback binds require `--allow-non-loopback`. Path APIs reject `..`,
+absolute paths, and symlink escape outside `--root`. Meilisearch admin keys
+stay server-side; do not expose Meilisearch or the wiki API on untrusted
+networks without additional auth.

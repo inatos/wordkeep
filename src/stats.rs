@@ -3,32 +3,39 @@
 //! Every tool reports two numbers per call: `baseline_tokens` - roughly what the
 //! agent would have spent reading the raw material itself (source files, docs, a
 //! trace CSV) - and `returned_tokens`, the size of the distilled answer
-//! wordkeep actually emitted. The difference is the saving. Totals persist to
-//! `savings.json` in the shared cache dir so they accumulate across spawns, and
-//! the `stats` tool renders them on demand. A `~4 chars/token` heuristic is used
+//! wordkeep actually emitted. The difference is the estimated context avoided.
+//! Aggregates persist to `savings.json` in the shared cache dir; per-call events
+//! append to `{workspace}/events.jsonl`. A `~4 chars/token` heuristic is used
 //! throughout, matching the budgeting the other tools already do.
 //!
-//! Alongside the running totals each tool keeps high-water marks, per-call latency,
-//! outcome counters (truncation, error, low-yield), and a capped rolling event log.
-//! The optional `dashboard` reads `savings.json` live. On-disk schema is `version: 4`;
-//! v1–v3 files load fine (missing fields default to zero / empty / no workspace).
+//! Alongside the running totals each tool keeps high-water marks, per-call latency
+//! (microseconds), outcome counters, bytes/cache stats, and a capped in-memory
+//! event ring for the dashboard. On-disk schema is `version: 5`; v2–v4 files load
+//! fine (missing fields default to zero / empty / derive us from ms).
 
 use serde_json::{json, Value};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, VecDeque};
+use std::io::{BufRead, BufReader, Write};
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::cache;
 use crate::workspace;
 
 const FILE: &str = "savings.json";
+const EVENTS_FILE: &str = "events.jsonl";
 
-/// Cap on the rolling per-call event log persisted for the dashboard.
+/// Cap on the rolling per-call event log kept in memory for the dashboard.
 const EVENT_CAP: usize = 200;
 
 /// Returned tokens at or below this are tagged `low_yield` (one-line empty-ish answers).
 const LOW_YIELD_FLOOR: u64 = 25;
+
+/// Debounce: flush aggregates at most this often, or when this many events pend.
+const FLUSH_INTERVAL: Duration = Duration::from_secs(2);
+const FLUSH_EVENT_THRESHOLD: u64 = 25;
 
 /// Improvement-signal thresholds - only flag genuinely actionable patterns.
 const SLOW_MS_FLOOR: u64 = 50;
@@ -37,8 +44,51 @@ const ERROR_RATE_PCT: u64 = 10;
 const ERROR_MIN_CALLS: u64 = 5;
 const NET_NEGATIVE_BASELINE_FLOOR: u64 = 500;
 
+/// Dashboard / health: low-yield only when rate and sample size clear these.
+#[allow(dead_code)] // used by dashboard + unit tests
+pub const LOW_YIELD_RATE_PCT: u64 = 25;
+#[allow(dead_code)]
+pub const LOW_YIELD_MIN_CALLS: u64 = 10;
+
 thread_local! {
-    static PENDING: RefCell<Option<(u64, u64)>> = const { RefCell::new(None) };
+    static PENDING: RefCell<Option<RecordMeta>> = const { RefCell::new(None) };
+}
+
+/// Extra fields for [`record_ext`]; [`record`] fills tokens only.
+#[derive(Debug, Clone, Default)]
+pub struct RecordMeta {
+    pub baseline: u64,
+    pub returned: u64,
+    pub bytes_read: u64,
+    pub cache_hits: u64,
+    pub cache_misses: u64,
+    pub reason: Option<String>,
+}
+
+/// Classified tool-call outcome (persisted as a snake_case string).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Outcome {
+    Error,
+    Truncated,
+    NotFound,
+    Invalid,
+    Empty,
+    LowYield,
+    Ok,
+}
+
+impl Outcome {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Outcome::Error => "error",
+            Outcome::Truncated => "truncated",
+            Outcome::NotFound => "not_found",
+            Outcome::Invalid => "invalid",
+            Outcome::Empty => "empty",
+            Outcome::LowYield => "low_yield",
+            Outcome::Ok => "ok",
+        }
+    }
 }
 
 #[derive(Default, Clone)]
@@ -50,15 +100,27 @@ struct Tool {
     peak_returned: u64,
     peak_saved: u64,
     last_ts: u64,
-    total_ms: u64,
-    peak_ms: u64,
+    total_us: u64,
+    peak_us: u64,
     trunc_count: u64,
     error_count: u64,
     low_yield_count: u64,
+    bytes_read: u64,
+    cache_hits: u64,
+    cache_misses: u64,
+    invalid_count: u64,
 }
 
 impl Tool {
-    fn observe(&mut self, baseline: u64, returned: u64, elapsed_ms: u64, outcome: &str, ts: u64) {
+    fn observe(
+        &mut self,
+        baseline: u64,
+        returned: u64,
+        elapsed_us: u64,
+        outcome: Outcome,
+        ts: u64,
+        meta: &RecordMeta,
+    ) {
         self.calls += 1;
         self.baseline_tokens += baseline;
         self.returned_tokens += returned;
@@ -66,18 +128,53 @@ impl Tool {
         self.peak_returned = self.peak_returned.max(returned);
         self.peak_saved = self.peak_saved.max(baseline.saturating_sub(returned));
         self.last_ts = ts;
-        self.total_ms += elapsed_ms;
-        self.peak_ms = self.peak_ms.max(elapsed_ms);
+        self.total_us += elapsed_us;
+        self.peak_us = self.peak_us.max(elapsed_us);
+        self.bytes_read += meta.bytes_read;
+        self.cache_hits += meta.cache_hits;
+        self.cache_misses += meta.cache_misses;
         match outcome {
-            "truncated" => self.trunc_count += 1,
-            "error" => self.error_count += 1,
-            "low_yield" => self.low_yield_count += 1,
-            _ => {}
+            Outcome::Truncated => self.trunc_count += 1,
+            Outcome::Error => self.error_count += 1,
+            Outcome::LowYield => self.low_yield_count += 1,
+            Outcome::NotFound | Outcome::Invalid => self.invalid_count += 1,
+            Outcome::Empty | Outcome::Ok => {}
         }
     }
 
+    fn total_ms(&self) -> u64 {
+        self.total_us / 1000
+    }
+
+    fn peak_ms(&self) -> u64 {
+        self.peak_us / 1000
+    }
+
     fn avg_ms(&self) -> u64 {
-        self.total_ms.checked_div(self.calls).unwrap_or(0)
+        self.total_ms().checked_div(self.calls).unwrap_or(0)
+    }
+
+    fn to_json(&self) -> Value {
+        json!({
+            "calls": self.calls,
+            "baseline_tokens": self.baseline_tokens,
+            "returned_tokens": self.returned_tokens,
+            "peak_baseline": self.peak_baseline,
+            "peak_returned": self.peak_returned,
+            "peak_saved": self.peak_saved,
+            "last_ts": self.last_ts,
+            "total_us": self.total_us,
+            "peak_us": self.peak_us,
+            "total_ms": self.total_ms(),
+            "peak_ms": self.peak_ms(),
+            "trunc_count": self.trunc_count,
+            "error_count": self.error_count,
+            "low_yield_count": self.low_yield_count,
+            "bytes_read": self.bytes_read,
+            "cache_hits": self.cache_hits,
+            "cache_misses": self.cache_misses,
+            "invalid_count": self.invalid_count,
+        })
     }
 }
 
@@ -87,20 +184,57 @@ pub struct Event {
     pub tool: String,
     pub baseline: u64,
     pub returned: u64,
-    pub elapsed_ms: u64,
+    pub elapsed_us: u64,
     pub outcome: String,
+    pub reason: Option<String>,
     pub workspace_id: String,
+    pub bytes_read: u64,
+    pub cache_hits: u64,
+    pub cache_misses: u64,
+    pub wordkeep_version: String,
+}
+
+impl Event {
+    #[allow(dead_code)] // used by dashboard EventLog mapping
+    pub fn elapsed_ms(&self) -> u64 {
+        self.elapsed_us / 1000
+    }
+
+    fn to_jsonl(&self) -> Value {
+        let mut m = serde_json::Map::new();
+        m.insert("ts".into(), json!(self.ts));
+        m.insert("tool".into(), json!(self.tool));
+        m.insert("baseline".into(), json!(self.baseline));
+        m.insert("returned".into(), json!(self.returned));
+        m.insert("elapsed_us".into(), json!(self.elapsed_us));
+        m.insert("outcome".into(), json!(self.outcome));
+        m.insert("workspace_id".into(), json!(self.workspace_id));
+        m.insert("bytes_read".into(), json!(self.bytes_read));
+        m.insert("cache_hits".into(), json!(self.cache_hits));
+        m.insert("cache_misses".into(), json!(self.cache_misses));
+        m.insert("wordkeep_version".into(), json!(self.wordkeep_version));
+        if let Some(ref r) = self.reason {
+            m.insert("reason".into(), json!(r));
+        }
+        Value::Object(m)
+    }
 }
 
 struct Store {
     since: u64,
     tools: BTreeMap<String, Tool>,
     events: VecDeque<Event>,
+    /// Aggregates dirty since last savings.json write.
+    pending_flush: u64,
+    last_flush: Instant,
+    /// Last workspace id written into savings.json (for the dashboard process).
+    saved_workspace_id: String,
 }
 
 static STATS: OnceLock<Mutex<Store>> = OnceLock::new();
 static REGISTRY: OnceLock<Vec<&'static str>> = OnceLock::new();
 static WORKSPACE_ID: OnceLock<String> = OnceLock::new();
+static WORKSPACE_ROOT: OnceLock<PathBuf> = OnceLock::new();
 
 /// Register all MCP tool names (for never-called insights in `stats`).
 pub fn init_registry(names: Vec<&'static str>) {
@@ -108,12 +242,17 @@ pub fn init_registry(names: Vec<&'static str>) {
 }
 
 /// Bind telemetry events to a workspace (call once from `main`).
-pub fn set_workspace_root(root: &std::path::Path) {
+pub fn set_workspace_root(root: &Path) {
+    let _ = WORKSPACE_ROOT.set(root.to_path_buf());
     let _ = WORKSPACE_ID.set(workspace::workspace_id(root));
 }
 
 fn workspace_id_str() -> String {
     WORKSPACE_ID.get().cloned().unwrap_or_default()
+}
+
+fn workspace_root() -> Option<&'static Path> {
+    WORKSPACE_ROOT.get().map(PathBuf::as_path)
 }
 
 fn registry() -> &'static [&'static str] {
@@ -131,94 +270,98 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
+fn wordkeep_version() -> String {
+    env!("CARGO_PKG_VERSION").to_string()
+}
+
 impl Store {
     fn empty() -> Store {
         Store {
             since: now_secs(),
             tools: BTreeMap::new(),
             events: VecDeque::new(),
+            pending_flush: 0,
+            last_flush: Instant::now(),
+            saved_workspace_id: String::new(),
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn observe(
         &mut self,
         tool: &str,
-        baseline: u64,
-        returned: u64,
-        elapsed_ms: u64,
-        outcome: &str,
+        elapsed_us: u64,
+        outcome: Outcome,
         ts: u64,
         workspace_id: &str,
+        meta: &RecordMeta,
     ) {
-        self.tools
-            .entry(tool.to_string())
-            .or_default()
-            .observe(baseline, returned, elapsed_ms, outcome, ts);
-        self.events.push_back(Event {
+        self.tools.entry(tool.to_string()).or_default().observe(
+            meta.baseline,
+            meta.returned,
+            elapsed_us,
+            outcome,
+            ts,
+            meta,
+        );
+        let ev = Event {
             ts,
             tool: tool.to_string(),
-            baseline,
-            returned,
-            elapsed_ms,
-            outcome: outcome.to_string(),
+            baseline: meta.baseline,
+            returned: meta.returned,
+            elapsed_us,
+            outcome: outcome.as_str().to_string(),
+            reason: meta.reason.clone(),
             workspace_id: workspace_id.to_string(),
-        });
+            bytes_read: meta.bytes_read,
+            cache_hits: meta.cache_hits,
+            cache_misses: meta.cache_misses,
+            wordkeep_version: wordkeep_version(),
+        };
+        self.events.push_back(ev.clone());
         while self.events.len() > EVENT_CAP {
             self.events.pop_front();
         }
+        append_event_jsonl(&ev);
+        self.pending_flush += 1;
+    }
+
+    fn needs_flush(&self) -> bool {
+        self.pending_flush > 0
+            && (self.pending_flush >= FLUSH_EVENT_THRESHOLD
+                || self.last_flush.elapsed() >= FLUSH_INTERVAL)
+    }
+
+    fn flush_aggregates(&mut self) {
+        if self.pending_flush == 0 {
+            return;
+        }
+        self.save();
+        self.pending_flush = 0;
+        self.last_flush = Instant::now();
     }
 
     fn from_value(v: &Value) -> Store {
         let mut s = Store::empty();
-        let Value::Object(o) = v else { return s };
+        let Value::Object(o) = v else {
+            return s;
+        };
         if let Some(t) = o.get("since").and_then(Value::as_u64) {
             s.since = t;
         }
+        if let Some(wid) = o.get("workspace_id").and_then(Value::as_str) {
+            s.saved_workspace_id = wid.to_string();
+        }
         if let Some(Value::Object(tools)) = o.get("tools") {
             for (name, tv) in tools {
-                s.tools.insert(
-                    name.clone(),
-                    Tool {
-                        calls: field(tv, "calls"),
-                        baseline_tokens: field(tv, "baseline_tokens"),
-                        returned_tokens: field(tv, "returned_tokens"),
-                        peak_baseline: field(tv, "peak_baseline"),
-                        peak_returned: field(tv, "peak_returned"),
-                        peak_saved: field(tv, "peak_saved"),
-                        last_ts: field(tv, "last_ts"),
-                        total_ms: field(tv, "total_ms"),
-                        peak_ms: field(tv, "peak_ms"),
-                        trunc_count: field(tv, "trunc_count"),
-                        error_count: field(tv, "error_count"),
-                        low_yield_count: field(tv, "low_yield_count"),
-                    },
-                );
+                s.tools.insert(name.clone(), tool_from_value(tv));
             }
         }
+        // v2–v4 may embed a rolling events array; keep it as the in-memory ring.
         if let Some(Value::Array(evs)) = o.get("events") {
             for ev in evs {
-                let tool = ev.get("tool").and_then(Value::as_str).unwrap_or("");
-                if tool.is_empty() {
-                    continue;
+                if let Some(parsed) = event_from_value(ev) {
+                    s.events.push_back(parsed);
                 }
-                s.events.push_back(Event {
-                    ts: field(ev, "ts"),
-                    tool: tool.to_string(),
-                    baseline: field(ev, "baseline"),
-                    returned: field(ev, "returned"),
-                    elapsed_ms: field(ev, "elapsed_ms"),
-                    outcome: ev
-                        .get("outcome")
-                        .and_then(Value::as_str)
-                        .unwrap_or("ok")
-                        .to_string(),
-                    workspace_id: ev
-                        .get("workspace_id")
-                        .and_then(Value::as_str)
-                        .unwrap_or("")
-                        .to_string(),
-                });
             }
             while s.events.len() > EVENT_CAP {
                 s.events.pop_front();
@@ -240,46 +383,18 @@ impl Store {
         let tools: serde_json::Map<String, Value> = self
             .tools
             .iter()
-            .map(|(k, t)| {
-                (
-                    k.clone(),
-                    json!({
-                        "calls": t.calls,
-                        "baseline_tokens": t.baseline_tokens,
-                        "returned_tokens": t.returned_tokens,
-                        "peak_baseline": t.peak_baseline,
-                        "peak_returned": t.peak_returned,
-                        "peak_saved": t.peak_saved,
-                        "last_ts": t.last_ts,
-                        "total_ms": t.total_ms,
-                        "peak_ms": t.peak_ms,
-                        "trunc_count": t.trunc_count,
-                        "error_count": t.error_count,
-                        "low_yield_count": t.low_yield_count,
-                    }),
-                )
-            })
+            .map(|(k, t)| (k.clone(), t.to_json()))
             .collect();
-        let events: Vec<Value> = self
-            .events
-            .iter()
-            .map(|e| {
-                json!({
-                    "ts": e.ts,
-                    "tool": e.tool,
-                    "baseline": e.baseline,
-                    "returned": e.returned,
-                    "elapsed_ms": e.elapsed_ms,
-                    "outcome": e.outcome,
-                    "workspace_id": e.workspace_id,
-                })
-            })
-            .collect();
+        let wid = if !workspace_id_str().is_empty() {
+            workspace_id_str()
+        } else {
+            self.saved_workspace_id.clone()
+        };
         let doc = json!({
-            "version": 4,
+            "version": 5,
             "since": self.since,
+            "workspace_id": wid,
             "tools": Value::Object(tools),
-            "events": events,
         });
         let dir = cache::dir();
         let _ = std::fs::create_dir_all(&dir);
@@ -293,59 +408,216 @@ impl Store {
     }
 }
 
+fn tool_from_value(tv: &Value) -> Tool {
+    let total_us = match field(tv, "total_us") {
+        0 => field(tv, "total_ms").saturating_mul(1000),
+        u => u,
+    };
+    let peak_us = match field(tv, "peak_us") {
+        0 => field(tv, "peak_ms").saturating_mul(1000),
+        u => u,
+    };
+    Tool {
+        calls: field(tv, "calls"),
+        baseline_tokens: field(tv, "baseline_tokens"),
+        returned_tokens: field(tv, "returned_tokens"),
+        peak_baseline: field(tv, "peak_baseline"),
+        peak_returned: field(tv, "peak_returned"),
+        peak_saved: field(tv, "peak_saved"),
+        last_ts: field(tv, "last_ts"),
+        total_us,
+        peak_us,
+        trunc_count: field(tv, "trunc_count"),
+        error_count: field(tv, "error_count"),
+        low_yield_count: field(tv, "low_yield_count"),
+        bytes_read: field(tv, "bytes_read"),
+        cache_hits: field(tv, "cache_hits"),
+        cache_misses: field(tv, "cache_misses"),
+        invalid_count: field(tv, "invalid_count"),
+    }
+}
+
+fn event_from_value(ev: &Value) -> Option<Event> {
+    let tool = ev.get("tool").and_then(Value::as_str).unwrap_or("");
+    if tool.is_empty() {
+        return None;
+    }
+    let elapsed_us = match field(ev, "elapsed_us") {
+        0 => field(ev, "elapsed_ms").saturating_mul(1000),
+        u => u,
+    };
+    Some(Event {
+        ts: field(ev, "ts"),
+        tool: tool.to_string(),
+        baseline: field(ev, "baseline"),
+        returned: field(ev, "returned"),
+        elapsed_us,
+        outcome: ev
+            .get("outcome")
+            .and_then(Value::as_str)
+            .unwrap_or("ok")
+            .to_string(),
+        reason: ev.get("reason").and_then(Value::as_str).map(str::to_string),
+        workspace_id: ev
+            .get("workspace_id")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        bytes_read: field(ev, "bytes_read"),
+        cache_hits: field(ev, "cache_hits"),
+        cache_misses: field(ev, "cache_misses"),
+        wordkeep_version: ev
+            .get("wordkeep_version")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+    })
+}
+
 fn field(v: &Value, key: &str) -> u64 {
     v.get(key).and_then(Value::as_u64).unwrap_or(0)
 }
 
+fn append_event_jsonl(ev: &Event) {
+    let Some(root) = workspace_root() else {
+        return;
+    };
+    let Ok(dir) = workspace::ensure_workspace_dir(root) else {
+        return;
+    };
+    let path = dir.join(EVENTS_FILE);
+    let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    else {
+        return;
+    };
+    if let Ok(line) = serde_json::to_string(&ev.to_jsonl()) {
+        let _ = writeln!(f, "{line}");
+    }
+}
+
+fn read_events_jsonl(root: &Path) -> Vec<Event> {
+    let path = workspace::workspace_dir(root).join(EVENTS_FILE);
+    let Ok(file) = std::fs::File::open(&path) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for line in BufReader::new(file).lines() {
+        let Ok(line) = line else { continue };
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if let Some(ev) = event_from_value(&v) {
+            out.push(ev);
+        }
+    }
+    out
+}
+
 /// Stash baseline/returned for the in-flight call; finalized by [`finish`].
 pub fn record(_tool: &str, baseline_tokens: u64, returned_tokens: u64) {
-    PENDING.with(|p| *p.borrow_mut() = Some((baseline_tokens, returned_tokens)));
+    record_ext(
+        _tool,
+        RecordMeta {
+            baseline: baseline_tokens,
+            returned: returned_tokens,
+            ..Default::default()
+        },
+    );
+}
+
+/// Stash extended call metadata for the in-flight call; finalized by [`finish`].
+pub fn record_ext(_tool: &str, meta: RecordMeta) {
+    PENDING.with(|p| *p.borrow_mut() = Some(meta));
+}
+
+fn looks_like_not_found(text: &str) -> bool {
+    let t = text.to_ascii_lowercase();
+    t.contains("not found")
+        || t.contains("no definition")
+        || t.contains("unsupported")
+        || t.contains("no such")
+        || t.contains("cannot find")
+        || t.contains("no top-level")
+        || t.contains("unknown symbol")
+        || t.contains("no matches")
+}
+
+fn looks_like_invalid(text: &str) -> bool {
+    let t = text.to_ascii_lowercase();
+    t.contains("is required")
+        || t.contains("invalid ")
+        || t.contains("must be")
+        || t.contains("must provide")
 }
 
 /// Classify a tool result for telemetry.
-pub fn classify_outcome(result: &Result<String, String>, returned_tokens: u64) -> &'static str {
+pub fn classify_outcome(result: &Result<String, String>, returned_tokens: u64) -> Outcome {
     if result.is_err() {
-        return "error";
+        return Outcome::Error;
     }
-    if let Ok(text) = result {
-        if text.contains("truncated by token_budget") || text.contains("more; raise") {
-            return "truncated";
-        }
+    let Ok(text) = result else {
+        return Outcome::Error;
+    };
+    if text.contains("truncated by token_budget") || text.contains("more; raise") {
+        return Outcome::Truncated;
+    }
+    if looks_like_not_found(text) {
+        return Outcome::NotFound;
+    }
+    if looks_like_invalid(text) {
+        return Outcome::Invalid;
+    }
+    if returned_tokens == 0 {
+        return Outcome::Empty;
     }
     if returned_tokens <= LOW_YIELD_FLOOR {
-        return "low_yield";
+        return Outcome::LowYield;
     }
-    "ok"
+    Outcome::Ok
 }
 
 /// Finalize telemetry for one instrumented tool call.
-pub fn finish(tool: &str, elapsed_ms: u64, result: &Result<String, String>) {
-    let (baseline, returned) = PENDING.with(|p| p.borrow_mut().take()).unwrap_or((0, 0));
-    let outcome = classify_outcome(result, returned);
+///
+/// `elapsed_us` is wall time in **microseconds** (see `main::instrument`).
+pub fn finish(tool: &str, elapsed_us: u64, result: &Result<String, String>) {
+    let meta = PENDING.with(|p| p.borrow_mut().take()).unwrap_or_default();
+    let outcome = classify_outcome(result, meta.returned);
     let now = now_secs();
     let ws = workspace_id_str();
     if let Ok(mut s) = cell().lock() {
-        s.observe(tool, baseline, returned, elapsed_ms, outcome, now, &ws);
-        s.save();
+        s.observe(tool, elapsed_us, outcome, now, &ws, &meta);
+        if s.needs_flush() {
+            s.flush_aggregates();
+        }
     }
-    let saved = baseline.saturating_sub(returned);
+    let saved = meta.baseline.saturating_sub(meta.returned);
+    let elapsed_ms = elapsed_us / 1000;
     eprintln!(
-        "[wordkeep] {tool}: ~{returned} tok returned vs ~{baseline} distilled \
-         (saved ~{saved}, {}%, {elapsed_ms}ms, {outcome})",
-        pct(saved, baseline)
+        "[wordkeep] {tool}: ~{} tok returned vs ~{} distilled \
+         (avoided ~{saved}, {}%, {elapsed_ms}ms, {})",
+        meta.returned,
+        meta.baseline,
+        pct_precise(saved, meta.baseline),
+        outcome.as_str(),
     );
 }
 
 /// Events for a workspace since `since_ts` (exclusive lower bound when > 0).
-pub fn events_since(root: &std::path::Path, since_ts: u64) -> Vec<Event> {
+///
+/// Reads the append-only `{workspace}/events.jsonl` so callers see history beyond
+/// the in-memory ring of 200 (fixes `session_pressure` under long sessions).
+pub fn events_since(root: &Path, since_ts: u64) -> Vec<Event> {
     let wid = workspace::workspace_id(root);
-    let Ok(s) = cell().lock() else {
-        return Vec::new();
-    };
-    s.events
-        .iter()
+    read_events_jsonl(root)
+        .into_iter()
         .filter(|e| e.ts > since_ts && (e.workspace_id.is_empty() || e.workspace_id == wid))
-        .cloned()
         .collect()
 }
 
@@ -356,6 +628,22 @@ pub fn report(args: &Value) -> Result<String, String> {
         .get("insights")
         .and_then(Value::as_bool)
         .unwrap_or(true);
+    let format = args.get("format").and_then(Value::as_str).unwrap_or("text");
+    let workspace_filter = args
+        .get("workspace")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            let id = workspace_id_str();
+            if id.is_empty() {
+                None
+            } else {
+                Some(id)
+            }
+        });
+
     let mut s = cell()
         .lock()
         .map_err(|_| "stats lock poisoned".to_string())?;
@@ -363,14 +651,33 @@ pub fn report(args: &Value) -> Result<String, String> {
         s.tools.clear();
         s.events.clear();
         s.since = now_secs();
+        s.pending_flush = 0;
         s.save();
-        return Ok("wordkeep savings - counters reset.".to_string());
+        s.last_flush = Instant::now();
+        return Ok("wordkeep estimated context avoided - counters reset.".to_string());
+    }
+    // Ensure a fresh read of aggregates for long-lived servers.
+    if s.needs_flush() {
+        s.flush_aggregates();
     }
     let now = now_secs();
-    let mut out = render(s.since, now, &s.tools);
-    if insights {
-        out.push_str(&render_insights(now, &s.tools, registry()));
-    }
+    let out = if format == "json" {
+        render_json(
+            s.since,
+            now,
+            &s.tools,
+            &s.events,
+            workspace_filter.as_deref(),
+        )
+    } else {
+        let mut text = render(s.since, now, &s.tools);
+        if insights {
+            text.push_str(&render_insights(now, &s.tools, registry()));
+        }
+        text
+    };
+    // Avoid holding the lock while recording (record only sets TLS).
+    drop(s);
     record("stats", 0, (out.len() / 4) as u64);
     Ok(out)
 }
@@ -423,9 +730,59 @@ pub struct Snapshot {
 
 #[cfg(feature = "dashboard")]
 pub fn read_snapshot() -> Snapshot {
-    let s = Store::load();
-    let tools = s
-        .tools
+    // Prefer the live in-process store when the MCP server owns it; otherwise
+    // reload aggregates from disk (dashboard subcommand) and recent jsonl events.
+    let (since, tools, mut events, saved_wid) = if let Some(cell) = STATS.get() {
+        if let Ok(s) = cell.lock() {
+            (
+                s.since,
+                s.tools.clone(),
+                s.events.iter().cloned().collect::<Vec<_>>(),
+                s.saved_workspace_id.clone(),
+            )
+        } else {
+            let s = Store::load();
+            (
+                s.since,
+                s.tools,
+                s.events.into_iter().collect(),
+                s.saved_workspace_id,
+            )
+        }
+    } else {
+        let s = Store::load();
+        (s.since, s.tools, Vec::new(), s.saved_workspace_id)
+    };
+
+    if events.is_empty() {
+        let wid = if !workspace_id_str().is_empty() {
+            workspace_id_str()
+        } else {
+            saved_wid
+        };
+        if !wid.is_empty() {
+            let path = cache::dir().join("workspaces").join(&wid).join(EVENTS_FILE);
+            if let Ok(file) = std::fs::File::open(&path) {
+                let mut loaded = Vec::new();
+                for line in BufReader::new(file).lines() {
+                    let Ok(line) = line else { continue };
+                    let line = line.trim();
+                    if line.is_empty() {
+                        continue;
+                    }
+                    if let Ok(v) = serde_json::from_str::<Value>(line) {
+                        if let Some(ev) = event_from_value(&v) {
+                            loaded.push(ev);
+                        }
+                    }
+                }
+                let start = loaded.len().saturating_sub(EVENT_CAP);
+                events = loaded.split_off(start);
+            }
+        }
+    }
+
+    let tools: Vec<ToolStat> = tools
         .iter()
         .map(|(name, t)| ToolStat {
             name: name.clone(),
@@ -436,38 +793,67 @@ pub fn read_snapshot() -> Snapshot {
             peak_returned: t.peak_returned,
             peak_saved: t.peak_saved,
             last_ts: t.last_ts,
-            total_ms: t.total_ms,
-            peak_ms: t.peak_ms,
+            total_ms: t.total_ms(),
+            peak_ms: t.peak_ms(),
             trunc_count: t.trunc_count,
             error_count: t.error_count,
             low_yield_count: t.low_yield_count,
         })
         .collect();
-    let events = s
-        .events
+    let events: Vec<EventLog> = events
         .iter()
         .map(|e| EventLog {
             ts: e.ts,
             tool: e.tool.clone(),
             baseline: e.baseline,
             returned: e.returned,
-            elapsed_ms: e.elapsed_ms,
+            elapsed_ms: e.elapsed_ms(),
             outcome: e.outcome.clone(),
         })
         .collect();
     Snapshot {
-        since: s.since,
+        since,
         now: now_secs(),
         tools,
         events,
     }
 }
 
+/// Whether a tool should appear on the dashboard low-yield health line.
+#[allow(dead_code)] // dashboard + unit tests
+pub fn is_notable_low_yield(calls: u64, low_yield_count: u64) -> bool {
+    calls >= LOW_YIELD_MIN_CALLS && low_yield_count * 100 / calls >= LOW_YIELD_RATE_PCT
+}
+
+/// Whether a tool should be flagged net-negative (insights + dashboard).
+pub fn is_net_negative(baseline_tokens: u64, returned_tokens: u64) -> bool {
+    baseline_tokens >= NET_NEGATIVE_BASELINE_FLOOR && returned_tokens >= baseline_tokens
+}
+
+#[allow(dead_code)] // dashboard + unit tests
 pub(crate) fn pct(saved: u64, baseline: u64) -> u64 {
     if baseline == 0 {
         0
     } else {
         (saved as f64 / baseline as f64 * 100.0).round() as u64
+    }
+}
+
+/// Reduction % for display: exact `100` when fully avoided; otherwise one decimal
+/// so values like 99.94% render as `99.9` instead of rounding up to `100`.
+pub(crate) fn pct_precise(saved: u64, baseline: u64) -> String {
+    if baseline == 0 {
+        return "0".to_string();
+    }
+    if saved >= baseline {
+        return "100".to_string();
+    }
+    let p = saved as f64 / baseline as f64 * 100.0;
+    let rounded = format!("{p:.1}");
+    if rounded == "100.0" {
+        "99.9".to_string()
+    } else {
+        rounded
     }
 }
 
@@ -522,16 +908,75 @@ pub(crate) fn elapsed(since: u64, now: u64) -> String {
     }
 }
 
+fn percentile_us(samples: &mut [u64], p: f64) -> Option<u64> {
+    if samples.is_empty() {
+        return None;
+    }
+    samples.sort_unstable();
+    let idx = ((p / 100.0) * (samples.len() as f64 - 1.0)).round() as usize;
+    Some(samples[idx.min(samples.len() - 1)])
+}
+
+fn render_json(
+    since: u64,
+    now: u64,
+    tools: &BTreeMap<String, Tool>,
+    events: &VecDeque<Event>,
+    workspace_filter: Option<&str>,
+) -> String {
+    let tools_json: serde_json::Map<String, Value> = tools
+        .iter()
+        .map(|(k, t)| (k.clone(), t.to_json()))
+        .collect();
+    let mut samples: Vec<u64> = events
+        .iter()
+        .filter(|e| match workspace_filter {
+            Some(w) => e.workspace_id.is_empty() || e.workspace_id == w,
+            None => true,
+        })
+        .map(|e| e.elapsed_us)
+        .collect();
+    let p50 = percentile_us(&mut samples.clone(), 50.0);
+    let p95 = percentile_us(&mut samples.clone(), 95.0);
+    let p99 = percentile_us(&mut samples, 99.0);
+    let (mut tb, mut tr) = (0u64, 0u64);
+    for t in tools.values() {
+        tb += t.baseline_tokens;
+        tr += t.returned_tokens;
+    }
+    let avoided = tb.saturating_sub(tr);
+    let doc = json!({
+        "version": 5,
+        "label": "estimated context avoided",
+        "since": since,
+        "now": now,
+        "workspace": workspace_filter,
+        "baseline_tokens": tb,
+        "returned_tokens": tr,
+        "avoided_tokens": avoided,
+        "reduction_pct": pct_precise(avoided, tb),
+        "tools": Value::Object(tools_json),
+        "percentiles": {
+            "elapsed_us": {
+                "p50": p50,
+                "p95": p95,
+                "p99": p99,
+            }
+        },
+    });
+    serde_json::to_string_pretty(&doc).unwrap_or_else(|_| "{}".into())
+}
+
 fn render(since: u64, now: u64, tools: &BTreeMap<String, Tool>) -> String {
     if tools.is_empty() {
-        return "wordkeep savings - no tool calls recorded yet.".to_string();
+        return "wordkeep estimated context avoided - no tool calls recorded yet.".to_string();
     }
     let (mut tc, mut tb, mut tr) = (0u64, 0u64, 0u64);
     let mut rows = String::new();
     for (name, t) in tools {
         let saved = t.baseline_tokens.saturating_sub(t.returned_tokens);
         rows.push_str(&format!(
-            "  {:<16} {:>5} {:>8} {:>5} {:>4} {:>11} {:>11} {:>11} {:>4}%\n",
+            "  {:<16} {:>5} {:>8} {:>5} {:>4} {:>11} {:>11} {:>11} {:>5}%\n",
             name,
             t.calls,
             t.avg_ms(),
@@ -540,7 +985,7 @@ fn render(since: u64, now: u64, tools: &BTreeMap<String, Tool>) -> String {
             commafy(t.baseline_tokens),
             commafy(t.returned_tokens),
             commafy(saved),
-            pct(saved, t.baseline_tokens),
+            pct_precise(saved, t.baseline_tokens),
         ));
         tc += t.calls;
         tb += t.baseline_tokens;
@@ -548,11 +993,11 @@ fn render(since: u64, now: u64, tools: &BTreeMap<String, Tool>) -> String {
     }
     let tsaved = tb.saturating_sub(tr);
     format!(
-        "wordkeep savings - tracking since {}\n\n  {:<16} {:>5} {:>8} {:>5} {:>4} {:>11} {:>11} {:>11} {:>4}\n{}  {:<16} {:>5} {:>8} {:>5} {:>4} {:>11} {:>11} {:>11} {:>4}%\n\n(distilled = est. tokens to read raw material; returned = tokens emitted;\navg ms = mean wall time; trunc/err = outcome counts; ~4 chars/token.)",
+        "wordkeep estimated context avoided - tracking since {}\n\n  {:<16} {:>5} {:>8} {:>5} {:>4} {:>11} {:>11} {:>11} {:>5}\n{}  {:<16} {:>5} {:>8} {:>5} {:>4} {:>11} {:>11} {:>11} {:>5}%\n\n(distilled = est. tokens to read raw material; returned = tokens emitted;\navoided = estimated context avoided; avg ms = mean wall time; trunc/err = outcome counts; ~4 chars/token.)",
         elapsed(since, now),
-        "tool", "calls", "avg ms", "trunc", "err", "distilled", "returned", "saved", "red%",
+        "tool", "calls", "avg ms", "trunc", "err", "distilled", "returned", "avoided", "red%",
         rows,
-        "TOTAL", tc, "-", "-", "-", commafy(tb), commafy(tr), commafy(tsaved), pct(tsaved, tb),
+        "TOTAL", tc, "-", "-", "-", commafy(tb), commafy(tr), commafy(tsaved), pct_precise(tsaved, tb),
     )
 }
 
@@ -606,10 +1051,7 @@ fn render_insights(now: u64, tools: &BTreeMap<String, Tool>, registry: &[&'stati
 
     let inverted: Vec<&str> = tools
         .iter()
-        .filter(|(_, t)| {
-            t.baseline_tokens >= NET_NEGATIVE_BASELINE_FLOOR
-                && t.returned_tokens >= t.baseline_tokens
-        })
+        .filter(|(_, t)| is_net_negative(t.baseline_tokens, t.returned_tokens))
         .map(|(n, _)| n.as_str())
         .collect();
     if !inverted.is_empty() {
@@ -638,6 +1080,7 @@ fn render_insights(now: u64, tools: &BTreeMap<String, Tool>, registry: &[&'stati
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
 
     #[test]
     fn pct_is_saturating_ratio() {
@@ -645,6 +1088,16 @@ mod tests {
         assert_eq!(pct(50, 100), 50);
         assert_eq!(pct(97, 100), 97);
         assert_eq!(pct(100, 0), 0);
+    }
+
+    #[test]
+    fn pct_precise_keeps_one_decimal_near_100() {
+        assert_eq!(pct_precise(0, 0), "0");
+        assert_eq!(pct_precise(100, 100), "100");
+        assert_eq!(pct_precise(50, 100), "50.0");
+        // 99.94% must not round to 100.
+        assert_eq!(pct_precise(9_994, 10_000), "99.9");
+        assert_eq!(pct_precise(9_995, 10_000), "99.9"); // {:.1} → 100.0 clamped
     }
 
     #[test]
@@ -664,31 +1117,55 @@ mod tests {
 
     #[test]
     fn classify_outcome_tags() {
-        assert_eq!(classify_outcome(&Err("x".into()), 100), "error");
+        assert_eq!(classify_outcome(&Err("x".into()), 100), Outcome::Error);
         assert_eq!(
             classify_outcome(&Ok("… (truncated by token_budget)\n".into()), 500),
-            "truncated"
+            Outcome::Truncated
         );
         assert_eq!(
             classify_outcome(&Ok("… (+3 more; raise \"max\")\n".into()), 500),
-            "truncated"
+            Outcome::Truncated
         );
-        assert_eq!(classify_outcome(&Ok("no hits\n".into()), 10), "low_yield");
-        assert_eq!(classify_outcome(&Ok("big answer".repeat(100)), 500), "ok");
+        assert_eq!(
+            classify_outcome(&Ok("outline - a.txt: unsupported file type".into()), 10),
+            Outcome::NotFound
+        );
+        assert_eq!(
+            classify_outcome(&Ok("symbol X: not found".into()), 40),
+            Outcome::NotFound
+        );
+        assert_eq!(
+            classify_outcome(&Ok("file is required".into()), 5),
+            Outcome::Invalid
+        );
+        assert_eq!(classify_outcome(&Ok("".into()), 0), Outcome::Empty);
+        assert_eq!(
+            classify_outcome(&Ok("no hits\n".into()), 10),
+            Outcome::LowYield
+        );
+        assert_eq!(
+            classify_outcome(&Ok("big answer".repeat(100)), 500),
+            Outcome::Ok
+        );
     }
 
     #[test]
     fn observe_tracks_latency_and_outcomes() {
         let mut t = Tool::default();
-        t.observe(1_000, 100, 50, "ok", 5);
-        t.observe(3_000, 200, 150, "truncated", 9);
-        t.observe(500, 10, 20, "error", 12);
-        assert_eq!(t.calls, 3);
-        assert_eq!(t.total_ms, 220);
-        assert_eq!(t.peak_ms, 150);
+        let meta = RecordMeta::default();
+        t.observe(1_000, 100, 50_000, Outcome::Ok, 5, &meta);
+        t.observe(3_000, 200, 150_000, Outcome::Truncated, 9, &meta);
+        t.observe(500, 10, 20_000, Outcome::Error, 12, &meta);
+        t.observe(0, 5, 1_000, Outcome::NotFound, 13, &meta);
+        assert_eq!(t.calls, 4);
+        assert_eq!(t.total_us, 221_000);
+        assert_eq!(t.peak_us, 150_000);
+        assert_eq!(t.total_ms(), 221);
+        assert_eq!(t.peak_ms(), 150);
         assert_eq!(t.trunc_count, 1);
         assert_eq!(t.error_count, 1);
-        assert_eq!(t.avg_ms(), 73);
+        assert_eq!(t.invalid_count, 1);
+        assert_eq!(t.avg_ms(), 55);
     }
 
     #[test]
@@ -707,6 +1184,7 @@ mod tests {
         assert!(out.contains("repo_map"));
         assert!(out.contains("TOTAL"));
         assert!(out.contains("avg ms"));
+        assert!(out.contains("estimated context avoided"));
     }
 
     #[test]
@@ -718,13 +1196,14 @@ mod tests {
                 calls: 5,
                 baseline_tokens: 10_000,
                 returned_tokens: 500,
-                total_ms: 500,
+                total_us: 500_000,
                 ..Default::default()
             },
         );
         let out = render_insights(0, &tools, &["repo_map", "outline", "stats"]);
         assert!(out.contains("never called"));
         assert!(out.contains("outline"));
+        assert!(!out.contains("low_yield"), "{out}");
     }
 
     #[test]
@@ -736,7 +1215,7 @@ mod tests {
                 calls: 96,
                 baseline_tokens: 1_000,
                 returned_tokens: 500,
-                total_ms: 96 * 13,
+                total_us: 96 * 13_000,
                 error_count: 1,
                 ..Default::default()
             },
@@ -776,7 +1255,7 @@ mod tests {
                 baseline_tokens: 50_000,
                 returned_tokens: 5_000,
                 trunc_count: 5,
-                total_ms: 28 * 60,
+                total_us: 28 * 60_000,
                 ..Default::default()
             },
         );
@@ -787,9 +1266,9 @@ mod tests {
     }
 
     #[test]
-    fn from_value_reads_v3_and_defaults_v2() {
-        let v3 = json!({
-            "version": 3,
+    fn from_value_loads_v4_and_v5() {
+        let v4 = json!({
+            "version": 4,
             "since": 100,
             "tools": { "repo_map": {
                 "calls": 2, "baseline_tokens": 9_000, "returned_tokens": 300,
@@ -799,11 +1278,30 @@ mod tests {
             "events": [ { "ts": 41, "tool": "repo_map", "baseline": 3_000, "returned": 100,
                           "elapsed_ms": 40, "outcome": "ok" } ]
         });
-        let s = Store::from_value(&v3);
+        let s = Store::from_value(&v4);
         let t = s.tools.get("repo_map").unwrap();
-        assert_eq!(t.total_ms, 120);
+        assert_eq!(t.total_us, 120_000);
+        assert_eq!(t.peak_us, 80_000);
         assert_eq!(t.trunc_count, 1);
+        assert_eq!(s.events.back().unwrap().elapsed_us, 40_000);
         assert_eq!(s.events.back().unwrap().outcome, "ok");
+
+        let v5 = json!({
+            "version": 5,
+            "since": 200,
+            "workspace_id": "abcd",
+            "tools": { "outline": {
+                "calls": 3, "baseline_tokens": 800, "returned_tokens": 120,
+                "total_us": 9_000, "peak_us": 4_000,
+                "bytes_read": 4096, "cache_hits": 2, "cache_misses": 1, "invalid_count": 1
+            }}
+        });
+        let s5 = Store::from_value(&v5);
+        let o = s5.tools.get("outline").unwrap();
+        assert_eq!(o.total_us, 9_000);
+        assert_eq!(o.bytes_read, 4096);
+        assert_eq!(o.invalid_count, 1);
+        assert_eq!(s5.saved_workspace_id, "abcd");
 
         let v2 = json!({
             "version": 2,
@@ -812,7 +1310,87 @@ mod tests {
         });
         let s2 = Store::from_value(&v2);
         let o = s2.tools.get("outline").unwrap();
-        assert_eq!(o.total_ms, 0);
+        assert_eq!(o.total_us, 0);
         assert_eq!(o.trunc_count, 0);
+    }
+
+    #[test]
+    fn events_since_reads_jsonl_beyond_ring() {
+        let _guard = cache::test_env_lock();
+        let pid = std::process::id();
+        let cache_home = std::env::temp_dir().join(format!("wk_stats_cache_{pid}"));
+        let root = std::env::temp_dir().join(format!("wk_stats_root_{pid}"));
+        let _ = std::fs::remove_dir_all(&cache_home);
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::env::set_var("XDG_CACHE_HOME", &cache_home);
+
+        let dir = workspace::ensure_workspace_dir(&root).unwrap();
+        let path = dir.join(EVENTS_FILE);
+        let wid = workspace::workspace_id(&root);
+        let mut f = std::fs::File::create(&path).unwrap();
+        for i in 1..=250u64 {
+            let line = json!({
+                "ts": i,
+                "tool": "outline",
+                "baseline": 10,
+                "returned": 2,
+                "elapsed_us": 1000,
+                "outcome": "ok",
+                "workspace_id": wid,
+                "bytes_read": 0,
+                "cache_hits": 0,
+                "cache_misses": 0,
+                "wordkeep_version": "0.2.0",
+            });
+            writeln!(f, "{line}").unwrap();
+        }
+        drop(f);
+
+        let evs = events_since(&root, 0);
+        assert!(
+            evs.len() > 200,
+            "expected >200 from jsonl, got {}",
+            evs.len()
+        );
+        assert_eq!(evs.len(), 250);
+        let filtered = events_since(&root, 200);
+        assert_eq!(filtered.len(), 50);
+
+        let _ = std::fs::remove_dir_all(&cache_home);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn finish_debounce_does_not_fail() {
+        let _guard = cache::test_env_lock();
+        let pid = std::process::id();
+        let cache_home = std::env::temp_dir().join(format!("wk_stats_fin_{pid}"));
+        let root = std::env::temp_dir().join(format!("wk_stats_fin_root_{pid}"));
+        let _ = std::fs::remove_dir_all(&cache_home);
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::env::set_var("XDG_CACHE_HOME", &cache_home);
+        // Best-effort: workspace root may already be set in-process; events still ok.
+        let _ = WORKSPACE_ROOT.set(root.clone());
+        let _ = WORKSPACE_ID.set(workspace::workspace_id(&root));
+
+        for i in 0..5 {
+            record("stats", 100 + i, 10);
+            finish("stats", 1_500, &Ok("ok enough text here".into()));
+        }
+        // No panic / lock poison is success.
+        let _ = std::fs::remove_dir_all(&cache_home);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn low_yield_and_net_negative_thresholds() {
+        assert!(!is_notable_low_yield(5, 5));
+        assert!(!is_notable_low_yield(10, 2)); // 20%
+        assert!(is_notable_low_yield(10, 3)); // 30%
+        assert!(!is_net_negative(100, 400));
+        assert!(is_net_negative(500, 500));
+        assert!(is_net_negative(1_000, 2_000));
     }
 }

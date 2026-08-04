@@ -9,6 +9,7 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Mutex, OnceLock};
+use wordkeep_knowledge::chunk_bodies;
 
 use crate::cache::{self, DiskMap};
 use crate::{config, defects, stats, walk};
@@ -535,9 +536,12 @@ fn index(root: &Path, roots: &[String]) -> (Vec<Chunk>, u64) {
 
 /// Return a document's chunks, reusing the cached chunking when the on-disk mtime
 /// is unchanged. Adds the file size to `bytes` (the read-it-yourself baseline).
-/// Falls back to a fresh read+`chunk_file` on cache miss or stat error.
+/// Falls back to a fresh read plus the shared Markdown chunker on cache miss
+/// or stat error.
 fn cached_chunks(path: &Path, rel: &str, bytes: &mut u64) -> Vec<Chunk> {
-    let key = path.to_string_lossy();
+    // Keep the established cache file visible to index_stale, but version each
+    // key so pre-fence-aware chunks are never reused.
+    let key = format!("{}::markdown-v2", path.to_string_lossy());
     let (mtime_ns, len) = match std::fs::metadata(path) {
         Ok(m) => (cache::mtime_ns(&m), m.len()),
         Err(_) => (0, 0),
@@ -555,7 +559,9 @@ fn cached_chunks(path: &Path, rel: &str, bytes: &mut u64) -> Vec<Chunk> {
         return Vec::new();
     };
     let mut chunks = Vec::new();
-    chunk_file(rel, &src, &mut chunks);
+    for (heading, body) in chunk_bodies(rel, &src) {
+        push_chunk(&mut chunks, rel, &heading, &body);
+    }
     if let Ok(mut store) = cell.lock() {
         let payload = Value::Array(
             chunks
@@ -587,48 +593,6 @@ fn chunk_from_value(v: &Value) -> Option<Chunk> {
         tf,
         len,
     })
-}
-
-/// Split a markdown file into heading-delimited chunks, skipping any leading
-/// YAML frontmatter (`---` … `---`) used by `.mdc` rule files.
-fn chunk_file(path: &str, src: &str, out: &mut Vec<Chunk>) {
-    let mut heading = String::from("(intro)");
-    let mut buf = String::new();
-    let mut in_frontmatter = false;
-    let mut saw_nonempty = false;
-
-    for line in src.lines() {
-        if !saw_nonempty {
-            if line.trim().is_empty() {
-                continue;
-            }
-            saw_nonempty = true;
-            if line.trim() == "---" {
-                in_frontmatter = true;
-                continue;
-            }
-        }
-        if in_frontmatter {
-            if line.trim() == "---" {
-                in_frontmatter = false;
-            }
-            continue;
-        }
-        if let Some(rest) = line.strip_prefix('#') {
-            push_chunk(out, path, &heading, &buf);
-            buf.clear();
-            let h = rest.trim_start_matches('#').trim();
-            heading = if h.is_empty() {
-                "(section)".into()
-            } else {
-                h.to_string()
-            };
-        } else {
-            buf.push_str(line);
-            buf.push('\n');
-        }
-    }
-    push_chunk(out, path, &heading, &buf);
 }
 
 fn push_chunk(out: &mut Vec<Chunk>, path: &str, heading: &str, buf: &str) {
@@ -714,18 +678,26 @@ mod tests {
     }
 
     #[test]
-    fn chunk_file_strips_frontmatter_and_splits_headings() {
+    fn shared_chunker_strips_frontmatter_and_splits_headings() {
         let src = "---\ntitle: rule\n---\n# Alpha\nbody one\n## Beta\nbody two\n";
-        let mut out = Vec::new();
-        chunk_file("r.md", src, &mut out);
-        let headings: Vec<&str> = out.iter().map(|c| c.heading.as_str()).collect();
+        let out = chunk_bodies("r.md", src);
+        let headings: Vec<&str> = out.iter().map(|(heading, _)| heading.as_str()).collect();
         assert!(headings.contains(&"Alpha"), "{headings:?}");
         assert!(headings.contains(&"Beta"), "{headings:?}");
         // frontmatter key should not leak into any chunk body
         assert!(
-            out.iter().all(|c| !c.body.contains("title")),
+            out.iter().all(|(_, body)| !body.contains("title")),
             "frontmatter leaked"
         );
+    }
+
+    #[test]
+    fn shared_chunker_does_not_split_cpp_include_inside_fence() {
+        let src = "# Build\n```cpp\n#include <vector>\n```\ncompiler notes\n";
+        let out = chunk_bodies("build.md", src);
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert_eq!(out[0].0, "Build");
+        assert!(out[0].1.contains("#include <vector>"));
     }
 
     #[test]

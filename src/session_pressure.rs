@@ -176,6 +176,8 @@ pub fn report(root: &Path, args: &Value) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+    use std::io::Write;
 
     #[test]
     fn level_thresholds() {
@@ -183,5 +185,52 @@ mod tests {
         assert_eq!(level_from_score(4), "medium");
         assert_eq!(level_from_score(7), "high");
         assert_eq!(level_from_score(12), "critical");
+    }
+
+    #[test]
+    fn events_since_reads_beyond_ring_for_pressure() {
+        let _guard = crate::cache::test_env_lock();
+        let pid = std::process::id();
+        let cache_home = std::env::temp_dir().join(format!("wk_pressure_cache_{pid}"));
+        let root = std::env::temp_dir().join(format!("wk_pressure_root_{pid}"));
+        let _ = std::fs::remove_dir_all(&cache_home);
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::env::set_var("XDG_CACHE_HOME", &cache_home);
+
+        let dir = workspace::ensure_workspace_dir(&root).unwrap();
+        let wid = workspace::workspace_id(&root);
+        let mut f = std::fs::File::create(dir.join("events.jsonl")).unwrap();
+        for i in 1..=220u64 {
+            writeln!(
+                f,
+                "{}",
+                json!({
+                    "ts": i,
+                    "tool": "outline",
+                    "baseline": 1,
+                    "returned": 1,
+                    "elapsed_us": 100,
+                    "outcome": if i % 10 == 0 { "error" } else { "ok" },
+                    "workspace_id": wid,
+                    "bytes_read": 0,
+                    "cache_hits": 0,
+                    "cache_misses": 0,
+                    "wordkeep_version": "0.2.0",
+                })
+            )
+            .unwrap();
+        }
+        drop(f);
+
+        let events = stats::events_since(&root, 0);
+        assert!(
+            events.len() > 200,
+            "session_pressure needs jsonl history beyond the 200 ring; got {}",
+            events.len()
+        );
+
+        let _ = std::fs::remove_dir_all(&cache_home);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -49,7 +49,7 @@ Path-accepting tools use `paths`, optional `profile`, or `.wordkeep/config.json`
 | `trace_profile` | optional trace args | Hitch workflow: trace + diff_map + index_stale |
 | `integration_hooks` | optional `query`, `from`, `to` | Curated hooks + optional call_path |
 | `index_stale` | optional `ref`, `paths` / `profile` | Whether disk indexes may lag git / miss coverage |
-| `stats` | optional `reset`, `insights` | Token displacement telemetry (counts ≥1M → `3.25M` / `1.23B` / …) |
+| `stats` | optional `reset`, `insights`, `format` (`text`\|`json`), `workspace` | Estimated context avoided (v5: µs latency, typed outcomes, jsonl events) |
 | `run_record` | `command` | Metadata-only gate/run write (also CLI `run-record`) |
 | `run_history` | optional filters | Recent runs; flags missing logs/artifacts |
 | `artifact_index` | optional `roots` / `query` | Artifact metadata index (no image grading) |

@@ -20,5 +20,10 @@
     "auto_promote": false,
     "handoff_tokens": 1600
   },
+  "wiki": {
+    "meili_url": "http://127.0.0.1:7700",
+    "index": "wiki_chunks",
+    "bind": "127.0.0.1:8787"
+  },
   "test_command": "ctest -R"
 }

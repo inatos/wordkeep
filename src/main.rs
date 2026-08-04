@@ -104,7 +104,7 @@ fn instrument(name: &'static str, inner: mcp::Handler) -> mcp::Handler {
     Box::new(move |args| {
         let t0 = Instant::now();
         let r = inner(args);
-        stats::finish(name, t0.elapsed().as_millis() as u64, &r);
+        stats::finish(name, t0.elapsed().as_micros() as u64, &r);
         r
     })
 }
@@ -747,18 +747,25 @@ fn main() {
         },
         mcp::Tool {
             name: "stats",
-            description: "Report how many tokens wordkeep has saved versus reading the raw \
-                          material (source files, docs, trace CSVs) directly. Shows per-tool call \
-                          counts, avg latency, truncation/error counts, distilled vs returned tokens, \
-                          reduction %, and improvement signals (slow tools, high truncation, never-called). \
-                          Pass \"reset\": true to zero counters. Totals persist across server restarts.",
+            description: "Report estimated context avoided versus reading the raw material \
+                          (source files, docs, trace CSVs) directly. Shows per-tool call counts, \
+                          avg latency, truncation/error counts, distilled vs returned tokens, \
+                          reduction % (one decimal near 100%), and improvement signals (slow tools, \
+                          high truncation, never-called). Pass \"format\": \"json\" for machine-readable \
+                          output with elapsed_us percentiles. Optional \"workspace\" filters event \
+                          percentiles. Pass \"reset\": true to zero counters. Aggregates persist in \
+                          savings.json; per-call events append to workspace events.jsonl.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "reset": { "type": "boolean",
                                "description": "Zero all counters and restart tracking. Default false." },
                     "insights": { "type": "boolean",
-                                  "description": "Append improvement-signals section. Default true." }
+                                  "description": "Append improvement-signals section (text format). Default true." },
+                    "format": { "type": "string",
+                                "description": "\"text\" (default) or \"json\"." },
+                    "workspace": { "type": "string",
+                                   "description": "Workspace id filter for JSON percentiles; defaults to current workspace." }
                 }
             }),
             handler: Box::new(stats::report),

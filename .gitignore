@@ -3,3 +3,7 @@
 # fastembed downloads the ONNX model (~88 MB) into a local cache when the
 # `embeddings` feature runs; never commit it.
 /.fastembed_cache
+
+# Wiki UI (Bun/npm); keep source, ignore install tree. Built `wiki/dist` is
+# produced in CI/release and for local `serve`.
+/wiki/node_modules

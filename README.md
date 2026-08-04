@@ -10,8 +10,47 @@ See [blog.md](./blog.md) for project rationale, architecture decisions, and the 
 
 ![Wordkeep terminal dashboard showing per-tool token displacement, recent activity, and health metrics](docs/dashboard.png)
 
-*Live dashboard for per-tool token displacement, recent activity, and health signals.
-Large counts abbreviate as `3.25M` / `1.23B` / `3.25T` once they pass a million.*
+*Terminal dashboard (`cargo run --features dashboard -- dashboard`) — per-tool token
+displacement, recent activity, and health signals. Large counts abbreviate as
+`3.25M` / `1.23B` / `3.25T` once they pass a million.*
+
+## Wiki companion
+
+`wordkeep-wiki` is an optional local browser UI over the same Markdown knowledge
+(Meilisearch + dark Svelte app). Same telemetry as the terminal dashboard, plus
+search, reader tabs, and garden health.
+
+![Wiki GUI MCP telemetry dashboard with overview cards, sortable tools table, and editor tabs](docs/wiki-dashboard.png)
+
+*GUI dashboard tab — live `/api/dashboard` poll of the same `savings.json` as the
+terminal TUI (no `dashboard` Cargo feature required).*
+
+![Wiki search with live hits and path-root typeahead open](docs/wiki-search.png)
+
+*Instant search with kind / path-root / tag typeaheads and highlighted snippets.*
+
+![Wiki reader with pinned tabs, tag color picker, and hex field](docs/wiki-reader.png)
+
+*Reader with VS Code-style pinned tabs, frontmatter tag CRUD, and per-tag colors
+(picker + copyable hex).*
+
+![Wiki knowledge health panel with search telemetry and link garden](docs/wiki-health.png)
+
+*Knowledge health — Meilisearch/manifest status, search telemetry, and link-garden
+scan (broken / orphan / duplicate headings).*
+
+```sh
+docker compose -f docker-compose.wiki.yml up -d
+cargo run -p wordkeep-wiki -- --root /path/to/repo index --full
+cargo run -p wordkeep-wiki -- --root /path/to/repo serve --watch
+# UI: http://127.0.0.1:8787
+```
+
+Refresh README screenshots (wiki must be serving on `:8787`):
+
+```sh
+cd wiki && bun run shots
+```
 
 ## Install
 
@@ -114,9 +153,16 @@ opt-in (`--features daslang`).
 cargo build --release --features embeddings   # semantic rerank for knowledge_search
 cargo build --release --features daslang      # vendored Daslang grammar
 cargo run --features dashboard -- dashboard   # live stats terminal UI
+# GUI alternative (no dashboard feature needed): wordkeep-wiki serve → Dashboard tab
 ```
 
 Default build is offline and deterministic (BM25 only, no ONNX).
+
+Token-savings telemetry is available two ways:
+
+- **Terminal:** `cargo run --features dashboard -- dashboard` → [docs/dashboard.png](docs/dashboard.png)
+- **Wiki GUI:** Dashboard tab at http://127.0.0.1:8787 → [docs/wiki-dashboard.png](docs/wiki-dashboard.png)
+  (same `savings.json`; no `dashboard` Cargo feature required)
 
 ## Tests
 
@@ -145,12 +191,29 @@ See [docs/getting-started.md](docs/getting-started.md) for a longer walkthrough.
 ## Telemetry
 
 Every tool records **distilled** (estimated tokens to read raw material) vs
-**returned** (what it actually emitted). Call `stats` to inspect savings.
-Figures use a ~4 characters per token heuristic.
+**returned** (what it actually emitted). Call `stats` to inspect **estimated
+context avoided**. Figures use a ~4 characters per token heuristic — comparative
+telemetry, not billing.
 
 In a 29-day trial on a large private polyglot codebase (627 calls), wordkeep
-estimated **240M distilled vs 315K returned** (~99.9% reduction). Methodology and
-caveats: [blog.md](blog.md#measured-results-anonymized-july-2026).
+estimated **240M distilled vs 315K returned** (~99.9% reduction). Live baseline
+and caveats: [docs/performance.md](docs/performance.md),
+[blog.md](blog.md#measured-results-anonymized-july-2026).
+
+Schema v5 adds workspace event logs, microsecond latency, and typed outcomes.
+`stats` accepts `format: "json"`.
+
+## Wiki companion
+
+Optional local Markdown wiki (Meilisearch + dark Svelte UI):
+
+```sh
+docker compose -f docker-compose.wiki.yml up -d
+cargo run -p wordkeep-wiki -- --root . index --full
+cargo run -p wordkeep-wiki -- --root . serve --watch
+```
+
+See [docs/designs/wiki.md](docs/designs/wiki.md).
 
 ## Docs map
 
@@ -158,6 +221,8 @@ caveats: [blog.md](blog.md#measured-results-anonymized-july-2026).
 - [docs/configuration.md](docs/configuration.md) - config file, env vars, cache
 - [docs/tools.md](docs/tools.md) - tool reference
 - [docs/onboarding.md](docs/onboarding.md) - MCP primer and design rationale
+- [docs/performance.md](docs/performance.md) - telemetry methodology & baselines
+- [docs/designs/wiki.md](docs/designs/wiki.md) - searchable wiki companion
 - [docs/designs/recursive_mas.md](docs/designs/recursive_mas.md) - MAS blackboard
 - [blog.md](blog.md) - why the project exists
 - [CHANGELOG.md](CHANGELOG.md) - release notes

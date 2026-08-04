@@ -1,0 +1,17 @@
+[
+  {
+    "id": "ecs-phases",
+    "query": "Flecs phase ordering PreUpdate PostUpdate",
+    "expect_path_contains": ["docs/", ".cursor/rules/"]
+  },
+  {
+    "id": "wordkeep-stats",
+    "query": "token savings distilled returned telemetry",
+    "expect_path_contains": ["tools/wordkeep/", "README"]
+  },
+  {
+    "id": "session-continuity",
+    "query": "session_handoff defects run_record",
+    "expect_path_contains": ["session_continuity", "wordkeep"]
+  }
+]
