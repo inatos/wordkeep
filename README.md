@@ -46,6 +46,13 @@ cargo run -p wordkeep-wiki -- --root /path/to/repo serve --watch
 # UI: http://127.0.0.1:8787
 ```
 
+Optional idempotent launcher (same binary search as `mcp.sh`): [wiki.sh](wiki.sh) brings up Meilisearch + `serve --watch` if `:8787` is not already healthy. In the Betwixt monorepo, Cursor runs it on folder open via `.vscode/tasks.json`.
+
+```sh
+./wiki.sh
+# UI: http://127.0.0.1:8787
+```
+
 Refresh README screenshots (wiki must be serving on `:8787`):
 
 ```sh
