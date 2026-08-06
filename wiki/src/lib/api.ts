@@ -159,13 +159,30 @@ export type DashboardPayload = {
   health?: { signals?: DashboardSignal[] };
 };
 
-async function getJson<T>(url: string): Promise<T> {
-  const res = await fetch(url);
-  const data = await res.json();
+async function parseJsonResponse<T>(res: Response, url: string): Promise<T> {
+  const text = await res.text();
+  if (!text) {
+    throw new Error(
+      res.ok
+        ? `Empty response from ${url}`
+        : `HTTP ${res.status} empty body from ${url} (rebuild/restart wordkeep-wiki if /api/dashboard is missing)`,
+    );
+  }
+  let data: unknown;
+  try {
+    data = JSON.parse(text);
+  } catch {
+    throw new Error(`Non-JSON response from ${url} (HTTP ${res.status})`);
+  }
   if (!res.ok) {
     throw new Error((data as { error?: string }).error || `HTTP ${res.status}`);
   }
   return data as T;
+}
+
+async function getJson<T>(url: string): Promise<T> {
+  const res = await fetch(url);
+  return parseJsonResponse<T>(res, url);
 }
 
 async function sendJson<T>(url: string, method: 'POST' | 'PUT', body: unknown): Promise<T> {
@@ -174,11 +191,7 @@ async function sendJson<T>(url: string, method: 'POST' | 'PUT', body: unknown): 
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
   });
-  const data = await res.json();
-  if (!res.ok) {
-    throw new Error((data as { error?: string }).error || `HTTP ${res.status}`);
-  }
-  return data as T;
+  return parseJsonResponse<T>(res, url);
 }
 
 async function postJson<T>(url: string, body: unknown): Promise<T> {
