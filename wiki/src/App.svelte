@@ -1539,10 +1539,11 @@
           <button
             class="tree-item"
             class:active={pagePath === node.path}
-            style={`padding-left:${0.5 + depth * 0.75}rem`}
+            style={`--depth:${depth}`}
             title={node.path}
             onclick={() => openPath(node.path!)}
           >
+            <span class="tree-indent" aria-hidden="true"></span>
             <svg class="leaf" viewBox="0 0 24 24" aria-hidden="true"
               ><path
                 d="M7 3h7l4 4v14H7z"
@@ -1552,14 +1553,14 @@
                 stroke-linejoin="round"
               /></svg
             >
-            {node.name}
+            <span class="tree-label">{node.name}</span>
           </button>
         {:else if dirKey}
           <button
             type="button"
             class="tree-dir"
             class:collapsed={expanded === false}
-            style={`padding-left:${0.5 + depth * 0.75}rem`}
+            style={`--depth:${depth}`}
             title={expanded
               ? `Collapse ${dirKey}`
               : `Expand ${dirKey}`}
@@ -1567,6 +1568,7 @@
             aria-label={`${expanded ? 'Collapse' : 'Expand'} folder ${node.name}`}
             onclick={() => toggleDir(dirKey)}
           >
+            <span class="tree-indent" aria-hidden="true"></span>
             <svg class="chevron" viewBox="0 0 24 24" aria-hidden="true"
               ><path
                 d="M9 6l6 6-6 6"
@@ -1586,7 +1588,7 @@
                 stroke-linejoin="round"
               /></svg
             >
-            {node.name}
+            <span class="tree-label">{node.name}</span>
           </button>
         {/if}
       {/each}
@@ -2806,7 +2808,6 @@
   }
   .icon-btn,
   .hits button,
-  .tree-item,
   .backlinks button,
   .toc button {
     border: 1px solid var(--border);
@@ -2854,7 +2855,6 @@
   }
   .icon-btn:active:not(:disabled),
   .hits button:active,
-  .tree-item:active,
   .backlinks button:active,
   .toc button:active {
     transform: translateY(0.15em);
@@ -3160,48 +3160,71 @@
   .tree {
     display: flex;
     flex-direction: column;
-    gap: 0.15rem;
-    max-height: 28vh;
-    overflow: auto;
-    margin-bottom: 1rem;
+    gap: 0.05rem;
+    max-height: 36vh;
+    overflow-x: hidden;
+    overflow-y: auto;
+    margin-bottom: 0.65rem;
+    min-width: 0;
   }
   .tree-head {
     display: flex;
     align-items: center;
     justify-content: space-between;
-    gap: 0.4rem;
-    margin: 0.35rem 0 0.35rem;
+    gap: 0.35rem;
+    margin: 0.2rem 0 0.25rem;
   }
   .tree-head .section-title {
     margin: 0;
     min-width: 0;
+    font-size: 0.85rem;
+    gap: 0.35rem;
   }
   .tree-actions {
     display: flex;
-    gap: 0.25rem;
+    gap: 0.2rem;
     flex: 0 0 auto;
   }
   .tree-action {
-    width: 1.7rem;
-    height: 1.7rem;
+    width: 1.45rem;
+    height: 1.45rem;
   }
   .tree-action svg {
-    width: 0.95rem;
-    height: 0.95rem;
+    width: 0.85rem;
+    height: 0.85rem;
   }
   .tree-item,
   .tree-dir {
     display: flex;
     align-items: center;
-    gap: 0.4rem;
+    gap: 0.28rem;
     text-align: left;
-    font-size: 0.9rem;
+    font-size: 0.78rem;
+    line-height: 1.25;
+    width: 100%;
+    min-width: 0;
+    max-width: 100%;
+    box-sizing: border-box;
+    padding: 0.18rem 0.4rem;
+    border-radius: 5px;
+  }
+  .tree-indent {
+    flex: 0 0 calc(var(--depth, 0) * 0.55rem);
+    width: calc(var(--depth, 0) * 0.55rem);
+    height: 1px;
+  }
+  .tree-label {
+    min-width: 0;
+    flex: 1 1 auto;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
   .tree-item .leaf,
   .tree-dir .leaf,
   .tree-dir .chevron {
-    width: 0.9rem;
-    height: 0.9rem;
+    width: 0.78rem;
+    height: 0.78rem;
     flex: 0 0 auto;
     opacity: 0.75;
     color: var(--accent-strong);
@@ -3214,7 +3237,10 @@
     transform: rotate(0deg);
   }
   .tree-item {
+    border: 1px solid var(--border);
     border-left: 2px solid transparent;
+    background: var(--bg-elevated);
+    cursor: pointer;
   }
   .tree-item.active {
     border-left-color: var(--accent);
@@ -3224,16 +3250,16 @@
   .tree-item:hover {
     background: var(--bg-hover);
     border-left-color: var(--accent);
-    transform: translateX(2px);
+  }
+  .tree-item:active {
+    transform: none;
+    box-shadow: none;
   }
   .tree-dir {
     color: var(--muted);
-    padding: 0.25rem 0.5rem;
     border: 0;
     background: transparent;
-    border-radius: 6px;
     cursor: pointer;
-    width: 100%;
   }
   .tree-dir:hover {
     color: var(--text);

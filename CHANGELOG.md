@@ -3,6 +3,16 @@
 All notable changes to wordkeep are documented here. The project follows
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- Wiki sidebar **Tree** left-edge clipping on deep folders (flex `min-width` +
+  padding indent overflow). Indent uses a fixed-width spacer + label ellipsis;
+  denser row chrome. Regenerated `docs/wiki-*.png` / `docs/dashboard.png`.
+- `wiki.sh` restarts when `/api/dashboard` is missing (stale binary) so the GUI
+  Dashboard tab does not hit empty JSON parse errors.
+
 ## [0.3.0] - 2026-08-04
 
 Telemetry truthfulness, `diff_map` hot-path fix, shared Markdown knowledge
