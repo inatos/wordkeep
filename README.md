@@ -95,8 +95,9 @@ Example (Cursor): copy [examples/mcp.cursor.json](examples/mcp.cursor.json) to
 Example (VS Code Copilot): copy [examples/mcp.vscode.json](examples/mcp.vscode.json)
 to `.vscode/mcp.json`.
 
-Optional launcher script for this repo: [mcp.sh](mcp.sh) runs
-`target/release/wordkeep` with a pinned `CARGO_TARGET_DIR`.
+Optional launcher script for this repo: [mcp.sh](mcp.sh) picks the newest
+`target/{release,debug}/wordkeep`, pins `CARGO_TARGET_DIR`, and warns when
+`src/` is newer than the binary (rebuild + reload MCP after bumps).
 
 ## Configuration
 

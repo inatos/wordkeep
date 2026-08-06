@@ -549,9 +549,12 @@ fn looks_like_not_found(text: &str) -> bool {
         || t.contains("unsupported")
         || t.contains("no such")
         || t.contains("cannot find")
+        || t.contains("cannot read")
         || t.contains("no top-level")
         || t.contains("unknown symbol")
         || t.contains("no matches")
+        || t.contains("no matching")
+        || t.contains("no test file")
 }
 
 fn looks_like_invalid(text: &str) -> bool {
@@ -1190,6 +1193,13 @@ mod tests {
         );
         assert_eq!(
             classify_outcome(&Ok("symbol X: not found".into()), 40),
+            Outcome::NotFound
+        );
+        assert_eq!(
+            classify_outcome(
+                &Ok("symbol_refs - \"X\": 0 def, 0 call, 0 ref\n(no matching occurrences)\n".into()),
+                23
+            ),
             Outcome::NotFound
         );
         assert_eq!(

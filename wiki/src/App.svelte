@@ -2210,6 +2210,119 @@
             </article>
           </div>
 
+          <div class="dash-split">
+            <div>
+              <h3
+                class="section-title"
+                title="Most recent MCP tool calls (newest first). Outcome chips flag truncated/error/low-yield."
+              >
+                <svg viewBox="0 0 24 24" aria-hidden="true"
+                  ><path
+                    d="M12 8v5l3 2M12 22a10 10 0 1 0 0-20 10 10 0 0 0 0 20z"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="2"
+                    stroke-linecap="round"
+                    stroke-linejoin="round"
+                  /></svg
+                >
+                Recent activity
+              </h3>
+              <div class="table-wrap">
+                <table class="dash-table">
+                  <thead>
+                    <tr>
+                      <th class="static" title="Time since the call">When</th>
+                      <th class="static" title="MCP tool name">Tool</th>
+                      <th class="static" title="Wall time for the call">Ms</th>
+                      <th class="static" title="Estimated tokens without wordkeep">Distill</th>
+                      <th class="static" title="Tokens actually returned">Return</th>
+                      <th class="static" title="Call outcome (ok / trunc / error / low-yield)"
+                        >Outcome</th
+                      >
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {#each dashboard.activity || [] as event}
+                      <tr title={activityTitle(event)}>
+                        <td class="muted">{event.ago}</td>
+                        <td class="tool-name"
+                          ><code title={activityTitle(event)}>{event.tool}</code></td
+                        >
+                        <td>{event.elapsed_ms}ms</td>
+                        <td class="good">{event.baseline_fmt ?? event.baseline}</td>
+                        <td>{event.returned_fmt ?? event.returned}</td>
+                        <td>
+                          {#if event.outcome !== 'ok'}
+                            <span class="chip warn" title={activityTitle(event)}
+                              >{event.outcome}</span
+                            >
+                          {:else}
+                            <span class="muted">ok</span>
+                          {/if}
+                        </td>
+                      </tr>
+                    {:else}
+                      <tr>
+                        <td colspan="6" class="muted">No recent MCP events.</td>
+                      </tr>
+                    {/each}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+            <div>
+              <h3
+                class="section-title"
+                title="Watermarks and risk signals: peak saves, slow tools, low-yield, and net-negative distill."
+              >
+                <svg viewBox="0 0 24 24" aria-hidden="true"
+                  ><path
+                    d="M12 3l8 4v6c0 5-3.5 8.5-8 10-4.5-1.5-8-5-8-10V7l8-4z"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="2"
+                    stroke-linejoin="round"
+                  /></svg
+                >
+                Health signals
+              </h3>
+              <div class="table-wrap">
+                <table class="dash-table">
+                  <thead>
+                    <tr>
+                      <th class="static" title="Signal category">Signal</th>
+                      <th class="static" title="Primary value">Value</th>
+                      <th class="static" title="Related tool or note">Detail</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {#each dashboard.health?.signals || [] as signal}
+                      <tr
+                        class={`signal-${signal.kind}`}
+                        title={`${signal.label}: ${signal.value ?? '—'}${signal.detail ? ` (${signal.detail})` : ''}`}
+                      >
+                        <td class="muted">{signal.label}</td>
+                        <td class="signal-value">{signal.value ?? '—'}</td>
+                        <td>
+                          {#if signal.detail}
+                            <code>{signal.detail}</code>
+                          {:else}
+                            <span class="muted">—</span>
+                          {/if}
+                        </td>
+                      </tr>
+                    {:else}
+                      <tr>
+                        <td colspan="3" class="muted">No health signals yet.</td>
+                      </tr>
+                    {/each}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+
           <h3
             class="section-title"
             title="Per-tool lifetime stats. Click a column header to sort; hover a tool name for usage."
@@ -2372,119 +2485,6 @@
                 {/each}
               </tbody>
             </table>
-          </div>
-
-          <div class="dash-split">
-            <div>
-              <h3
-                class="section-title"
-                title="Most recent MCP tool calls (newest first). Outcome chips flag truncated/error/low-yield."
-              >
-                <svg viewBox="0 0 24 24" aria-hidden="true"
-                  ><path
-                    d="M12 8v5l3 2M12 22a10 10 0 1 0 0-20 10 10 0 0 0 0 20z"
-                    fill="none"
-                    stroke="currentColor"
-                    stroke-width="2"
-                    stroke-linecap="round"
-                    stroke-linejoin="round"
-                  /></svg
-                >
-                Recent activity
-              </h3>
-              <div class="table-wrap">
-                <table class="dash-table">
-                  <thead>
-                    <tr>
-                      <th class="static" title="Time since the call">When</th>
-                      <th class="static" title="MCP tool name">Tool</th>
-                      <th class="static" title="Wall time for the call">Ms</th>
-                      <th class="static" title="Estimated tokens without wordkeep">Distill</th>
-                      <th class="static" title="Tokens actually returned">Return</th>
-                      <th class="static" title="Call outcome (ok / trunc / error / low-yield)"
-                        >Outcome</th
-                      >
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {#each dashboard.activity || [] as event}
-                      <tr title={activityTitle(event)}>
-                        <td class="muted">{event.ago}</td>
-                        <td class="tool-name"
-                          ><code title={activityTitle(event)}>{event.tool}</code></td
-                        >
-                        <td>{event.elapsed_ms}ms</td>
-                        <td class="good">{event.baseline_fmt ?? event.baseline}</td>
-                        <td>{event.returned_fmt ?? event.returned}</td>
-                        <td>
-                          {#if event.outcome !== 'ok'}
-                            <span class="chip warn" title={activityTitle(event)}
-                              >{event.outcome}</span
-                            >
-                          {:else}
-                            <span class="muted">ok</span>
-                          {/if}
-                        </td>
-                      </tr>
-                    {:else}
-                      <tr>
-                        <td colspan="6" class="muted">No recent MCP events.</td>
-                      </tr>
-                    {/each}
-                  </tbody>
-                </table>
-              </div>
-            </div>
-            <div>
-              <h3
-                class="section-title"
-                title="Watermarks and risk signals: peak saves, slow tools, low-yield, and net-negative distill."
-              >
-                <svg viewBox="0 0 24 24" aria-hidden="true"
-                  ><path
-                    d="M12 3l8 4v6c0 5-3.5 8.5-8 10-4.5-1.5-8-5-8-10V7l8-4z"
-                    fill="none"
-                    stroke="currentColor"
-                    stroke-width="2"
-                    stroke-linejoin="round"
-                  /></svg
-                >
-                Health signals
-              </h3>
-              <div class="table-wrap">
-                <table class="dash-table">
-                  <thead>
-                    <tr>
-                      <th class="static" title="Signal category">Signal</th>
-                      <th class="static" title="Primary value">Value</th>
-                      <th class="static" title="Related tool or note">Detail</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {#each dashboard.health?.signals || [] as signal}
-                      <tr
-                        class={`signal-${signal.kind}`}
-                        title={`${signal.label}: ${signal.value ?? '—'}${signal.detail ? ` (${signal.detail})` : ''}`}
-                      >
-                        <td class="muted">{signal.label}</td>
-                        <td class="signal-value">{signal.value ?? '—'}</td>
-                        <td>
-                          {#if signal.detail}
-                            <code>{signal.detail}</code>
-                          {:else}
-                            <span class="muted">—</span>
-                          {/if}
-                        </td>
-                      </tr>
-                    {:else}
-                      <tr>
-                        <td colspan="3" class="muted">No health signals yet.</td>
-                      </tr>
-                    {/each}
-                  </tbody>
-                </table>
-              </div>
-            </div>
           </div>
         {/if}
 

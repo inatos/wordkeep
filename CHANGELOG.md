@@ -12,6 +12,14 @@ All notable changes to wordkeep are documented here. The project follows
   denser row chrome. Regenerated `docs/wiki-*.png` / `docs/dashboard.png`.
 - `wiki.sh` restarts when `/api/dashboard` is missing (stale binary) so the GUI
   Dashboard tab does not hit empty JSON parse errors.
+- Telemetry: treat `no matching occurrences` / `no test file` / `cannot read`
+  replies as **not_found** (was low_yield). `mcp.sh` picks the newest
+  release/debug binary and warns when `src/` is newer than the binary.
+
+### Changed
+
+- Wiki Dashboard tab: Recent activity + Health signals render above the Tools
+  table.
 
 ## [0.3.0] - 2026-08-04
 
