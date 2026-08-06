@@ -1197,7 +1197,9 @@ mod tests {
         );
         assert_eq!(
             classify_outcome(
-                &Ok("symbol_refs - \"X\": 0 def, 0 call, 0 ref\n(no matching occurrences)\n".into()),
+                &Ok(
+                    "symbol_refs - \"X\": 0 def, 0 call, 0 ref\n(no matching occurrences)\n".into()
+                ),
                 23
             ),
             Outcome::NotFound
