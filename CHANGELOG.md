@@ -5,8 +5,21 @@ All notable changes to wordkeep are documented here. The project follows
 
 ## [Unreleased]
 
+### Added
+
+- Wiki Dashboard **live charts** (tokens saved / calls bars, outcome donut,
+  recent-savings line chart) from the existing 2s `/api/dashboard` poll.
+  Zero new npm deps — SVG components under `wiki/src/lib/charts/`.
+- Chart interactivity: line chart axes + hover crosshair/tooltip; donut slice
+  + legend hover metrics (count, %, description; center follows hover).
+- `CHART_HELP` / `OUTCOME_HELP` tooltips on chart cards, bars, and sections.
+- Collapsible Dashboard + Health sections with persisted open/closed state
+  (`localStorage` key `wordkeep-wiki-section-collapsed`).
+
 ### Fixed
 
+- Sticky wiki navbar no longer covered by sidebar filter/combo stacking
+  (`aside { isolation: isolate }`, header `z-index: 30`).
 - Wiki sidebar **Tree** left-edge clipping on deep folders (flex `min-width` +
   padding indent overflow). Indent uses a fixed-width spacer + label ellipsis;
   denser row chrome. Regenerated `docs/wiki-*.png` / `docs/dashboard.png`.

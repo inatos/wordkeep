@@ -23,7 +23,9 @@ search, reader tabs, and garden health.
 ![Wiki GUI MCP telemetry dashboard with overview cards, sortable tools table, and editor tabs](docs/wiki-dashboard.png)
 
 *GUI dashboard tab — live `/api/dashboard` poll of the same `savings.json` as the
-terminal TUI (no `dashboard` Cargo feature required).*
+terminal TUI (no `dashboard` Cargo feature required). Includes live bar / donut /
+line charts (axes + hover metrics) and collapsible sections (open/closed state
+persisted).*)
 
 ![Wiki search with live hits and path-root typeahead open](docs/wiki-search.png)
 
@@ -37,7 +39,7 @@ terminal TUI (no `dashboard` Cargo feature required).*
 ![Wiki knowledge health panel with search telemetry and link garden](docs/wiki-health.png)
 
 *Knowledge health — Meilisearch/manifest status, search telemetry, and link-garden
-scan (broken / orphan / duplicate headings).*
+scan (broken / orphan / duplicate headings). Sections collapse like the Dashboard.*)
 
 ```sh
 docker compose -f docker-compose.wiki.yml up -d

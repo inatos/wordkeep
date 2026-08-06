@@ -119,6 +119,7 @@ export type DashboardTool = {
 };
 
 export type DashboardActivity = {
+  ts?: number;
   ago: string;
   tool: string;
   elapsed_ms: number;

@@ -25,8 +25,10 @@
     type TreeNode,
   } from './lib/api';
   import {
+    CHART_HELP,
     COLUMN_HELP,
     METRIC_HELP,
+    OUTCOME_HELP,
     TERMINAL_DASHBOARD_CMD,
     WIKI_SERVE_CMD,
     toolHelp,
@@ -41,6 +43,11 @@
     saveTagColors,
     type TagColorMap,
   } from './lib/tagColors';
+  import CollapsibleSection from './lib/CollapsibleSection.svelte';
+  import BarChart from './lib/charts/BarChart.svelte';
+  import DonutChart from './lib/charts/DonutChart.svelte';
+  import Sparkline from './lib/charts/Sparkline.svelte';
+  import type { BarDatum, DonutDatum, SparkPoint } from './lib/charts/utils';
 
   type Tab = 'search' | 'reader' | 'dashboard' | 'health';
   type EditorTab = { path: string; pinned: boolean };
@@ -998,6 +1005,70 @@
     });
     return tools;
   });
+
+  let chartSavedBars = $derived.by((): BarDatum[] =>
+    (dashboard?.tools || []).map((tool) => ({
+      label: tool.name,
+      value: tool.saved,
+      color: tool.inverted ? 'var(--danger)' : 'var(--ok)',
+      title: [
+        toolHelp(tool.name),
+        `Tokens saved (distill − return): ${tool.saved_fmt ?? tool.saved}`,
+        tool.inverted ? 'Net-negative: returned more tokens than the distilled baseline.' : '',
+      ]
+        .filter(Boolean)
+        .join('\n'),
+    })),
+  );
+
+  let chartCallBars = $derived.by((): BarDatum[] =>
+    (dashboard?.tools || []).map((tool) => ({
+      label: tool.name,
+      value: tool.calls,
+      color: 'var(--accent)',
+      title: `${toolHelp(tool.name)}\nLifetime calls: ${tool.calls_fmt ?? tool.calls}`,
+    })),
+  );
+
+  let chartOutcomes = $derived.by((): DonutDatum[] => {
+    const tools = dashboard?.tools || [];
+    let calls = 0;
+    let trunc = 0;
+    let error = 0;
+    let invalid = 0;
+    let low = 0;
+    for (const tool of tools) {
+      calls += tool.calls;
+      trunc += tool.trunc_count;
+      error += tool.error_count;
+      invalid += tool.invalid_count ?? 0;
+      low += tool.low_yield_count ?? 0;
+    }
+    const flagged = trunc + error + invalid + low;
+    const ok = Math.max(0, calls - flagged);
+    return [
+      { label: 'ok', value: ok, color: 'var(--ok)', title: OUTCOME_HELP.ok },
+      { label: 'trunc', value: trunc, color: 'var(--warn)', title: OUTCOME_HELP.trunc },
+      { label: 'error', value: error, color: 'var(--danger)', title: OUTCOME_HELP.error },
+      { label: 'invalid', value: invalid, color: '#c47ad0', title: OUTCOME_HELP.invalid },
+      {
+        label: 'low-yield',
+        value: low,
+        color: 'var(--muted)',
+        title: OUTCOME_HELP['low-yield'],
+      },
+    ];
+  });
+
+  let chartSparkSaved = $derived.by((): SparkPoint[] =>
+    (dashboard?.activity || [])
+      .filter((event) => typeof event.ts === 'number' && event.ts > 0)
+      .map((event) => ({
+        ts: event.ts as number,
+        value: event.saved,
+        label: event.tool,
+      })),
+  );
 </script>
 
 <div
@@ -2178,44 +2249,114 @@
         {:else if !dashboard.available}
           <p class="muted">{dashboard.message || 'No savings.json yet.'}</p>
         {:else}
-          <div class="cards dash-overview">
-            <article class="card" title={METRIC_HELP.calls}>
-              <h3>Calls</h3>
-              <p class="metric"><code>{dashboard.overview?.calls_fmt ?? 0}</code></p>
-            </article>
-            <article class="card" title={METRIC_HELP.distilled}>
-              <h3>Distilled</h3>
-              <p class="metric"><code>{dashboard.overview?.baseline_fmt ?? 0}</code></p>
-            </article>
-            <article class="card" title={METRIC_HELP.returned}>
-              <h3>Returned</h3>
-              <p class="metric"><code>{dashboard.overview?.returned_fmt ?? 0}</code></p>
-            </article>
-            <article class="card" title={METRIC_HELP.saved}>
-              <h3>Saved</h3>
-              <p class="metric good"
-                ><code
-                  >{dashboard.overview?.saved_fmt ?? 0}
-                  · {dashboard.overview?.reduction_pct ?? 0}%</code
-                ></p
+          <CollapsibleSection id="dash-overview" titleAttr={CHART_HELP.overview}>
+            {#snippet heading()}
+              <svg viewBox="0 0 24 24" aria-hidden="true"
+                ><path
+                  d="M4 4h7v7H4V4zm9 0h7v7h-7V4zM4 13h7v7H4v-7zm9 4h7v3h-7v-3z"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="2"
+                  stroke-linejoin="round"
+                /></svg
               >
-            </article>
-            <article class="card" title={METRIC_HELP.session}>
-              <h3>Session</h3>
-              <p class="metric"><code>{sessionSavedFmt}</code></p>
-            </article>
-            <article class="card" title={METRIC_HELP.tracking}>
-              <h3>Tracking</h3>
-              <p class="metric"><code>{dashboard.overview?.since_label ?? '—'}</code></p>
-            </article>
-          </div>
+              Overview
+            {/snippet}
+            <div class="cards dash-overview">
+              <article class="card" title={METRIC_HELP.calls}>
+                <h3>Calls</h3>
+                <p class="metric"><code>{dashboard.overview?.calls_fmt ?? 0}</code></p>
+              </article>
+              <article class="card" title={METRIC_HELP.distilled}>
+                <h3>Distilled</h3>
+                <p class="metric"><code>{dashboard.overview?.baseline_fmt ?? 0}</code></p>
+              </article>
+              <article class="card" title={METRIC_HELP.returned}>
+                <h3>Returned</h3>
+                <p class="metric"><code>{dashboard.overview?.returned_fmt ?? 0}</code></p>
+              </article>
+              <article class="card" title={METRIC_HELP.saved}>
+                <h3>Saved</h3>
+                <p class="metric good"
+                  ><code
+                    >{dashboard.overview?.saved_fmt ?? 0}
+                    · {dashboard.overview?.reduction_pct ?? 0}%</code
+                  ></p
+                >
+              </article>
+              <article class="card" title={METRIC_HELP.session}>
+                <h3>Session</h3>
+                <p class="metric"><code>{sessionSavedFmt}</code></p>
+              </article>
+              <article class="card" title={METRIC_HELP.tracking}>
+                <h3>Tracking</h3>
+                <p class="metric"><code>{dashboard.overview?.since_label ?? '—'}</code></p>
+              </article>
+            </div>
+          </CollapsibleSection>
+
+          <CollapsibleSection id="dash-charts" titleAttr={CHART_HELP.section}>
+            {#snippet heading()}
+              <svg viewBox="0 0 24 24" aria-hidden="true"
+                ><path
+                  d="M4 19V9M10 19V5M16 19v-7M22 19H2"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="2"
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                /></svg
+              >
+              Charts
+            {/snippet}
+            <div class="dash-charts">
+              <article class="card chart-card" title={CHART_HELP.saved}>
+                <h3 title={CHART_HELP.saved}>Tokens saved by tool</h3>
+                <BarChart
+                  data={chartSavedBars}
+                  empty="No tool savings yet."
+                  ariaLabel="Tokens saved by tool"
+                  chartTitle={CHART_HELP.saved}
+                />
+              </article>
+              <article class="card chart-card" title={CHART_HELP.calls}>
+                <h3 title={CHART_HELP.calls}>Calls by tool</h3>
+                <BarChart
+                  data={chartCallBars}
+                  empty="No tool calls yet."
+                  ariaLabel="Calls by tool"
+                  chartTitle={CHART_HELP.calls}
+                />
+              </article>
+              <article class="card chart-card" title={CHART_HELP.outcomes}>
+                <h3 title={CHART_HELP.outcomes}>Outcomes</h3>
+                <DonutChart
+                  data={chartOutcomes}
+                  empty="No outcomes yet."
+                  ariaLabel="Call outcomes"
+                  chartTitle={CHART_HELP.outcomes}
+                  centerTitle="Total MCP calls across all outcome buckets"
+                  valueLabel="calls"
+                />
+              </article>
+              <article class="card chart-card" title={CHART_HELP.spark}>
+                <h3 title={CHART_HELP.spark}>Recent savings</h3>
+                <Sparkline
+                  data={chartSparkSaved}
+                  empty="No recent events with timestamps."
+                  ariaLabel="Recent tokens saved per call"
+                  chartTitle={CHART_HELP.spark}
+                  valueLabel="tokens saved"
+                  yAxisLabel="tokens saved"
+                  xAxisLabel="older → newer"
+                />
+              </article>
+            </div>
+          </CollapsibleSection>
 
           <div class="dash-split">
-            <div>
-              <h3
-                class="section-title"
-                title="Most recent MCP tool calls (newest first). Outcome chips flag truncated/error/low-yield."
-              >
+            <CollapsibleSection id="dash-activity" titleAttr={CHART_HELP.activity}>
+              {#snippet heading()}
                 <svg viewBox="0 0 24 24" aria-hidden="true"
                   ><path
                     d="M12 8v5l3 2M12 22a10 10 0 1 0 0-20 10 10 0 0 0 0 20z"
@@ -2227,7 +2368,7 @@
                   /></svg
                 >
                 Recent activity
-              </h3>
+              {/snippet}
               <div class="table-wrap">
                 <table class="dash-table">
                   <thead>
@@ -2270,12 +2411,9 @@
                   </tbody>
                 </table>
               </div>
-            </div>
-            <div>
-              <h3
-                class="section-title"
-                title="Watermarks and risk signals: peak saves, slow tools, low-yield, and net-negative distill."
-              >
+            </CollapsibleSection>
+            <CollapsibleSection id="dash-signals" titleAttr={CHART_HELP.signals}>
+              {#snippet heading()}
                 <svg viewBox="0 0 24 24" aria-hidden="true"
                   ><path
                     d="M12 3l8 4v6c0 5-3.5 8.5-8 10-4.5-1.5-8-5-8-10V7l8-4z"
@@ -2286,7 +2424,7 @@
                   /></svg
                 >
                 Health signals
-              </h3>
+              {/snippet}
               <div class="table-wrap">
                 <table class="dash-table">
                   <thead>
@@ -2320,24 +2458,22 @@
                   </tbody>
                 </table>
               </div>
-            </div>
+            </CollapsibleSection>
           </div>
 
-          <h3
-            class="section-title"
-            title="Per-tool lifetime stats. Click a column header to sort; hover a tool name for usage."
-          >
-            <svg viewBox="0 0 24 24" aria-hidden="true"
-              ><path
-                d="M4 6h16M4 12h16M4 18h10"
-                fill="none"
-                stroke="currentColor"
-                stroke-width="2"
-                stroke-linecap="round"
-              /></svg
-            >
-            Tools
-          </h3>
+          <CollapsibleSection id="dash-tools" titleAttr={CHART_HELP.tools}>
+            {#snippet heading()}
+              <svg viewBox="0 0 24 24" aria-hidden="true"
+                ><path
+                  d="M4 6h16M4 12h16M4 18h10"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="2"
+                  stroke-linecap="round"
+                /></svg
+              >
+              Tools
+            {/snippet}
           <div class="table-wrap">
             <table class="dash-table">
               <thead>
@@ -2486,6 +2622,7 @@
               </tbody>
             </table>
           </div>
+          </CollapsibleSection>
         {/if}
 
         <footer class="panel-footer muted">
@@ -2616,88 +2753,107 @@
             class="card"
             title="Wiki search quality: latency, empty-result rate, and how deep users click into hit lists."
           >
-            <h3 title="Local wiki search stats (not MCP tool telemetry)">Search telemetry</h3>
-            {#if searchTelemetry?.available}
-              <ul>
-                <li title="Total wiki searches since serve started / telemetry file began"
-                  >Searches: <code>{searchTelemetry.searches ?? 0}</code></li
-                >
-                <li title="Share of searches that returned zero hits"
-                  >No-result rate:
-                  <code>{((searchTelemetry.no_result_rate ?? 0) * 100).toFixed(1)}%</code></li
-                >
-                <li title="Average end-to-end search latency in milliseconds"
-                  >Avg latency: <code>{searchTelemetry.avg_latency_ms ?? 0} ms</code></li
-                >
-                <li title="How many search hits were opened"
-                  >Clicks: <code>{searchTelemetry.clicks ?? 0}</code></li
-                >
-                <li title="Mean rank of clicked hits (1 = top result)"
-                  >Avg click rank: <code>{searchTelemetry.avg_click_rank ?? '—'}</code></li
-                >
-              </ul>
-            {:else}
-              <p class="muted">No wiki searches recorded yet — try a query.</p>
-            {/if}
+            <CollapsibleSection
+              id="health-search"
+              titleAttr="Local wiki search stats (not MCP tool telemetry)"
+            >
+              {#snippet heading()}Search telemetry{/snippet}
+              {#if searchTelemetry?.available}
+                <ul>
+                  <li title="Total wiki searches since serve started / telemetry file began"
+                    >Searches: <code>{searchTelemetry.searches ?? 0}</code></li
+                  >
+                  <li title="Share of searches that returned zero hits"
+                    >No-result rate:
+                    <code>{((searchTelemetry.no_result_rate ?? 0) * 100).toFixed(1)}%</code></li
+                  >
+                  <li title="Average end-to-end search latency in milliseconds"
+                    >Avg latency: <code>{searchTelemetry.avg_latency_ms ?? 0} ms</code></li
+                  >
+                  <li title="How many search hits were opened"
+                    >Clicks: <code>{searchTelemetry.clicks ?? 0}</code></li
+                  >
+                  <li title="Mean rank of clicked hits (1 = top result)"
+                    >Avg click rank: <code>{searchTelemetry.avg_click_rank ?? '—'}</code></li
+                  >
+                </ul>
+              {:else}
+                <p class="muted">No wiki searches recorded yet — try a query.</p>
+              {/if}
+            </CollapsibleSection>
           </article>
           <article
             class="card"
             title="Static scan of Markdown links: broken targets, orphans with no inbound links, duplicate heading anchors."
           >
-            <h3 title="Link-graph hygiene for the knowledge garden">Link garden</h3>
-            <ul>
-              <li title="Outbound links whose target file cannot be resolved"
-                >Broken links: <code>{garden?.broken_count ?? 0}</code></li
-              >
-              <li title="Pages with no inbound links from other garden pages"
-                >Orphan pages: <code>{garden?.orphan_count ?? 0}</code></li
-              >
-              <li title="Same heading/anchor colliding within a file"
-                >Duplicate headings: <code>{garden?.duplicate_heading_count ?? 0}</code></li
-              >
-            </ul>
+            <CollapsibleSection
+              id="health-garden"
+              titleAttr="Link-graph hygiene for the knowledge garden"
+            >
+              {#snippet heading()}Link garden{/snippet}
+              <ul>
+                <li title="Outbound links whose target file cannot be resolved"
+                  >Broken links: <code>{garden?.broken_count ?? 0}</code></li
+                >
+                <li title="Pages with no inbound links from other garden pages"
+                  >Orphan pages: <code>{garden?.orphan_count ?? 0}</code></li
+                >
+                <li title="Same heading/anchor colliding within a file"
+                  >Duplicate headings: <code>{garden?.duplicate_heading_count ?? 0}</code></li
+                >
+              </ul>
+            </CollapsibleSection>
           </article>
         </div>
 
         {#if garden?.broken_links?.length}
-          <h3>Broken links</h3>
-          <ul class="plain">
-            {#each garden.broken_links.slice(0, 40) as link}
-              <li>
-                <button class="linkish" onclick={() => openPath(link.source)}
-                  >{link.source}</button
-                >
-                → <code>{link.target}</code>
-              </li>
-            {/each}
-          </ul>
+          <CollapsibleSection id="health-broken" titleAttr="Broken outbound Markdown links">
+            {#snippet heading()}Broken links{/snippet}
+            <ul class="plain">
+              {#each garden.broken_links.slice(0, 40) as link}
+                <li>
+                  <button class="linkish" onclick={() => openPath(link.source)}
+                    >{link.source}</button
+                  >
+                  → <code>{link.target}</code>
+                </li>
+              {/each}
+            </ul>
+          </CollapsibleSection>
         {/if}
 
         {#if garden?.orphans?.length}
-          <h3>Orphan pages</h3>
-          <ul class="plain">
-            {#each garden.orphans.slice(0, 40) as orphan}
-              <li>
-                <button class="linkish" onclick={() => openPath(orphan.path)}>{orphan.path}</button>
-              </li>
-            {/each}
-          </ul>
+          <CollapsibleSection id="health-orphans" titleAttr="Pages with no inbound garden links">
+            {#snippet heading()}Orphan pages{/snippet}
+            <ul class="plain">
+              {#each garden.orphans.slice(0, 40) as orphan}
+                <li>
+                  <button class="linkish" onclick={() => openPath(orphan.path)}>{orphan.path}</button>
+                </li>
+              {/each}
+            </ul>
+          </CollapsibleSection>
         {/if}
 
         {#if garden?.duplicate_headings?.length}
-          <h3>Duplicate headings</h3>
-          <ul class="plain">
-            {#each garden.duplicate_headings.slice(0, 40) as dup}
-              <li>
-                <button
-                  class="linkish"
-                  onclick={() => openPath(dup.path, undefined, dup.anchor)}
-                  >{dup.path}</button
-                >
-                · {dup.heading}
-              </li>
-            {/each}
-          </ul>
+          <CollapsibleSection
+            id="health-dupes"
+            titleAttr="Heading/anchor collisions within a file"
+          >
+            {#snippet heading()}Duplicate headings{/snippet}
+            <ul class="plain">
+              {#each garden.duplicate_headings.slice(0, 40) as dup}
+                <li>
+                  <button
+                    class="linkish"
+                    onclick={() => openPath(dup.path, undefined, dup.anchor)}
+                    >{dup.path}</button
+                  >
+                  · {dup.heading}
+                </li>
+              {/each}
+            </ul>
+          </CollapsibleSection>
         {/if}
 
         <footer class="panel-footer muted">
@@ -2765,7 +2921,8 @@
     backdrop-filter: blur(8px);
     position: sticky;
     top: 0;
-    z-index: 5;
+    /* Above sidebar combobox menus (z-index 5–9) so sticky header is never covered. */
+    z-index: 30;
   }
   .brand {
     display: flex;
@@ -2920,6 +3077,9 @@
     padding: 1rem;
     overflow: auto;
     min-width: 0;
+    /* Keep filter/combo z-index local so they cannot paint over the navbar. */
+    isolation: isolate;
+    z-index: 1;
   }
   .search {
     display: flex;
@@ -3495,6 +3655,23 @@
     margin: 0.4rem 0 0;
     padding-left: 1.1rem;
   }
+  .dash-charts {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 0.75rem;
+    margin: 0 0 0.75rem;
+  }
+  .dash-charts .chart-card {
+    cursor: help;
+  }
+  .dash-charts .chart-card h3 {
+    margin: 0 0 0.55rem;
+    font-size: 0.72rem;
+    font-weight: 600;
+    letter-spacing: 0.02em;
+    text-transform: uppercase;
+    color: var(--muted);
+  }
   .dash-overview {
     grid-template-columns: repeat(auto-fit, minmax(5.5rem, 1fr));
     gap: 0.4rem;
@@ -3629,6 +3806,9 @@
       grid-template-rows: auto auto 6px 1fr;
     }
     .dash-split {
+      grid-template-columns: 1fr;
+    }
+    .dash-charts {
       grid-template-columns: 1fr;
     }
     aside {

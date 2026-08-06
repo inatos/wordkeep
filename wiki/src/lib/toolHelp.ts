@@ -69,6 +69,37 @@ export const COLUMN_HELP = {
   last: 'Time since the most recent call.',
 } as const;
 
+/** Dashboard chart cards + section chrome. */
+export const CHART_HELP = {
+  section:
+    'Live visualizations from the same /api/dashboard poll as the tables (refreshes every 2s while this tab is open). Collapse to focus on tables.',
+  saved:
+    'Per-tool cumulative tokens avoided (distill − return). Longer bar = more context saved. Top tools shown; remainder folded into “other”. Red bars mean net-negative distill.',
+  calls:
+    'Per-tool lifetime MCP call count. Shows which tools dominate agent traffic. Top tools shown; remainder folded into “other”.',
+  outcomes:
+    'Share of all recorded calls by outcome: ok (clean), trunc (hit token budget), error (hard failure), invalid (bad args/misuse), low-yield (thin/unhelpful reply). Hover a slice or legend row for count, %, and meaning; center switches to that bucket.',
+  spark:
+    'Tokens saved on each recent MCP call (ring buffer, oldest → newest). Axes show value × relative age; hover the line for the value, tool, and age at that point. Meta: n=events, last=newest save, peak=max in the window.',
+  overview:
+    'Lifetime MCP call and token totals from ~/.cache/wordkeep/savings.json (same source as the terminal dashboard).',
+  activity:
+    'Most recent MCP tool calls (newest first). Outcome chips flag truncated / error / low-yield / invalid replies.',
+  signals:
+    'Watermarks and risk signals: peak saves, slow tools, low-yield rate, and net-negative distill.',
+  tools:
+    'Per-tool lifetime stats. Click a column header to sort; hover a tool name for what it does.',
+} as const;
+
+export const OUTCOME_HELP: Record<string, string> = {
+  ok: 'Clean call — answer returned within budget without hard failure.',
+  trunc: 'Answer was truncated to fit the token budget.',
+  error: 'Hard failure (IO, panic-class, or tool abort).',
+  invalid: 'Invalid call: missing required args, bad mode, or other agent misuse.',
+  'low-yield': 'Thin or unhelpful reply relative to the distilled baseline.',
+  other: 'Remaining tools outside the top-N chart slots, aggregated together.',
+};
+
 export const TERMINAL_DASHBOARD_CMD =
   'cargo run -p wordkeep --features dashboard -- dashboard';
 

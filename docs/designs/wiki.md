@@ -65,11 +65,18 @@ else CMake/`Cargo.toml`/`package.json`, else the workspace folder name.
 - Frontmatter tag CRUD in the reader (add / rename / delete → `PUT /api/page`)
 - Per-tag colors (picker + hex, `localStorage`) for visual chips
 - Knowledge health: Meilisearch/manifest status, broken/orphan links, duplicate
-  headings, search telemetry (latency, no-result rate, click rank)
-- MCP savings dashboard (GUI): overview / sortable tools table (incl. **Inv**
-  for validation/missing-arg calls) / recent activity + health as tables /
-  outcome hover shows `reason` when present; via `/api/dashboard`, auto-refresh
-  while the tab is open
+  headings, search telemetry (latency, no-result rate, click rank); Health
+  sections are collapsible (same persist key as Dashboard)
+- MCP savings dashboard (GUI): overview / live charts / sortable tools table
+  (incl. **Inv** for validation/missing-arg calls) / recent activity + health
+  as tables / outcome hover shows `reason` when present; via `/api/dashboard`,
+  auto-refresh while the tab is open
+- Dashboard charts (SVG, no chart npm deps): tokens-saved + calls bars, outcome
+  donut with hover metrics, recent-savings line chart with axes + point hover;
+  chart/section tooltips via `CHART_HELP` / `OUTCOME_HELP`
+- Collapsible Dashboard sections (Overview / Charts / Recent activity / Health
+  signals / Tools) persisted in `localStorage` as
+  `wordkeep-wiki-section-collapsed`
 - Terminal alternative: `cargo run -p wordkeep --features dashboard -- dashboard`
   (loads embedded `savings.json` events for Recent activity)
 - README screenshots: `cd wiki && bun run shots` (wiki must serve on `:8787`)
