@@ -4,7 +4,7 @@ resolver = "2"
 
 [package]
 name = "wordkeep"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 rust-version = "1.74"
 description = "Token-budgeted MCP server for coding agents: tree-sitter maps, call graphs, and project docs over stdio."

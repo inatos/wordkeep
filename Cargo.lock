@@ -4111,7 +4111,7 @@ dependencies = [
 
 [[package]]
 name = "wordkeep"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "cc",
  "fastembed",
@@ -4131,11 +4131,11 @@ dependencies = [
 
 [[package]]
 name = "wordkeep-knowledge"
-version = "0.3.0"
+version = "0.4.0"
 
 [[package]]
 name = "wordkeep-wiki"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "axum",
  "clap",

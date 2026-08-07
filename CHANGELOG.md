@@ -5,6 +5,11 @@ All notable changes to wordkeep are documented here. The project follows
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-08-06
+
+Live wiki Dashboard charts, collapsible telemetry/health panels, and wiki UX
+polish since 0.3.0.
+
 ### Added
 
 - Wiki Dashboard **live charts** (tokens saved / calls bars, outcome donut,
