@@ -316,11 +316,10 @@ pub fn history(root: &Path, args: &Value) -> Result<String, String> {
     if runs.is_empty() {
         out.push_str("\n(no matching runs)\n");
     }
-    stats::record(
-        "run_history",
-        runs.len() as u64 * 32,
-        (out.len() / 4) as u64,
-    );
+    let store_tokens = std::fs::metadata(store_path(root))
+        .map(|m| m.len() / 4)
+        .unwrap_or(0);
+    stats::record("run_history", store_tokens.max(64), (out.len() / 4) as u64);
     Ok(out)
 }
 

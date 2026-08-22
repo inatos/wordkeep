@@ -5,6 +5,29 @@ All notable changes to wordkeep are documented here. The project follows
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-08-22
+
+### Fixed
+
+- **`classify_outcome`**: for successful tool responses, apply invalid/not_found
+  heuristics on the **header line only** so registry and content tools
+  (`defect_list`, `session_handoff`, `outline`, `integration_hooks`, …) no
+  longer false-positive when embedded text contains phrases like `must be` or
+  `(no matching defects)`. Empty `symbol_refs` / `integration_hooks` results
+  still classify as `not_found` via explicit suffix-line markers.
+- **`run_history`** / **`session_handoff`**: distill baseline uses on-disk store
+  size (not a tiny per-row guess) to avoid false net-negative insights.
+
+### Changed
+
+- `stats` improvement signals: add **invalid-prone** line (same thresholds as
+  error-prone) so real agent misuse remains visible after the classifier fix.
+
+### Notes
+
+- Historical `invalid_count` in `savings.json` is unchanged; use `stats`
+  `{"reset": true}` for a clean slate, or let new calls dominate aggregates.
+
 ## [0.4.1] - 2026-08-22
 
 ### Fixed

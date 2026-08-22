@@ -949,9 +949,13 @@ pub fn session_handoff(root: &Path, args: &Value) -> Result<String, String> {
         "session_handoff - session {session} status={}\n\n{}",
         s.status, prompt
     );
+    let session_file_tokens = session_path(root, &session)
+        .ok()
+        .and_then(|p| std::fs::metadata(p).ok().map(|m| m.len() / 4))
+        .unwrap_or(0);
     stats::record(
         "session_handoff",
-        s.entries.len() as u64 * 64,
+        session_file_tokens.max(64),
         estimate_tokens(&out) as u64,
     );
     Ok(out)

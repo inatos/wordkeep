@@ -570,6 +570,18 @@ fn looks_like_invalid(text: &str) -> bool {
         || t.contains("expected ")
 }
 
+fn first_line(text: &str) -> &str {
+    text.lines().next().unwrap_or(text)
+}
+
+/// Empty-result suffix lines that should count as not_found (body only — not headers).
+fn empty_result_suffix_is_not_found(text: &str) -> bool {
+    text.lines().skip(1).any(|line| {
+        let t = line.trim().to_ascii_lowercase();
+        t.starts_with("(no matching occurrences)") || t.starts_with("(no matching hooks")
+    })
+}
+
 /// Classify a tool result for telemetry.
 pub fn classify_outcome(result: &Result<String, String>, returned_tokens: u64) -> Outcome {
     // Validation / missing-arg Errs are agent misuse, not tool failures — keep
@@ -589,11 +601,17 @@ pub fn classify_outcome(result: &Result<String, String>, returned_tokens: u64) -
     if text.contains("truncated by token_budget") || text.contains("more; raise") {
         return Outcome::Truncated;
     }
-    if looks_like_not_found(text) {
+    // Ok responses: classify invalid/not_found from the header line only so
+    // embedded docs/defects/source do not false-positive (defect_list, outline, …).
+    let header = first_line(text);
+    if looks_like_not_found(header) {
         return Outcome::NotFound;
     }
-    if looks_like_invalid(text) {
+    if looks_like_invalid(header) {
         return Outcome::Invalid;
+    }
+    if empty_result_suffix_is_not_found(text) {
+        return Outcome::NotFound;
     }
     if returned_tokens == 0 {
         return Outcome::Empty;
@@ -1102,6 +1120,17 @@ fn render_insights(now: u64, tools: &BTreeMap<String, Tool>, registry: &[&'stati
         signals.push_str(&format!("error-prone: {}\n", err_tools.join(", ")));
     }
 
+    let invalid_tools: Vec<&str> = tools
+        .iter()
+        .filter(|(_, t)| {
+            t.calls >= ERROR_MIN_CALLS && t.invalid_count * 100 / t.calls >= ERROR_RATE_PCT
+        })
+        .map(|(n, _)| n.as_str())
+        .collect();
+    if !invalid_tools.is_empty() {
+        signals.push_str(&format!("invalid-prone: {}\n", invalid_tools.join(", ")));
+    }
+
     let inverted: Vec<&str> = tools
         .iter()
         .filter(|(_, t)| is_net_negative(t.baseline_tokens, t.returned_tokens))
@@ -1216,6 +1245,40 @@ mod tests {
         assert_eq!(
             classify_outcome(&Ok("big answer".repeat(100)), 500),
             Outcome::Ok
+        );
+        assert_eq!(
+            classify_outcome(
+                &Ok(
+                    "defect_list - 1 defect(s)\n\n[open] x — 1\n  summary: foo must be bar\n"
+                        .into()
+                ),
+                200
+            ),
+            Outcome::Ok
+        );
+        assert_eq!(
+            classify_outcome(
+                &Ok("defect_list - 0 defect(s)\n\n(no matching defects)\n".into()),
+                30
+            ),
+            Outcome::Ok
+        );
+        assert_eq!(
+            classify_outcome(
+                &Ok("session_handoff - session s status=open\n\nAcceptance: must be true\n".into()),
+                500
+            ),
+            Outcome::Ok
+        );
+        assert_eq!(
+            classify_outcome(
+                &Ok(
+                    "integration_hooks - query \"water\"\n\n(no matching hooks - try broader)\n"
+                        .into()
+                ),
+                40
+            ),
+            Outcome::NotFound
         );
     }
 
