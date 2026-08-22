@@ -5,6 +5,15 @@ All notable changes to wordkeep are documented here. The project follows
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-08-22
+
+### Fixed
+
+- **`mcp.sh`**: portable rebuild hints (`cargo build` with pinned `CARGO_TARGET_DIR`);
+  optional `tools/dev/rebuild_wordkeep.sh` when present in a monorepo layout.
+- Avoid stale MCP binaries when a parent shell sets `CARGO_TARGET_DIR` outside
+  `tools/wordkeep/target`.
+
 ## [0.4.0] - 2026-08-06
 
 Live wiki Dashboard charts, collapsible telemetry/health panels, and wiki UX
