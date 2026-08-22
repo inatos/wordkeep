@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
+  import { onMount, tick } from 'svelte';
   import {
     fetchBacklinks,
     fetchDashboard,
@@ -48,6 +48,7 @@
   import DonutChart from './lib/charts/DonutChart.svelte';
   import Sparkline from './lib/charts/Sparkline.svelte';
   import type { BarDatum, DonutDatum, SparkPoint } from './lib/charts/utils';
+  import RuntimeHealth from './lib/RuntimeHealth.svelte';
 
   type Tab = 'search' | 'reader' | 'dashboard' | 'health';
   type EditorTab = { path: string; pinned: boolean };
@@ -70,12 +71,14 @@
   const SIDEBAR_MAX = 720;
   const SIDEBAR_DEFAULT = 320;
   const SIDEBAR_KEY = 'wordkeep-wiki-sidebar-width';
+  const SIDEBAR_COLLAPSED_KEY = 'wordkeep-wiki-sidebar-collapsed';
   const TREE_COLLAPSED_KEY = 'wordkeep-wiki-tree-collapsed';
   const EDITOR_TABS_KEY = 'wordkeep-wiki-editor-tabs';
   const DASH_BASELINE_KEY = 'wordkeep-wiki-dash-baseline';
   const DASH_POLL_MS = 2000;
 
   let tab = $state<Tab>('search');
+  let healthView = $state<'runtime' | 'knowledge'>('runtime');
   let urlReady = $state(false);
   let query = $state('');
   let kind = $state('');
@@ -135,6 +138,10 @@
   let saving = $state(false);
   let saveError = $state('');
   let sidebarWidth = $state(SIDEBAR_DEFAULT);
+  let sidebarCollapsed = $state(false);
+  let headerEl: HTMLElement | null = $state(null);
+  let mainChromeEl: HTMLElement | null = $state(null);
+  let mainEl: HTMLElement | null = $state(null);
   let resizing = $state(false);
   let resizeMove: ((event: PointerEvent) => void) | null = null;
   let resizeUp: (() => void) | null = null;
@@ -146,6 +153,7 @@
     if (Number.isFinite(stored)) {
       sidebarWidth = clampSidebar(stored);
     }
+    sidebarCollapsed = localStorage.getItem(SIDEBAR_COLLAPSED_KEY) === '1';
     try {
       const raw = localStorage.getItem(TREE_COLLAPSED_KEY);
       if (raw) {
@@ -191,6 +199,10 @@
       if (event.key === 'Escape' && editing) {
         void doneEditing();
       }
+      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'b') {
+        event.preventDefault();
+        toggleSidebarCollapsed();
+      }
     };
     window.addEventListener('keydown', onKey);
     return () => {
@@ -199,6 +211,33 @@
       if (autosaveHandle) clearTimeout(autosaveHandle);
       if (dashPollHandle) clearInterval(dashPollHandle);
       stopResize();
+    };
+  });
+
+  $effect(() => {
+    if (!headerEl) return;
+    syncHeaderHeight();
+    const ro = new ResizeObserver(() => syncHeaderHeight());
+    ro.observe(headerEl);
+    return () => ro.disconnect();
+  });
+
+  $effect(() => {
+    if (tab !== 'reader') return;
+    editorTabs.length;
+    mainChromeEl;
+    headerEl;
+    void tick().then(syncPageActionsTop);
+    const ro = new ResizeObserver(() => syncPageActionsTop());
+    if (mainChromeEl) ro.observe(mainChromeEl);
+    if (headerEl) ro.observe(headerEl);
+    const main = mainEl;
+    main?.addEventListener('scroll', syncPageActionsTop, { passive: true });
+    window.addEventListener('resize', syncPageActionsTop);
+    return () => {
+      ro.disconnect();
+      main?.removeEventListener('scroll', syncPageActionsTop);
+      window.removeEventListener('resize', syncPageActionsTop);
     };
   });
 
@@ -228,6 +267,9 @@
     const url = new URL(location.href);
     if (tab === 'search') url.searchParams.delete('tab');
     else url.searchParams.set('tab', tab);
+    if (tab === 'health' && healthView !== 'knowledge') url.searchParams.set('view', healthView);
+    else if (tab === 'health') url.searchParams.set('view', 'knowledge');
+    else url.searchParams.delete('view');
     const next = `${url.pathname}${url.search}${url.hash}`;
     const cur = `${location.pathname}${location.search}${location.hash}`;
     if (next !== cur) history.replaceState({}, '', url);
@@ -245,6 +287,30 @@
 
   function clampSidebar(width: number): number {
     return Math.min(SIDEBAR_MAX, Math.max(SIDEBAR_MIN, Math.round(width)));
+  }
+
+  function syncPageActionsTop() {
+    if (tab !== 'reader') return;
+    const bodyPad = 20;
+    let top: number;
+    if (mainChromeEl) {
+      top = mainChromeEl.getBoundingClientRect().bottom + bodyPad;
+    } else if (headerEl) {
+      top = headerEl.getBoundingClientRect().bottom + bodyPad;
+    } else {
+      top = bodyPad;
+    }
+    document.documentElement.style.setProperty('--page-actions-top', `${top}px`);
+  }
+
+  function syncHeaderHeight() {
+    if (!headerEl) return;
+    document.documentElement.style.setProperty('--header-h', `${headerEl.offsetHeight}px`);
+  }
+
+  function toggleSidebarCollapsed() {
+    sidebarCollapsed = !sidebarCollapsed;
+    localStorage.setItem(SIDEBAR_COLLAPSED_KEY, sidebarCollapsed ? '1' : '0');
   }
 
   function startResize(event: PointerEvent) {
@@ -288,6 +354,8 @@
     const params = new URLSearchParams(location.search);
     const path = params.get('path');
     const restoredTab = parseTab(params.get('tab'));
+    const view = params.get('view');
+    if (view === 'runtime' || view === 'knowledge') healthView = view;
     if (path) {
       await openPath(path, undefined, params.get('anchor') || undefined);
       if (restoredTab && restoredTab !== 'reader') {
@@ -1074,9 +1142,10 @@
 <div
   class="shell"
   class:resizing
+  class:sidebar-collapsed={sidebarCollapsed}
   style={`--sidebar-width:${sidebarWidth}px`}
 >
-  <header class="top">
+  <header class="top" bind:this={headerEl}>
     <div class="brand">
       <a
         class="navbar-brand logo"
@@ -1095,6 +1164,24 @@
       >
     </div>
     <nav>
+      <button
+        class="icon-btn"
+        class:active={!sidebarCollapsed}
+        title="Sidebar — browse & search (Ctrl/⌘B)"
+        aria-label="Toggle sidebar"
+        aria-expanded={!sidebarCollapsed}
+        onclick={toggleSidebarCollapsed}
+      >
+        <svg viewBox="0 0 24 24" aria-hidden="true"
+          ><path
+            d="M4 6h16M4 12h10M4 18h16"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="2"
+            stroke-linecap="round"
+          /></svg
+        >
+      </button>
       <button
         class="icon-btn"
         class:active={tab === 'search'}
@@ -1150,7 +1237,7 @@
       <button
         class="icon-btn"
         class:active={tab === 'health'}
-        title="Health — Meilisearch/index status, link garden, and wiki search telemetry"
+        title="Health — Runtime memory map, NUMA, pools; or Knowledge (Meilisearch / garden)"
         aria-label="Health"
         onclick={() => setTab('health')}
       >
@@ -1168,7 +1255,30 @@
     </nav>
   </header>
 
-  <aside>
+  <aside aria-hidden={sidebarCollapsed}>
+    <div class="sidebar-chrome">
+      <span class="sidebar-chrome-label">Browse</span>
+      <div class="sidebar-chrome-actions">
+        <button
+          type="button"
+          class="icon-btn sidebar-chrome-btn"
+          title="Collapse sidebar (Ctrl/⌘B)"
+          aria-label="Collapse sidebar"
+          onclick={toggleSidebarCollapsed}
+        >
+          <svg viewBox="0 0 24 24" aria-hidden="true"
+            ><path
+              d="M15 6l-6 6 6 6"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="2"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+            /></svg
+          >
+        </button>
+      </div>
+    </div>
     <form class="search" onsubmit={runSearch}>
       <input
         bind:value={query}
@@ -1669,6 +1779,27 @@
     </div>
   </aside>
 
+  {#if sidebarCollapsed}
+    <button
+      type="button"
+      class="sidebar-expand-tab"
+      aria-label="Expand sidebar"
+      title="Expand sidebar (Ctrl/⌘B)"
+      onclick={toggleSidebarCollapsed}
+    >
+      <svg viewBox="0 0 24 24" aria-hidden="true"
+        ><path
+          d="M9 6l6 6-6 6"
+          fill="none"
+          stroke="currentColor"
+          stroke-width="2"
+          stroke-linecap="round"
+          stroke-linejoin="round"
+        /></svg
+      >
+    </button>
+  {/if}
+
   <button
     type="button"
     class="sidebar-resizer"
@@ -1686,8 +1817,9 @@
     }}
   ></button>
 
-  <main>
+  <main bind:this={mainEl}>
     {#if editorTabs.length}
+      <div class="main-chrome" bind:this={mainChromeEl}>
       <div
         class="editor-tabs-stack"
         title="Open pages as tabs. Pinned tabs stay on the top row."
@@ -1840,6 +1972,7 @@
           </div>
         {/if}
       </div>
+      </div>
     {/if}
 
     <div class="main-body">
@@ -1879,7 +2012,81 @@
       </section>
     {:else if tab === 'reader'}
       <section class="reader panel enter">
-        <header class="panel-head">
+        <div class="page-actions-float" aria-label="Page actions">
+          <div class="actions">
+            <button
+              class="icon-btn"
+              onclick={copyPath}
+              disabled={!pagePath}
+              title="Copy path"
+              aria-label="Copy path"
+            >
+              <svg viewBox="0 0 24 24" aria-hidden="true"
+                ><rect
+                  x="8"
+                  y="8"
+                  width="11"
+                  height="11"
+                  rx="1.5"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="2"
+                /><path
+                  d="M5 15V5h10"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="2"
+                  stroke-linecap="round"
+                /></svg
+              >
+            </button>
+            {#if editing}
+              <button
+                class="icon-btn primary"
+                onclick={doneEditing}
+                disabled={saving && dirty}
+                title="Done editing (Esc) · autosaved"
+                aria-label="Done editing"
+              >
+                <svg viewBox="0 0 24 24" aria-hidden="true"
+                  ><path
+                    d="M4 12l5 5L20 6"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="2"
+                    stroke-linecap="round"
+                    stroke-linejoin="round"
+                  /></svg
+                >
+              </button>
+            {:else}
+              <button
+                class="icon-btn"
+                onclick={startEditing}
+                disabled={!pagePath}
+                title="Edit Markdown (Ctrl/⌘E) · autosaves"
+                aria-label="Edit"
+              >
+                <svg viewBox="0 0 24 24" aria-hidden="true"
+                  ><path
+                    d="M4 20l4.5-1L19 8.5 15.5 5 5 15.5 4 20z"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="2"
+                    stroke-linejoin="round"
+                  /><path
+                    d="M13.5 6.5l4 4"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="2"
+                    stroke-linecap="round"
+                  /></svg
+                >
+              </button>
+            {/if}
+          </div>
+        </div>
+        <header class="panel-head reader-head">
           <div class="title-block">
             <h2 class="section-title" title={pagePath || 'Reader'}>
               <svg viewBox="0 0 24 24" aria-hidden="true"
@@ -2054,78 +2261,6 @@
                   <p class="muted tag-error" title={tagError}><code>{tagError}</code></p>
                 {/if}
               </div>
-            {/if}
-          </div>
-          <div class="actions">
-            <button
-              class="icon-btn"
-              onclick={copyPath}
-              disabled={!pagePath}
-              title="Copy path"
-              aria-label="Copy path"
-            >
-              <svg viewBox="0 0 24 24" aria-hidden="true"
-                ><rect
-                  x="8"
-                  y="8"
-                  width="11"
-                  height="11"
-                  rx="1.5"
-                  fill="none"
-                  stroke="currentColor"
-                  stroke-width="2"
-                /><path
-                  d="M5 15V5h10"
-                  fill="none"
-                  stroke="currentColor"
-                  stroke-width="2"
-                  stroke-linecap="round"
-                /></svg
-              >
-            </button>
-            {#if editing}
-              <button
-                class="icon-btn primary"
-                onclick={doneEditing}
-                disabled={saving && dirty}
-                title="Done editing (Esc) · autosaved"
-                aria-label="Done editing"
-              >
-                <svg viewBox="0 0 24 24" aria-hidden="true"
-                  ><path
-                    d="M4 12l5 5L20 6"
-                    fill="none"
-                    stroke="currentColor"
-                    stroke-width="2"
-                    stroke-linecap="round"
-                    stroke-linejoin="round"
-                  /></svg
-                >
-              </button>
-            {:else}
-              <button
-                class="icon-btn"
-                onclick={startEditing}
-                disabled={!pagePath}
-                title="Edit Markdown (Ctrl/⌘E) · autosaves"
-                aria-label="Edit"
-              >
-                <svg viewBox="0 0 24 24" aria-hidden="true"
-                  ><path
-                    d="M4 20l4.5-1L19 8.5 15.5 5 5 15.5 4 20z"
-                    fill="none"
-                    stroke="currentColor"
-                    stroke-width="2"
-                    stroke-linejoin="round"
-                  /><path
-                    d="M13.5 6.5l4 4"
-                    fill="none"
-                    stroke="currentColor"
-                    stroke-width="2"
-                    stroke-linecap="round"
-                  /></svg
-                >
-              </button>
             {/if}
           </div>
         </header>
@@ -2697,6 +2832,24 @@
         </footer>
       </section>
     {:else}
+      <div class="health-wrap">
+        <div class="subviews" role="tablist" aria-label="Health subviews">
+          <button
+            type="button"
+            class="subview-btn"
+            class:active={healthView === 'runtime'}
+            onclick={() => (healthView = 'runtime')}>Runtime</button
+          >
+          <button
+            type="button"
+            class="subview-btn"
+            class:active={healthView === 'knowledge'}
+            onclick={() => (healthView = 'knowledge')}>Knowledge</button
+          >
+        </div>
+        {#if healthView === 'runtime'}
+          <RuntimeHealth />
+        {:else}
       <section class="health panel enter">
         <header class="panel-head">
           <h2
@@ -2867,6 +3020,8 @@
           {/if}
         </footer>
       </section>
+        {/if}
+      </div>
     {/if}
     </div>
   </main>
@@ -2875,13 +3030,122 @@
 <style>
   .shell {
     --sidebar-width: 20rem;
+    --sidebar-transition: 0.36s var(--ease-snap);
+    --header-h: 3.35rem;
     display: grid;
     grid-template-columns: var(--sidebar-width) 6px 1fr;
     grid-template-rows: auto 1fr;
+    height: 100dvh;
     min-height: 100vh;
+    overflow: hidden;
+    transition: grid-template-columns var(--sidebar-transition);
+  }
+  .shell.sidebar-collapsed {
+    grid-template-columns: 0 0 1fr;
+  }
+  .shell.sidebar-collapsed main {
+    grid-column: 1;
+  }
+  .subviews {
+    display: flex;
+    gap: 0.4rem;
+    margin: 0 0 0.75rem;
+  }
+  .subview-btn {
+    border: 1px solid var(--border, #333);
+    background: transparent;
+    color: inherit;
+    border-radius: 999px;
+    padding: 0.2rem 0.75rem;
+    cursor: pointer;
+  }
+  .subview-btn.active {
+    border-color: var(--accent, #6bcf8e);
   }
   .shell.resizing {
     cursor: col-resize;
+  }
+  .shell.resizing aside,
+  .shell.resizing .sidebar-expand-tab {
+    transition: none;
+  }
+  .sidebar-expand-tab {
+    position: fixed;
+    left: 0;
+    top: calc(var(--header-h) + 1.25rem);
+    z-index: 26;
+    display: grid;
+    place-items: center;
+    width: 1.65rem;
+    height: 2.75rem;
+    margin: 0;
+    padding: 0;
+    border: 1px solid var(--border);
+    border-left: 0;
+    border-radius: 0 10px 10px 0;
+    background: var(--bg-elevated);
+    color: var(--accent-strong);
+    cursor: pointer;
+    box-shadow: 4px 0 18px rgba(0, 0, 0, 0.35);
+    animation: sidebar-tab-in 0.38s var(--ease-snap) both;
+    transition:
+      width 0.2s var(--ease-snap),
+      background-color 0.16s var(--ease-snap),
+      border-color 0.16s var(--ease-snap),
+      box-shadow 0.2s var(--ease-snap),
+      color 0.16s var(--ease-snap);
+  }
+  .sidebar-expand-tab svg {
+    width: 1rem;
+    height: 1rem;
+    transition: transform 0.2s var(--ease-snap);
+  }
+  .sidebar-expand-tab:hover {
+    width: 1.9rem;
+    background: var(--bg-hover);
+    border-color: rgba(177, 83, 184, 0.55);
+    box-shadow: 6px 0 22px rgba(0, 0, 0, 0.42), 0 0 0 1px var(--accent-soft);
+  }
+  .sidebar-expand-tab:hover svg {
+    transform: translateX(2px);
+  }
+  @keyframes sidebar-tab-in {
+    from {
+      opacity: 0;
+      transform: translateX(-110%);
+    }
+    to {
+      opacity: 1;
+      transform: translateX(0);
+    }
+  }
+  .sidebar-chrome {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.5rem;
+    margin: -0.15rem 0 0.65rem;
+    padding-bottom: 0.55rem;
+    border-bottom: 1px solid rgba(177, 83, 184, 0.16);
+  }
+  .sidebar-chrome-label {
+    font-size: 0.72rem;
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--muted);
+  }
+  .sidebar-chrome-actions {
+    display: flex;
+    gap: 0.3rem;
+  }
+  .sidebar-chrome-btn {
+    width: 1.85rem;
+    height: 1.85rem;
+  }
+  .sidebar-chrome-btn svg {
+    width: 1rem;
+    height: 1rem;
   }
   .sidebar-resizer {
     grid-row: 2;
@@ -2895,6 +3159,12 @@
     background: transparent;
     position: relative;
     z-index: 2;
+    opacity: 1;
+    transition: opacity 0.24s var(--ease-snap);
+  }
+  .shell.sidebar-collapsed .sidebar-resizer {
+    opacity: 0;
+    pointer-events: none;
   }
   .sidebar-resizer::after {
     content: '';
@@ -3072,14 +3342,30 @@
   aside {
     grid-column: 1;
     grid-row: 2;
+    position: fixed;
+    left: 0;
+    top: var(--header-h);
+    bottom: 0;
     border-right: 0;
     background: var(--bg-elevated);
     padding: 1rem;
     overflow: auto;
     min-width: 0;
+    width: var(--sidebar-width);
     /* Keep filter/combo z-index local so they cannot paint over the navbar. */
     isolation: isolate;
-    z-index: 1;
+    z-index: 5;
+    transition:
+      transform var(--sidebar-transition),
+      opacity 0.28s var(--ease-snap),
+      box-shadow var(--sidebar-transition),
+      border-radius var(--sidebar-transition);
+    will-change: transform, opacity;
+  }
+  .shell.sidebar-collapsed aside {
+    opacity: 0;
+    transform: translateX(calc(-1 * var(--sidebar-width) - 12px));
+    pointer-events: none;
   }
   .search {
     display: flex;
@@ -3455,7 +3741,9 @@
     grid-row: 2;
     padding: 0;
     overflow: auto;
+    overscroll-behavior: contain;
     min-width: 0;
+    min-height: 0;
     display: flex;
     flex-direction: column;
   }
@@ -3464,16 +3752,19 @@
     padding: 1.25rem clamp(1rem, 3vw, 2.5rem);
     min-width: 0;
   }
-  .editor-tabs-stack {
+  .main-chrome {
     position: sticky;
     top: 0;
     z-index: 4;
-    display: flex;
-    flex-direction: column;
-    gap: 0;
+    flex: 0 0 auto;
     border-bottom: 1px solid var(--border);
     background: rgba(18, 13, 20, 0.94);
     backdrop-filter: blur(8px);
+  }
+  .editor-tabs-stack {
+    display: flex;
+    flex-direction: column;
+    gap: 0;
   }
   .editor-tabs {
     display: flex;
@@ -3582,6 +3873,24 @@
     align-items: flex-start;
     gap: 0.75rem;
     margin-bottom: 1rem;
+  }
+  .reader-head {
+    padding-right: 5.5rem;
+  }
+  .page-actions-float {
+    position: fixed;
+    top: var(--page-actions-top, calc(var(--header-h) + 1.25rem));
+    right: clamp(1rem, 3vw, 2.5rem);
+    z-index: 18;
+    opacity: 0.7;
+    pointer-events: none;
+    transition: opacity 0.2s var(--ease-snap);
+  }
+  .page-actions-float .actions {
+    pointer-events: auto;
+  }
+  .page-actions-float:hover {
+    opacity: 1;
   }
   .actions {
     display: flex;
@@ -3816,6 +4125,10 @@
       grid-row: 2;
       border-bottom: 1px solid var(--border);
       max-height: 40vh;
+      position: relative;
+      top: auto;
+      bottom: auto;
+      width: auto;
     }
     .sidebar-resizer {
       display: none;
