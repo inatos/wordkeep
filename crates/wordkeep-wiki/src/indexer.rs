@@ -508,15 +508,7 @@ pub(crate) fn manifest_path(root: &Path) -> PathBuf {
 }
 
 pub(crate) fn global_cache_dir() -> PathBuf {
-    std::env::var_os("XDG_CACHE_HOME")
-        .filter(|path| !path.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("HOME")
-                .filter(|path| !path.is_empty())
-                .map(|home| PathBuf::from(home).join(".cache"))
-        })
-        .unwrap_or_else(std::env::temp_dir)
+    wordkeep_knowledge::global_cache_dir()
 }
 
 fn workspace_id(root: &Path) -> String {

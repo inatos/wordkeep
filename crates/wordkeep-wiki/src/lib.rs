@@ -3,6 +3,7 @@ mod dashboard;
 mod garden;
 mod indexer;
 mod meili;
+mod runtime;
 mod telemetry;
 mod web;
 
@@ -53,6 +54,10 @@ enum Command {
         /// Permit binding to an address other than loopback.
         #[arg(long)]
         allow_non_loopback: bool,
+
+        /// Allow PID attach, peek, and ECS apply against a chosen process.
+        #[arg(long)]
+        runtime_attach: bool,
     },
     /// Show Meilisearch and local manifest status.
     Status,
@@ -86,9 +91,19 @@ pub async fn run() -> Result<(), String> {
             bind,
             watch,
             allow_non_loopback,
+            runtime_attach,
         } => {
             let bind = bind.as_deref().unwrap_or(&config.bind).to_string();
-            web::serve(root, config, meili, &bind, allow_non_loopback, watch).await
+            web::serve(
+                root,
+                config,
+                meili,
+                &bind,
+                allow_non_loopback,
+                watch,
+                runtime_attach,
+            )
+            .await
         }
         Command::Status => {
             let health = meili.health().await;

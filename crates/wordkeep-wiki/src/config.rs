@@ -20,6 +20,8 @@ pub(crate) struct WikiConfig {
     pub retain_search_queries: bool,
     /// Display name for the wiki brand (`{project_name} ~ Wiki`).
     pub project_name: String,
+    /// When true, block page writes (public demo hosts).
+    pub read_only: bool,
 }
 
 impl WikiConfig {
@@ -109,6 +111,13 @@ impl WikiConfig {
                     .map(str::to_string)
             })
             .unwrap_or_else(|| detect_project_name(root));
+        let read_only = environment("WIKI_READ_ONLY")
+            .map(|value| matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+            .or_else(|| {
+                wiki.and_then(|object| object.get("read_only"))
+                    .and_then(Value::as_bool)
+            })
+            .unwrap_or(false);
 
         Ok(Self {
             doc_roots,
@@ -118,6 +127,7 @@ impl WikiConfig {
             bind,
             retain_search_queries,
             project_name,
+            read_only,
         })
     }
 
@@ -305,6 +315,7 @@ mod tests {
             bind: String::new(),
             retain_search_queries: false,
             project_name: "Demo".into(),
+            read_only: false,
         };
         assert_eq!(config.root_label_for("docs/a.md").as_deref(), Some("docs"));
         assert_eq!(

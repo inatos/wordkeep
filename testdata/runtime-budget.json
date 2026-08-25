@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "name": "dev-gym-idle",
+  "limits": {
+    "/rss_bytes": 4294967296,
+    "/flecs/bytes_table_components_unused": 67108864,
+    "/jolt/temp_used": 16777216,
+    "/gpu/particles": 1024,
+    "pools.EntityPool.in_use": 4096
+  }
+}

@@ -26,6 +26,9 @@
 //!   * knowledge_upsert - write/update a markdown section for knowledge_search
 //!   * trace_summary    - condense a Tracy CSV export into the hottest zones (or diff two)
 //!   * trace_profile    - hitch workflow: max-sorted zones + diff_map + index_stale
+//!   * runtime_snapshot - summarize the latest Runtime Health census or a capture
+//!   * memory_diff      - compare two Runtime Health captures
+//!   * locality_hotspots - sampled PMC/ETW/perf address hotspots (when available)
 //!   * integration_hooks - curated cross-subsystem call sites + optional call_path
 //!   * index_stale      - detect when on-disk indexes lag git changes
 //!   * stats            - how many tokens wordkeep has saved vs reading raw material
@@ -80,6 +83,7 @@ mod module_map;
 mod outline;
 mod repo_map;
 mod runs;
+mod runtime;
 mod session_pressure;
 mod stats;
 mod symbol_context;
@@ -193,6 +197,9 @@ fn main() {
     let root_kb_upsert = root.clone();
     let root_trace = root.clone();
     let root_trace_profile = root.clone();
+    let root_runtime_snapshot = root.clone();
+    let root_memory_diff = root.clone();
+    let root_locality_hotspots = root.clone();
     let root_hooks = root.clone();
     let root_stale = root.clone();
     let root_mas_post = root.clone();
@@ -709,6 +716,61 @@ fn main() {
                 }
             }),
             handler: Box::new(move |args| trace_profile::build(&root_trace_profile, args)),
+        },
+        mcp::Tool {
+            name: "runtime_snapshot",
+            description: "Summarize the latest Wordkeep Runtime Memory Health census or a bounded \
+                          capture: process envelope, Flecs/Jolt/pools, largest mappings, quality \
+                          labels, and hints. Reads local capture files; performs no network request.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "capture": { "type": "string",
+                                 "description": "Capture id (digits) or `live` (default)." },
+                    "top": { "type": "integer",
+                             "description": "Maximum mappings/pools/hints to show. Default 12, max 64." },
+                    "token_budget": { "type": "integer",
+                                      "description": "Approx max tokens to return. Default 1600." }
+                }
+            }),
+            handler: Box::new(move |args| runtime::snapshot(&root_runtime_snapshot, args)),
+        },
+        mcp::Tool {
+            name: "memory_diff",
+            description: "Compare two Runtime Health snapshots by capture id. Reports signed \
+                          RSS/VA/Flecs/Jolt deltas plus pool occupancy and mapping-kind changes; \
+                          does not call VA gaps allocator fragmentation.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "base": { "type": "string", "description": "Baseline capture id (digits)." },
+                    "current": { "type": "string",
+                                 "description": "Current capture id or `live`. Default `live`." },
+                    "token_budget": { "type": "integer",
+                                      "description": "Approx max tokens to return. Default 1600." }
+                },
+                "required": ["base"]
+            }),
+            handler: Box::new(move |args| runtime::memory_diff(&root_memory_diff, args)),
+        },
+        mcp::Tool {
+            name: "locality_hotspots",
+            description: "Return token-budgeted PMC/ETW/perf address hotspots from a Runtime \
+                          Health snapshot. If samples are absent, explicitly reports unavailable; \
+                          it never infers cache locality from virtual-address adjacency.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "capture": { "type": "string",
+                                 "description": "Capture id (digits) or `live` (default)." },
+                    "top": { "type": "integer", "description": "Rows to show. Default 12, max 64." },
+                    "min_samples": { "type": "integer",
+                                     "description": "Minimum attributed samples per row. Default 1." },
+                    "token_budget": { "type": "integer",
+                                      "description": "Approx max tokens to return. Default 1600." }
+                }
+            }),
+            handler: Box::new(move |args| runtime::locality_hotspots(&root_locality_hotspots, args)),
         },
         mcp::Tool {
             name: "integration_hooks",

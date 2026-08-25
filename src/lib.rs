@@ -31,6 +31,7 @@ mod module_map;
 mod outline;
 pub mod repo_map;
 mod runs;
+mod runtime;
 mod session_pressure;
 mod stats;
 mod symbol_context;

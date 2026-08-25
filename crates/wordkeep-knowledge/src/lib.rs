@@ -6,6 +6,33 @@
 //! headings.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
+
+/// Cross-platform parent directory for Wordkeep caches.
+///
+/// Keep this shared by the MCP and wiki crates so runtime captures resolve to
+/// the same workspace on Windows (`LOCALAPPDATA`) and Unix (`XDG_CACHE_HOME`).
+pub fn global_cache_dir() -> PathBuf {
+    std::env::var_os("XDG_CACHE_HOME")
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("LOCALAPPDATA")
+                .filter(|path| !path.is_empty())
+                .map(PathBuf::from)
+        })
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .filter(|path| !path.is_empty())
+                .map(|home| PathBuf::from(home).join(".cache"))
+        })
+        .unwrap_or_else(std::env::temp_dir)
+}
+
+/// Root directory for all Wordkeep cache data.
+pub fn wordkeep_cache_dir() -> PathBuf {
+    global_cache_dir().join("wordkeep")
+}
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Frontmatter {

@@ -53,6 +53,7 @@ export type TreePayload = {
 export type HealthPayload = {
   status: string;
   project_name?: string;
+  read_only?: boolean;
   meilisearch?: unknown;
   index?: unknown;
   manifest?: { files?: number; chunks?: number };
@@ -160,6 +161,8 @@ export type DashboardPayload = {
   health?: { signals?: DashboardSignal[] };
 };
 
+const API_BASE = `${import.meta.env.BASE_URL}api`;
+
 async function parseJsonResponse<T>(res: Response, url: string): Promise<T> {
   const text = await res.text();
   if (!text) {
@@ -186,10 +189,15 @@ async function getJson<T>(url: string): Promise<T> {
   return parseJsonResponse<T>(res, url);
 }
 
-async function sendJson<T>(url: string, method: 'POST' | 'PUT', body: unknown): Promise<T> {
+async function sendJson<T>(
+  url: string,
+  method: 'POST' | 'PUT',
+  body: unknown,
+  extraHeaders: Record<string, string> = {},
+): Promise<T> {
   const res = await fetch(url, {
     method,
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json', ...extraHeaders },
     body: JSON.stringify(body),
   });
   return parseJsonResponse<T>(res, url);
@@ -213,19 +221,19 @@ export function search(
     estimatedTotalHits?: number;
     processingTimeMs?: number;
     clientLatencyMs?: number;
-  }>(`/api/search?${params}`);
+  }>(`${API_BASE}/search?${params}`);
 }
 
 export function fetchPage(path: string) {
-  return getJson<PagePayload>(`/api/page?${new URLSearchParams({ path })}`);
+  return getJson<PagePayload>(`${API_BASE}/page?${new URLSearchParams({ path })}`);
 }
 
 export function savePage(path: string, markdown: string) {
-  return sendJson<PagePayload>('/api/page', 'PUT', { path, markdown });
+  return sendJson<PagePayload>(`${API_BASE}/page`, 'PUT', { path, markdown });
 }
 
 export function fetchTree() {
-  return getJson<TreePayload | TreeNode[]>(`/api/tree`);
+  return getJson<TreePayload | TreeNode[]>(`${API_BASE}/tree`);
 }
 
 /** Normalize /api/tree payloads into a hierarchical sidebar tree. */
@@ -284,35 +292,252 @@ export function fetchBacklinks(path: string) {
   return getJson<{
     backlinks?: { path: string; heading?: string }[];
     links?: { path: string; heading?: string }[];
-  }>(`/api/backlinks?${new URLSearchParams({ path })}`);
+  }>(`${API_BASE}/backlinks?${new URLSearchParams({ path })}`);
 }
 
 export function fetchRecent(limit = 20) {
-  return getJson<{ files?: RecentFile[] }>(`/api/recent?${new URLSearchParams({ limit: String(limit) })}`);
+  return getJson<{ files?: RecentFile[] }>(`${API_BASE}/recent?${new URLSearchParams({ limit: String(limit) })}`);
 }
 
 export function fetchGarden() {
-  return getJson<GardenPayload>('/api/garden');
+  return getJson<GardenPayload>(`${API_BASE}/garden`);
 }
 
 export function fetchHealth() {
-  return getJson<HealthPayload>('/api/health');
+  return getJson<HealthPayload>(`${API_BASE}/health`);
 }
 
 export function fetchStats() {
-  return getJson<StatsPayload>('/api/stats');
+  return getJson<StatsPayload>(`${API_BASE}/stats`);
 }
 
 export function fetchDashboard() {
-  return getJson<DashboardPayload>('/api/dashboard');
+  return getJson<DashboardPayload>(`${API_BASE}/dashboard`);
+}
+
+export type RuntimeRegion = {
+  start?: string;
+  end?: string;
+  start_u64?: number;
+  end_u64?: number;
+  size?: number;
+  kind?: string;
+  path?: string | null;
+  perm?: string;
+  rss_bytes?: number;
+};
+
+export type RuntimeSnapshot = {
+  available?: boolean;
+  message?: string;
+  token?: string;
+  schema_version?: number;
+  seq?: number;
+  dropped?: number;
+  source?: string;
+  os?: string;
+  pid?: number;
+  name?: string;
+  rss_bytes?: number | null;
+  peak_rss_bytes?: number | null;
+  committed_va_bytes?: number;
+  quality?: Record<string, string>;
+  capabilities?: Record<string, boolean>;
+  attach_enabled?: boolean;
+  cooperative?: boolean;
+  capturing?: boolean;
+  capture_id?: string;
+  capture_truncated?: boolean;
+  regions?: RuntimeRegion[];
+  address_map?: {
+    projection?: string;
+    area_scale?: string;
+    source_segments?: number;
+    segments?: RuntimeRegion[];
+  };
+  kinds?: Record<string, number>;
+  numa?: {
+    quality?: string;
+    dimm_quality?: string;
+    detail?: string;
+    dimms?: { label?: string; size_hint?: number; memory_controller?: string }[];
+    nodes?: {
+      id: number;
+      cpulist?: string;
+      distance?: string;
+      mem_total_bytes?: number | null;
+      mem_free_bytes?: number | null;
+      dimms?: unknown[];
+    }[];
+  };
+  pools?: { name: string; in_use: number; cap: number; quality?: string }[];
+  flecs?: Record<string, number>;
+  jolt?: Record<string, number>;
+  frame?: Record<string, number | object>;
+  hints?: { kind?: string; label?: string; detail?: string }[];
+  timeline?: {
+    seq?: number;
+    ts_ns?: number;
+    rss_bytes?: number | null;
+    committed_va_bytes?: number | null;
+    flecs_unused_bytes?: number | null;
+    jolt_temp_used?: number | null;
+    presented_ms?: number | null;
+    hitch?: boolean;
+  }[];
+  lifetime?: {
+    quality?: string;
+    live_allocations?: number;
+    live_bytes?: number;
+    oldest_ms?: number;
+    age_buckets?: { label: string; bytes: number; count: number }[];
+  };
+  locality?: {
+    quality?: string;
+    source?: string;
+    coverage_start_ns?: number;
+    samples?: number;
+    dropped?: number;
+    page_size?: number;
+    hotspots?: {
+      addr?: string;
+      end?: string;
+      samples?: number;
+      weight?: number;
+      misses?: number;
+      thread?: string;
+      symbol?: string;
+      data_source?: string;
+    }[];
+  };
+  gpu?: {
+    quality?: string;
+    particles?: number;
+    particle_cap?: number;
+    particle_ssbo_bytes?: number;
+    dynamic_meshes_live?: number;
+    dynamic_meshes_free?: number;
+    mesh_slots_remaining?: number;
+    portal_rt_bytes?: number;
+    driver_dedicated_kb?: number;
+    driver_available_kb?: number;
+    driver_quality?: string;
+  };
+  budget?: {
+    name?: string;
+    ok?: boolean;
+    checked?: number;
+    unavailable?: number;
+    quality?: string;
+    violations?: {
+      metric?: string;
+      limit?: number | null;
+      actual?: number | null;
+      delta?: number | null;
+      quality?: string;
+    }[];
+  };
+  alloc_streams?: {
+    name?: string;
+    live_bytes?: number;
+    allocs?: number;
+    frees?: number;
+  }[];
+};
+
+export type RuntimeDelta = {
+  schema_version?: number;
+  seq?: number;
+  changed?: Partial<RuntimeSnapshot> & { map_dirty?: boolean };
+};
+
+export type RuntimeCapture = {
+  id: string;
+  bytes?: number;
+  samples?: number | null;
+  started_ns?: number | null;
+  ended_ns?: number | null;
+  truncated?: boolean;
+  capturing?: boolean;
+};
+
+export type RuntimeCaptures = {
+  captures: RuntimeCapture[];
+  max_captures?: number;
+  max_samples?: number;
+};
+
+export type RuntimeDiffMetric = {
+  base: number | null;
+  current: number | null;
+  delta: number | null;
+  quality?: string;
+};
+
+export type RuntimeDiff = {
+  base: string;
+  current: string;
+  quality?: string;
+  metrics?: Record<string, RuntimeDiffMetric>;
+  pools?: { name: string; base: number; current: number; delta: number }[];
+  kinds?: { name: string; base: number; current: number; delta: number }[];
+};
+
+let runtimeToken = '';
+
+function runtimeHeaders(): Record<string, string> {
+  return runtimeToken ? { 'X-Wordkeep-Runtime': runtimeToken } : {};
+}
+
+export async function fetchRuntime() {
+  const res = await fetch(`${API_BASE}/runtime`, { headers: runtimeHeaders() });
+  const data = await parseJsonResponse<RuntimeSnapshot>(res, `${API_BASE}/runtime`);
+  if (data.token) runtimeToken = data.token;
+  return data;
+}
+
+export function openRuntimeStream(
+  onSnapshot: (snapshot: RuntimeSnapshot) => void,
+  onDelta: (delta: RuntimeDelta) => void,
+  onOpen: () => void,
+  onError: () => void,
+) {
+  const source = new EventSource(`${API_BASE}/runtime/stream`);
+  source.addEventListener('snapshot', (event) => {
+    try {
+      const snapshot = JSON.parse((event as MessageEvent<string>).data) as RuntimeSnapshot;
+      if (snapshot.token) runtimeToken = snapshot.token;
+      onSnapshot(snapshot);
+    } catch {
+      onError();
+    }
+  });
+  source.addEventListener('delta', (event) => {
+    try {
+      onDelta(JSON.parse((event as MessageEvent<string>).data) as RuntimeDelta);
+    } catch {
+      onError();
+    }
+  });
+  source.onopen = onOpen;
+  source.onerror = onError;
+  return () => source.close();
+}
+
+export function postRuntime<T>(url: string, body: unknown) {
+  return sendJson<T>(url, 'POST', body, runtimeHeaders());
+}
+
+export function fetchRuntimeCaptures() {
+  return getJson<RuntimeCaptures>(`${API_BASE}/runtime/captures`);
 }
 
 export function fetchSearchTelemetry() {
-  return getJson<SearchTelemetry>('/api/search-telemetry');
+  return getJson<SearchTelemetry>(`${API_BASE}/search-telemetry`);
 }
 
 export function recordClick(rank: number) {
-  return postJson<{ ok: boolean }>(`/api/search-telemetry/click`, { rank });
+  return postJson<{ ok: boolean }>(`${API_BASE}/search-telemetry/click`, { rank });
 }
 
 export function snippetOf(hit: SearchHit): string {

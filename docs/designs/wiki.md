@@ -34,9 +34,12 @@ Open http://127.0.0.1:8787
 ```
 wordkeep-wiki [--root DIR] index [--full]
 wordkeep-wiki [--root DIR] watch
-wordkeep-wiki [--root DIR] serve [--bind 127.0.0.1:8787] [--watch] [--allow-non-loopback]
+wordkeep-wiki [--root DIR] serve [--bind 127.0.0.1:8787] [--watch] [--allow-non-loopback] [--runtime-attach]
 wordkeep-wiki [--root DIR] status
 ```
+
+Cursor folder-open (`tools/wordkeep/wiki.sh`) passes `--runtime-attach` by default
+(`WIKI_RUNTIME_ATTACH=0` to opt out).
 
 Env: `WIKI_MEILI_URL`, `WIKI_MEILI_MASTER_KEY`, `WIKI_BIND`, `WIKI_PROJECT_NAME`.
 
@@ -65,8 +68,10 @@ else CMake/`Cargo.toml`/`package.json`, else the workspace folder name.
 - Frontmatter tag CRUD in the reader (add / rename / delete → `PUT /api/page`)
 - Per-tag colors (picker + hex, `localStorage`) for visual chips
 - Knowledge health: Meilisearch/manifest status, broken/orphan links, duplicate
-  headings, search telemetry (latency, no-result rate, click rank); Health
-  sections are collapsible (same persist key as Dashboard)
+  headings, search telemetry; **Runtime** subview (`?tab=health&view=runtime`)
+  live-maps process VA / NUMA, cooperative Betwixt pools, capped peek, and
+  confirm-gated ECS field reorder — [runtime_memory_health.md](runtime_memory_health.md).
+  Knowledge stays on `/api/health` + `/api/garden`.
 - MCP savings dashboard (GUI): overview / live charts / sortable tools table
   (incl. **Inv** for validation/missing-arg calls) / recent activity + health
   as tables / outcome hover shows `reason` when present; via `/api/dashboard`,
@@ -89,4 +94,9 @@ else CMake/`Cargo.toml`/`package.json`, else the workspace folder name.
 - Meilisearch hybrid/vector search
 - Azera intelligence (cited librarian, dream jobs) — design inspiration only;
   no runtime coupling
+- Runtime Memory Health UI/API is implemented (see
+  [runtime_memory_health.md](runtime_memory_health.md)), including SSE deltas,
+  captures/diffs, Linux bpftrace attach, Jolt diagnostics, and MCP tools.
+  Remaining collectors: Windows PEBS-style data-address samples (ETW profile
+  events are instruction IPs) and a fuller GPU inventory.
 

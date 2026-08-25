@@ -4,7 +4,7 @@ All tools accept optional `token_budget` (approximate max response tokens) where
 Path-accepting tools use `paths`, optional `profile`, or `.wordkeep/config.json`
 `path_profiles` / `default_paths` (see [configuration.md](configuration.md)).
 
-**Surface:** 36 tools + MCP resource `wordkeep://readme`.
+**Surface:** 39 tools + MCP resource `wordkeep://readme`.
 
 ## Navigation
 
@@ -47,6 +47,9 @@ Path-accepting tools use `paths`, optional `profile`, or `.wordkeep/config.json`
 | --- | --- | --- |
 | `trace_summary` | optional `file`, `dir`, `baseline` | Hottest Tracy zones or diff |
 | `trace_profile` | optional trace args | Hitch workflow: trace + diff_map + index_stale |
+| `runtime_snapshot` | optional `capture`, `top` | Token-budgeted live/captured Runtime Health census |
+| `memory_diff` | `base`; optional `current` | Signed memory, pool, and mapping-kind deltas |
+| `locality_hotspots` | optional `capture`, `top`, `min_samples` | Sampled address hotspots, or explicit unavailable |
 | `integration_hooks` | optional `query`, `from`, `to` | Curated hooks + optional call_path |
 | `index_stale` | optional `ref`, `paths` / `profile` | Whether disk indexes may lag git / miss coverage |
 | `stats` | optional `reset`, `insights`, `format` (`text`\|`json`), `workspace` | Estimated context avoided (v5: µs latency, typed outcomes, jsonl events) |

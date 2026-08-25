@@ -201,6 +201,9 @@ fn lists_all_tools() {
         "knowledge_upsert",
         "trace_summary",
         "trace_profile",
+        "runtime_snapshot",
+        "memory_diff",
+        "locality_hotspots",
         "integration_hooks",
         "index_stale",
         "stats",
@@ -221,10 +224,35 @@ fn lists_all_tools() {
     }
     assert_eq!(
         names.len(),
-        36,
-        "expected 36 tools, got {}: {names:?}",
+        39,
+        "expected 39 tools, got {}: {names:?}",
         names.len()
     );
+}
+
+#[test]
+fn runtime_tools_read_cooperative_snapshot_without_network() {
+    let mut s = Server::start();
+    let runtime = s._fixture.root.join(".wordkeep/runtime");
+    std::fs::create_dir_all(&runtime).unwrap();
+    std::fs::write(
+        runtime.join("latest.json"),
+        serde_json::to_vec(&json!({
+            "schema_version": 1,
+            "source": "betwixt",
+            "pid": 42,
+            "rss_bytes": 4096,
+            "quality": {"rss_bytes": "exact"},
+            "regions": [{"size": 2048, "kind": "anon", "perm": "rw-", "path": null}]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let snapshot = s.tool_text("runtime_snapshot", json!({}));
+    assert!(snapshot.contains("RSS 4.0 KiB [exact]"), "{snapshot}");
+    let locality = s.tool_text("locality_hotspots", json!({}));
+    assert!(locality.contains("quality=unavailable"), "{locality}");
 }
 
 #[test]

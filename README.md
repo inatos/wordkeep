@@ -48,12 +48,29 @@ cargo run -p wordkeep-wiki -- --root /path/to/repo serve --watch
 # UI: http://127.0.0.1:8787
 ```
 
-Optional idempotent launcher (same binary search as `mcp.sh`): [wiki.sh](wiki.sh) brings up Meilisearch + `serve --watch` if `:8787` is not already healthy. In the Betwixt monorepo, Cursor runs it on folder open via `.vscode/tasks.json`.
+Optional idempotent launcher (same binary search as `mcp.sh`): [wiki.sh](wiki.sh) brings up Meilisearch + `serve --watch --runtime-attach` if `:8787` is not already healthy. In the Betwixt monorepo, Cursor runs it on folder open via `.vscode/tasks.json`. Health → Runtime needs that attach flag plus a current `wiki/dist` build.
 
 ```sh
 ./wiki.sh
 # UI: http://127.0.0.1:8787
 ```
+
+Optional Linux allocation attach (requires `bpftrace`; elevation depends on
+Yama/eBPF policy). The helper is separate so the wiki process never elevates:
+
+```sh
+cargo build -p wordkeep-wiki --bin wordkeep-runtime-helper
+export WORDKEEP_RUNTIME_TOKEN="$(curl -s http://127.0.0.1:8787/api/runtime | jq -r .token)"
+./target/debug/wordkeep-runtime-helper --pid <PID>
+# If policy requires it:
+sudo --preserve-env=WORDKEEP_RUNTIME_TOKEN ./target/debug/wordkeep-runtime-helper --pid <PID>
+```
+
+The stream covers allocations after attach and is labeled sampled. Use
+`--backend perf` for Linux data-address samples, `--backend etw` for a Windows
+heap + SampledProfile session (elevation required), or `--input` to replay a
+tracerpt/perf text dump. Cooperative Jolt/Flecs diagnostics work without the
+helper.
 
 Refresh README screenshots (wiki must be serving on `:8787`):
 
@@ -134,7 +151,7 @@ CLI: `wordkeep run-record …` records gate metadata without executing commands.
 
 ## What you get
 
-36 MCP tools + `wordkeep://readme` resource, including:
+39 MCP tools + `wordkeep://readme` resource, including:
 
 | Tool | Use when you need |
 | --- | --- |
@@ -148,6 +165,8 @@ CLI: `wordkeep run-record …` records gate metadata without executing commands.
 | `defect_list` / `run_history` | Unresolved blockers and recent gate evidence |
 | `session_pressure` | Heuristic context-pressure signal |
 | `test_map` | Narrowest tests after a change |
+| `runtime_snapshot` / `memory_diff` | Runtime memory census or signed capture deltas |
+| `locality_hotspots` | Sampled PMC/ETW/perf hotspots, or explicit unavailable |
 | `stats` | Measured token displacement per tool |
 
 Full catalog: [docs/tools.md](docs/tools.md). Design notes:

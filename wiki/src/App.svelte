@@ -24,6 +24,7 @@
     type SearchTelemetry,
     type TreeNode,
   } from './lib/api';
+  import { rippleFromEvent } from './lib/press-ripple';
   import {
     CHART_HELP,
     COLUMN_HELP,
@@ -99,6 +100,7 @@
   let health = $state<string>('unknown');
   let healthDetail = $state('');
   let retainSearchQueries = $state(false);
+  let readOnly = $state(false);
   let projectName = $state('Project');
   let brandTitle = $derived(`${projectName} ~ Wiki`);
   let garden = $state<GardenPayload | null>(null);
@@ -380,6 +382,7 @@
       const chunks = h.manifest?.chunks ?? '?';
       healthDetail = `manifest ${files} files / ${chunks} chunks`;
       searchTelemetry = h.search_telemetry || null;
+      readOnly = Boolean(h.read_only);
     } catch {
       health = 'down';
       healthDetail = '';
@@ -1722,7 +1725,10 @@
             class:active={pagePath === node.path}
             style={`--depth:${depth}`}
             title={node.path}
-            onclick={() => openPath(node.path!)}
+            onclick={(event) => {
+              rippleFromEvent(event);
+              openPath(node.path!);
+            }}
           >
             <span class="tree-indent" aria-hidden="true"></span>
             <svg class="leaf" viewBox="0 0 24 24" aria-hidden="true"
@@ -1747,7 +1753,10 @@
               : `Expand ${dirKey}`}
             aria-expanded={expanded}
             aria-label={`${expanded ? 'Collapse' : 'Expand'} folder ${node.name}`}
-            onclick={() => toggleDir(dirKey)}
+            onclick={(event) => {
+              rippleFromEvent(event);
+              toggleDir(dirKey);
+            }}
           >
             <span class="tree-indent" aria-hidden="true"></span>
             <svg class="chevron" viewBox="0 0 24 24" aria-hidden="true"
@@ -2059,7 +2068,7 @@
                   /></svg
                 >
               </button>
-            {:else}
+            {:else if !readOnly}
               <button
                 class="icon-btn"
                 onclick={startEditing}

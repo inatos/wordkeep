@@ -22,12 +22,7 @@ pub fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {
 
 /// Root directory for all on-disk caches.
 pub fn dir() -> PathBuf {
-    let base = std::env::var_os("XDG_CACHE_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("LOCALAPPDATA").map(PathBuf::from))
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
-        .unwrap_or_else(std::env::temp_dir);
-    base.join("wordkeep")
+    wordkeep_knowledge::wordkeep_cache_dir()
 }
 
 /// Modified time as whole nanoseconds since the Unix epoch (`0` if unavailable).

@@ -151,3 +151,64 @@ article h1, article h2, article h3 { scroll-margin-top: 4rem; }
   75% { transform: rotate(270deg); }
   100% { transform: rotate(360deg); }
 }
+
+/* Sidebar / tree press ripple */
+.press-ripple {
+  position: fixed;
+  z-index: 5000;
+  width: 0;
+  height: 0;
+  pointer-events: none;
+  overflow: visible;
+}
+.press-ripple-core,
+.press-ripple-ring {
+  position: absolute;
+  left: 0;
+  top: 0;
+  translate: -50% -50%;
+  border-radius: 50%;
+}
+.press-ripple-core {
+  width: 0.28rem;
+  height: 0.28rem;
+  background: radial-gradient(
+    circle,
+    rgba(177, 83, 184, 0.55) 0%,
+    rgba(88, 40, 96, 0.35) 55%,
+    transparent 78%
+  );
+  animation: press-ripple-core 0.62s var(--ease-snap) forwards;
+}
+.press-ripple-ring {
+  width: 0.42rem;
+  height: 0.42rem;
+  border: 1px solid color-mix(in srgb, var(--accent) 45%, transparent);
+  box-shadow: 0 0 8px color-mix(in srgb, var(--accent) 35%, transparent);
+  animation: press-ripple-ring 0.68s var(--ease-snap) forwards;
+}
+@keyframes press-ripple-core {
+  0% {
+    transform: scale(0.4);
+    opacity: 0.7;
+  }
+  100% {
+    transform: scale(5);
+    opacity: 0;
+  }
+}
+@keyframes press-ripple-ring {
+  0% {
+    transform: scale(0.55);
+    opacity: 0.5;
+  }
+  100% {
+    transform: scale(7);
+    opacity: 0;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .press-ripple {
+    display: none;
+  }
+}

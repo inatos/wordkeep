@@ -14,6 +14,7 @@ survives chat resets without pasting megabytes of transcript.
 | Defects | `<root>/.wordkeep/defects.json` | `defect_upsert`, `defect_list` |
 | Knowledge notes | `<root>/.wordkeep/notes/` (and allowlisted roots) | `knowledge_upsert`, MAS spill/promote |
 | Stats | `$XDG_CACHE_HOME/wordkeep/savings.json` | all instrumented tools |
+| Runtime captures (planned) | `…/workspaces/<id>/runtime/` | wiki Runtime Health — [runtime_memory_health.md](runtime_memory_health.md) |
 
 `<id>` is a stable hash of the canonical `--root` path. Legacy global
 `wordkeep/mas/<session>.json` files are copied into the workspace cache on first
