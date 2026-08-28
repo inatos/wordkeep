@@ -151,7 +151,7 @@ CLI: `wordkeep run-record …` records gate metadata without executing commands.
 
 ## What you get
 
-39 MCP tools + `wordkeep://readme` resource, including:
+40 MCP tools + 2 MCP resources (`wordkeep://readme`, `wordkeep://capabilities`), including:
 
 | Tool | Use when you need |
 | --- | --- |
@@ -164,6 +164,7 @@ CLI: `wordkeep run-record …` records gate metadata without executing commands.
 | `session_handoff` | Paste-ready next-session prime |
 | `defect_list` / `run_history` | Unresolved blockers and recent gate evidence |
 | `session_pressure` | Heuristic context-pressure signal |
+| `profile_upsert` | Propose/apply a new `path_profiles` entry in `.wordkeep/config.json` |
 | `test_map` | Narrowest tests after a change |
 | `runtime_snapshot` / `memory_diff` | Runtime memory census or signed capture deltas |
 | `locality_hotspots` | Sampled PMC/ETW/perf hotspots, or explicit unavailable |
@@ -172,7 +173,7 @@ CLI: `wordkeep run-record …` records gate metadata without executing commands.
 Full catalog: [docs/tools.md](docs/tools.md). Design notes:
 [docs/onboarding.md](docs/onboarding.md).
 
-Languages (via tree-sitter): C/C++, GLSL, Rust, Python, C#, TypeScript/TSX/Svelte.
+Languages (via tree-sitter): C/C++, GLSL, Rust, Python, C#, TypeScript/TSX/Svelte/JS.
 Daslang (`.das`) uses a lightweight scanner by default; exact parsing is
 opt-in (`--features daslang`).
 

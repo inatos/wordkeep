@@ -6,7 +6,7 @@
 use serde_json::{json, Value};
 use std::path::Path;
 
-use crate::{stats, workspace};
+use crate::{coeffects, stats, workspace};
 
 const STORE_VERSION: u64 = 1;
 const FILE: &str = "runs.json";
@@ -243,6 +243,7 @@ pub fn record(root: &Path, args: &Value) -> Result<String, String> {
         "created"
     };
     save_all(root, &runs)?;
+    coeffects::notify(root, "run_record", coeffects::NotifyCtx::EMPTY);
     let out = format!("run_record - {action} {id} status={status} cmd={command:?}");
     stats::record("run_record", 64, (out.len() / 4) as u64);
     Ok(out)

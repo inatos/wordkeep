@@ -12,7 +12,7 @@ use std::sync::{Mutex, OnceLock};
 use wordkeep_knowledge::chunk_bodies;
 
 use crate::cache::{self, DiskMap};
-use crate::{config, defects, stats, walk};
+use crate::{coeffects, config, defects, effect_journal, mas, stats, walk};
 
 #[cfg(feature = "embeddings")]
 mod embed;
@@ -27,6 +27,19 @@ const B: f64 = 0.75;
 /// when the document changes. Backed by a JSON file under the shared cache dir,
 /// so a cold spawn over a large docs tree reuses the previous run's chunking.
 static CHUNK_CACHE: OnceLock<Mutex<DiskMap>> = OnceLock::new();
+
+const CHUNK_KEY_SUFFIX: &str = "markdown-v2";
+
+/// Drop cached chunking for a markdown file (spatial coeffect on agent writes).
+pub fn invalidate_markdown_chunks(path: &Path) {
+    let key = format!("{}::{}", path.to_string_lossy(), CHUNK_KEY_SUFFIX);
+    let cell = CHUNK_CACHE.get_or_init(|| Mutex::new(DiskMap::load("knowledge-chunks.json")));
+    if let Ok(mut store) = cell.lock() {
+        if store.remove(&key) {
+            store.save();
+        }
+    }
+}
 
 const STOP: [&str; 22] = [
     "the", "and", "for", "with", "that", "this", "from", "are", "was", "but", "not", "you", "your",
@@ -306,12 +319,17 @@ pub fn upsert(root: &Path, args: &Value) -> Result<String, String> {
     };
 
     let full = resolve_upsert_path(root, rel)?;
+    let rel_key = full
+        .strip_prefix(root)
+        .map(|p| p.to_string_lossy().replace('\\', "/"))
+        .unwrap_or_else(|_| rel.to_string());
     let existed = full.exists();
     let mut src = if existed {
         std::fs::read_to_string(&full).map_err(|e| format!("read {}: {e}", full.display()))?
     } else {
         String::new()
     };
+    let before_content = if existed { Some(src.clone()) } else { None };
 
     let action = match write_mode {
         "replace_file" => {
@@ -349,7 +367,30 @@ pub fn upsert(root: &Path, args: &Value) -> Result<String, String> {
         action.to_string()
     };
 
+    if let Some(effect_sess) = args
+        .get("effect_session")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        mas::require_open_session(root, effect_sess)?;
+        effect_journal::record_write(root, effect_sess, &rel_key, before_content, src.clone())?;
+    }
+
     write_atomic(&full, &src)?;
+    let effect_sess = args
+        .get("effect_session")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    coeffects::notify(
+        root,
+        "knowledge_upsert",
+        coeffects::NotifyCtx {
+            rel_paths: &[rel_key.as_str()],
+            session: effect_sess,
+        },
+    );
     stats::record("knowledge_upsert", (src.len() / 4) as u64, 32);
 
     Ok(format!(
@@ -541,7 +582,7 @@ fn index(root: &Path, roots: &[String]) -> (Vec<Chunk>, u64) {
 fn cached_chunks(path: &Path, rel: &str, bytes: &mut u64) -> Vec<Chunk> {
     // Keep the established cache file visible to index_stale, but version each
     // key so pre-fence-aware chunks are never reused.
-    let key = format!("{}::markdown-v2", path.to_string_lossy());
+    let key = format!("{}::{}", path.to_string_lossy(), CHUNK_KEY_SUFFIX);
     let (mtime_ns, len) = match std::fs::metadata(path) {
         Ok(m) => (cache::mtime_ns(&m), m.len()),
         Err(_) => (0, 0),
@@ -721,6 +762,65 @@ mod tests {
         // Physics doc must appear and rank ahead of any audio match.
         assert!(audio.map_or(true, |a| phys < a), "{out}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn invalidate_markdown_chunks_evicts_disk_entry() {
+        let _guard = cache::test_env_lock();
+        let dir = std::env::temp_dir().join(format!("cbtest_kbinv_{}", std::process::id()));
+        let cache = std::env::temp_dir().join(format!("cbtest_kbinv_cache_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&cache);
+        std::env::set_var("XDG_CACHE_HOME", &cache);
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("n.md");
+        std::fs::write(&f, "# One\nalpha content\n").unwrap();
+        let mut bytes = 0u64;
+        let _ = cached_chunks(&f, "n.md", &mut bytes);
+        let mtime = cache::mtime_ns(&std::fs::metadata(&f).unwrap());
+        let key = format!("{}::{}", f.to_string_lossy(), CHUNK_KEY_SUFFIX);
+        let cell = CHUNK_CACHE.get_or_init(|| Mutex::new(DiskMap::load("knowledge-chunks.json")));
+        assert!(cell.lock().unwrap().get(&key, mtime).is_some());
+        invalidate_markdown_chunks(&f);
+        assert!(cell.lock().unwrap().get(&key, mtime).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&cache);
+    }
+
+    #[test]
+    fn upsert_notifies_coeffects_for_search() {
+        let _guard = cache::test_env_lock();
+        let dir = std::env::temp_dir().join(format!("cbtest_kb_coeffect_{}", std::process::id()));
+        let cache_dir =
+            std::env::temp_dir().join(format!("cbtest_kb_coeffect_cache_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&cache_dir);
+        std::env::set_var("XDG_CACHE_HOME", &cache_dir);
+        let docs = dir.join("docs");
+        std::fs::create_dir_all(&docs).unwrap();
+        let rel = "docs/agent-note.md";
+        std::fs::write(
+            docs.join("agent-note.md"),
+            "# Agent\nInitial searchable phrase xyzzy.\n",
+        )
+        .unwrap();
+        upsert(
+            &dir,
+            &json!({
+                "path": rel,
+                "heading": "Agent",
+                "body": "Updated searchable phrase xyzzy.",
+                "mode": "upsert_section"
+            }),
+        )
+        .unwrap();
+        let out = search(&dir, &json!({"query": "xyzzy", "roots": ["docs"]})).unwrap();
+        assert!(
+            out.contains("Updated searchable"),
+            "search should see post-upsert body: {out}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&cache_dir);
     }
 
     #[test]

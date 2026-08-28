@@ -2,11 +2,12 @@
 //!
 //! tree-sitter classifies each exact-name occurrence as a definition, a call
 //! site, or some other reference - far less noisy than grep (it ignores
-//! comments, strings, and substring collisions). Coverage spans C/C++, GLSL
-//! (a tree-sitter-c fork sharing the C node kinds), Rust, Python, and
-//! TypeScript/TSX/Svelte (Svelte parsed through its `<script>` blocks); Daslang
-//! is mapped by `repo_map` instead (its grammar is brace-only and its scripts
-//! are small).
+//! comments, ordinary strings, and substring collisions). Coverage spans C/C++,
+//! GLSL (a tree-sitter-c fork sharing the C node kinds), Rust, Python, and
+//! TypeScript/TSX/Svelte/JS (Svelte parsed through its `<script>` blocks);
+//! Daslang is mapped by `repo_map` instead (its grammar is brace-only and its
+//! scripts are small). Flecs `ecs.system("…")` and Tracy `ZoneScopedN("…")`
+//! string names are the deliberate exception: they count as definitions.
 //!
 //! Each file is distilled once into a symbol-agnostic occurrence list
 //! (name, role, line) memoized per process keyed by path+mtime, so the parse is
@@ -616,6 +617,12 @@ fn scan_cpp(node: Node, bytes: &[u8], out: &mut Vec<Occ>) {
                 line: node.start_position().row + 1,
             });
         }
+    } else if let Some(name) = crate::symbol_def::flecs_tracy_system_name(node, bytes) {
+        out.push(Occ {
+            name,
+            role: Role::Def,
+            line: node.start_position().row + 1,
+        });
     }
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
@@ -892,8 +899,9 @@ fn classify(node: Node) -> Role {
 }
 
 /// Classify a Rust name occurrence. Item names (`fn`, `struct`, `enum`, `trait`,
-/// `type`, `union`) are defs; the function of a call (incl. `path::seg`, `f::<T>`)
-/// and method fields of a method call are calls; everything else is a reference.
+/// `type`, `union`, `const`, `static`) are defs; the function of a call (incl.
+/// `path::seg`, `f::<T>`) and method fields of a method call are calls;
+/// everything else is a reference.
 fn classify_rust(node: Node) -> Role {
     // Type-like item definitions.
     if node.kind() == "type_identifier" {
@@ -907,10 +915,14 @@ fn classify_rust(node: Node) -> Role {
             }
         }
     }
-    // Function definition.
+    // Function / const / static definition names are `identifier` children.
     if node.kind() == "identifier" {
         if let Some(p) = node.parent() {
-            if p.kind() == "function_item" && p.child_by_field_name("name") == Some(node) {
+            if matches!(
+                p.kind(),
+                "function_item" | "const_item" | "static_item"
+            ) && p.child_by_field_name("name") == Some(node)
+            {
                 return Role::Def;
             }
         }
@@ -1095,6 +1107,44 @@ mod tests {
         assert_eq!(
             roles_in("fn use_it(o: Obj) { o.method(); }\n", "method", Lang::Rust),
             vec![Role::Call]
+        );
+    }
+
+    #[test]
+    fn rust_const_and_static_are_defs() {
+        assert_eq!(
+            roles_in("pub const INPUT_SPIN: u8 = 1 << 5;\n", "INPUT_SPIN", Lang::Rust),
+            vec![Role::Def]
+        );
+        let rs = roles_in(
+            "pub static MAX: i32 = 1;\nfn use_it() { let _ = MAX; }\n",
+            "MAX",
+            Lang::Rust,
+        );
+        assert!(rs.contains(&Role::Def), "{rs:?}");
+        assert!(rs.contains(&Role::Ref), "{rs:?}");
+    }
+
+    #[test]
+    fn flecs_system_and_tracy_zone_strings_are_defs() {
+        let src = r#"
+void Register() {
+  ecs.system("LightCollect")
+      .run([](flecs::iter&) {
+          ZoneScopedN("LightCollect");
+      });
+  puts("LightCollect");
+}
+"#;
+        let rs = roles_in(src, "LightCollect", Lang::Cpp);
+        assert!(
+            rs.iter().filter(|r| **r == Role::Def).count() >= 2,
+            "ecs.system + ZoneScopedN should be defs: {rs:?}"
+        );
+        // Ordinary string content must stay invisible.
+        assert_eq!(
+            roles_in(r#"void f() { puts("OtherName"); }"#, "OtherName", Lang::Cpp),
+            Vec::<Role>::new()
         );
     }
 

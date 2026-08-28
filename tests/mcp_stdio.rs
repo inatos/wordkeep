@@ -219,13 +219,14 @@ fn lists_all_tools() {
         "artifact_index",
         "session_pressure",
         "commit_scope",
+        "profile_upsert",
     ] {
         assert!(names.contains(&n), "missing tool {n}: {names:?}");
     }
     assert_eq!(
         names.len(),
-        39,
-        "expected 39 tools, got {}: {names:?}",
+        40,
+        "expected 40 tools, got {}: {names:?}",
         names.len()
     );
 }
@@ -272,6 +273,12 @@ fn resources_list_and_read_readme() {
         resources.iter().any(|r| r["uri"] == "wordkeep://readme"),
         "{list}"
     );
+    assert!(
+        resources
+            .iter()
+            .any(|r| r["uri"] == "wordkeep://capabilities"),
+        "{list}"
+    );
     let read = s.call(json!({
         "jsonrpc": "2.0", "id": 3, "method": "resources/read",
         "params": { "uri": "wordkeep://README" }
@@ -281,6 +288,13 @@ fn resources_list_and_read_readme() {
         text.contains("wordkeep") || text.contains("Wordkeep"),
         "{read}"
     );
+    let caps = s.call(json!({
+        "jsonrpc": "2.0", "id": 4, "method": "resources/read",
+        "params": { "uri": "wordkeep://capabilities" }
+    }));
+    let caps_text = caps["result"]["contents"][0]["text"].as_str().unwrap_or("");
+    assert!(caps_text.contains("\"tool_count\": 40"), "{caps}");
+    assert!(caps_text.contains("knowledge_upsert"), "{caps}");
 }
 
 #[test]
@@ -774,6 +788,98 @@ fn mas_finalize_can_promote_to_notes() {
         }),
     );
     assert!(search.contains("mas-result.md"), "{search}");
+}
+
+#[test]
+fn knowledge_upsert_effect_session_journaled_and_recovered() {
+    let mut s = Server::start();
+    let session = "stdio-effect-recover";
+
+    let _ = s.tool_text(
+        "mas_post",
+        json!({
+            "session": session,
+            "role": "planner",
+            "summary": "try revertible note",
+            "handoff_to": "solver"
+        }),
+    );
+
+    let up = s.tool_text(
+        "knowledge_upsert",
+        json!({
+            "path": ".wordkeep/notes/effect-poc.md",
+            "heading": "Effect PoC",
+            "body": "journaled content should disappear on recover.",
+            "effect_session": session
+        }),
+    );
+    assert!(up.contains("knowledge_upsert"), "{up}");
+
+    let status = s.tool_text("mas_status", json!({ "session": session }));
+    assert!(status.contains("pending_effect_writes: 1"), "{status}");
+
+    let fin = s.tool_text(
+        "mas_finalize",
+        json!({
+            "session": session,
+            "result": "abandon experiment",
+            "effects": "recover"
+        }),
+    );
+    assert!(fin.contains("reverted 1"), "{fin}");
+    assert!(fin.contains("not finalized"), "{fin}");
+
+    let search = s.tool_text(
+        "knowledge_search",
+        json!({
+            "query": "journaled content should disappear",
+            "roots": [".wordkeep/notes"],
+            "semantic": false
+        }),
+    );
+    assert!(
+        !search.contains("effect-poc.md"),
+        "note should be gone after recover: {search}"
+    );
+}
+
+#[test]
+fn mas_finalize_requires_effects_when_pending() {
+    let mut s = Server::start();
+    let session = "stdio-effect-required";
+
+    let _ = s.tool_text(
+        "mas_post",
+        json!({
+            "session": session,
+            "role": "planner",
+            "summary": "pending write test"
+        }),
+    );
+    let _ = s.tool_text(
+        "knowledge_upsert",
+        json!({
+            "path": ".wordkeep/notes/effect-required.md",
+            "heading": "Pending",
+            "body": "needs effects arg",
+            "effect_session": session
+        }),
+    );
+
+    let resp = s.call(json!({
+        "jsonrpc": "2.0", "id": 60, "method": "tools/call",
+        "params": {
+            "name": "mas_finalize",
+            "arguments": {
+                "session": session,
+                "result": "done"
+            }
+        }
+    }));
+    assert_eq!(resp["result"]["isError"], json!(true), "{resp}");
+    let text = resp["result"]["content"][0]["text"].as_str().unwrap_or("");
+    assert!(text.contains("pending effect writes"), "{text}");
 }
 
 #[test]

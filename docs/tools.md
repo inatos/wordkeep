@@ -4,7 +4,7 @@ All tools accept optional `token_budget` (approximate max response tokens) where
 Path-accepting tools use `paths`, optional `profile`, or `.wordkeep/config.json`
 `path_profiles` / `default_paths` (see [configuration.md](configuration.md)).
 
-**Surface:** 39 tools + MCP resource `wordkeep://readme`.
+**Surface:** 40 tools + MCP resources `wordkeep://readme`, `wordkeep://capabilities`.
 
 ## Navigation
 
@@ -33,13 +33,14 @@ Path-accepting tools use `paths`, optional `profile`, or `.wordkeep/config.json`
 | `undocumented` | optional `paths` | Exported symbols lacking doc comments |
 | `test_map` | `symbol` | Test files referencing the symbol |
 | `commit_scope` | optional `large_file_bytes` | Read-only dirty-path groups + warnings |
+| `profile_upsert` | optional `paths` / `symbol`, `mode` | Propose/apply `path_profiles` + hints + commit_scopes |
 
 ## Knowledge and docs
 
 | Tool | Required args | Returns |
 | --- | --- | --- |
 | `knowledge_search` | `query` | BM25 (+ optional defects boost / semantic rerank) |
-| `knowledge_upsert` | `path` + mode fields | Write/update markdown section |
+| `knowledge_upsert` | `path` + mode fields | Write/update markdown section; optional `effect_session` for revertible writes |
 
 ## Performance and workflow
 
@@ -67,17 +68,31 @@ Path-accepting tools use `paths`, optional `profile`, or `.wordkeep/config.json`
 | `mas_post` | Append compact entry (`kind`, `commands`, `constraints`, handoff spill) |
 | `mas_read` | Read entries (filter by recipient, role, round, tag) |
 | `mas_status` | Round bookkeeping and convergence hint |
-| `mas_finalize` | Close session; optional promote + handoff prompt |
+| `mas_finalize` | Close session; optional promote + handoff prompt; `effects: commit\|recover` when journaled writes pending |
 | `session_handoff` | Paste-ready next-session prime (works on finalized sessions) |
 
 See [designs/recursive_mas.md](designs/recursive_mas.md) and
 [designs/session_continuity.md](designs/session_continuity.md).
+
+### Revertible writes (`effect_session`)
+
+Opt-in temporal composability for agent notes (FIG-2026-005 PoC):
+
+1. Open a MAS session (`mas_post` / `mas_status`).
+2. Call `knowledge_upsert` with `"effect_session": "<slug>"` — each write is journaled under the workspace cache.
+3. On close, pass `"effects": "commit"` (keep writes) or `"effects": "recover"` (LIFO revert) to `mas_finalize` when `mas_status` reports `pending_effect_writes`.
+4. `effects: recover` leaves the session **open** (not finalized, no promote).
+
+Conflict policy: recover refuses if on-disk content no longer matches the journaled post-write snapshot (external edit or concurrent writer).
+
+**Spatial coeffects:** write tools notify dependent caches per `wordkeep://capabilities` (`coeffects.rs`). `mas_read` evicts session cache before load.
 
 ## MCP resources
 
 | URI | Content |
 | --- | --- |
 | `wordkeep://readme` | Packaged README (alias: `wordkeep://README`) |
+| `wordkeep://capabilities` | Static effect/coeffect manifest for write tools (FIG-2026-005 Phase 2) |
 
 ## Languages
 

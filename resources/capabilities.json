@@ -1,0 +1,41 @@
+{
+  "version": 1,
+  "tool_count": 40,
+  "notes": "Effect/coeffect manifest (FIG-2026-005). Wired: knowledge-chunks-cache, mas-session, workspace-cache. config/defects/runs/effect-journal are disk-fresh reads.",
+  "tools": {
+    "knowledge_upsert": {
+      "effects": ["write-notes"],
+      "coeffects": ["config", "knowledge-chunks-cache", "mas-session"],
+      "revertible": "opt-in via effect_session"
+    },
+    "defect_upsert": {
+      "effects": ["write-defects"],
+      "coeffects": ["config"]
+    },
+    "mas_post": {
+      "effects": ["write-mas-session"],
+      "coeffects": ["config", "workspace-cache"]
+    },
+    "mas_finalize": {
+      "effects": ["write-mas-session", "write-notes", "write-handoff-marker"],
+      "coeffects": ["config", "effect-journal"]
+    },
+    "session_handoff": {
+      "effects": ["write-handoff-marker"],
+      "coeffects": ["config", "mas-session", "defects", "runs"]
+    },
+    "run_record": {
+      "effects": ["append-runs"],
+      "coeffects": ["config"]
+    },
+    "stats": {
+      "effects": ["append-stats", "reset-stats"],
+      "coeffects": ["config"]
+    },
+    "profile_upsert": {
+      "effects": ["write-config"],
+      "coeffects": ["config"]
+    }
+  },
+  "read_only_default": "All tools not listed above are read-only over workspace paths (no durable writes)."
+}

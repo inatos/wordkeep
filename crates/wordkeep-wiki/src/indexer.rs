@@ -305,10 +305,13 @@ pub(crate) async fn watch_workspace(
     meili: MeiliClient,
 ) -> Result<(), String> {
     let summary = index_workspace(&root, &config, &meili, false).await?;
-    eprintln!(
-        "wordkeep-wiki: initial index: {} updated, {} skipped, {} deleted",
-        summary.updated_files, summary.skipped_files, summary.deleted_files
-    );
+    if summary.updated_files > 0 || summary.deleted_files > 0 {
+        eprintln!(
+            "wordkeep-wiki: initial index: {} updated, {} skipped, {} deleted",
+            summary.updated_files, summary.skipped_files, summary.deleted_files
+        );
+    }
+    // Skip routine "0 updated, N skipped" chatter on healthy relaunches.
 
     let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel::<notify::Result<Event>>();
     let mut watcher: RecommendedWatcher = notify::recommended_watcher(move |event| {

@@ -11,7 +11,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::{config, defects, knowledge, runs, session_pressure, stats, workspace};
+use crate::{
+    coeffects, config, defects, effect_journal, knowledge, runs, session_pressure, stats, workspace,
+};
 
 const STORE_VERSION: u64 = 2;
 const DEFAULT_MAX_ROUNDS: u64 = 3;
@@ -59,6 +61,25 @@ struct Session {
 
 fn cache_cell() -> &'static Mutex<HashMap<String, Session>> {
     SESSION_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Drop one session from the in-process MAS cache (spatial coeffect / cross-process freshness).
+pub fn evict_session_cache(root: &Path, session: &str) {
+    if validate_session_id(session).is_err() {
+        return;
+    }
+    let key = cache_key(root, session);
+    if let Ok(mut cache) = cache_cell().lock() {
+        cache.remove(&key);
+    }
+}
+
+/// Drop all MAS sessions cached for this workspace root.
+pub fn evict_workspace_session_cache(root: &Path) {
+    let prefix = format!("{}::", workspace::workspace_id(root));
+    if let Ok(mut cache) = cache_cell().lock() {
+        cache.retain(|k, _| !k.starts_with(&prefix));
+    }
 }
 
 fn now_secs() -> u64 {
@@ -416,6 +437,23 @@ fn spill_note(
     Ok(rel)
 }
 
+/// Validate session id and ensure the session exists and is not finalized.
+pub fn require_open_session(root: &Path, session: &str) -> Result<(), String> {
+    validate_session_id(session)?;
+    let s = load_session(root, session)?.ok_or_else(|| format!("session {session} not found"))?;
+    if s.status == "final" {
+        return Err(format!("session {session} is finalized"));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+pub fn get_or_create_session_for_test(root: &Path, session: &str) -> Result<(), String> {
+    let s = get_or_create_session(root, session, None)?;
+    save_session(root, &s)?;
+    Ok(())
+}
+
 /// Append a compact entry to a session blackboard.
 pub fn post(root: &Path, args: &Value) -> Result<String, String> {
     let session = required_str(args, "session")?;
@@ -540,6 +578,14 @@ constraints: {constraints:?}
     s.entries.push(entry);
     s.updated = now;
     save_session(root, &s)?;
+    coeffects::notify(
+        root,
+        "mas_post",
+        coeffects::NotifyCtx {
+            rel_paths: &[],
+            session: Some(&session),
+        },
+    );
 
     let mut out = format!(
         "mas_post - session {session}, entry id={id}, round {}/{}, role {role:?}, kind {kind:?}",
@@ -570,6 +616,7 @@ pub fn read(root: &Path, args: &Value) -> Result<String, String> {
     let tag = optional_str(args, "tag");
     let since_id = args.get("since_id").and_then(Value::as_u64);
 
+    evict_session_cache(root, &session);
     let s = load_session(root, &session)?.ok_or_else(|| format!("session {session} not found"))?;
 
     let mut filtered: Vec<&Entry> = s.entries.iter().collect();
@@ -671,12 +718,19 @@ pub fn status(root: &Path, args: &Value) -> Result<String, String> {
 
     let rounds_left = s.max_rounds.saturating_sub(s.round);
     let hint = convergence_hint(&s);
+    let pending = effect_journal::pending_count(root, &session).unwrap_or(0);
+    let effects_line = if pending > 0 {
+        format!("pending_effect_writes: {pending} (finalize with effects: commit|recover)\n")
+    } else {
+        String::new()
+    };
     let out = format!(
         "mas_status - session {session}\n\
          status: {}\n\
          round: {}/{}\n\
          rounds_remaining: {rounds_left}\n\
          entry_cap_tokens: {}\n\
+         {effects_line}\
          entries_by_role:\n{count_lines}\
          convergence: {hint}\n",
         s.status,
@@ -857,6 +911,59 @@ pub fn finalize(root: &Path, args: &Value) -> Result<String, String> {
         .unwrap_or(true);
     let note_path = optional_str(args, "note_path");
     let note_heading = optional_str(args, "note_heading");
+    let effects = optional_str(args, "effects");
+
+    let pending = effect_journal::has_pending(root, &session)?;
+    let mut effect_lines = String::new();
+    if pending {
+        let decision = effects.ok_or_else(|| {
+            format!(
+                "session {session} has pending effect writes; pass effects: \"commit\" or \"recover\""
+            )
+        })?;
+        let paths = effect_journal::pending_paths(root, &session)?;
+        let msg = effect_journal::resolve_effects(root, &session, &decision)?;
+        if decision == "recover" && !paths.is_empty() {
+            let refs: Vec<&str> = paths.iter().map(|s| s.as_str()).collect();
+            coeffects::notify(
+                root,
+                "knowledge_upsert",
+                coeffects::NotifyCtx {
+                    rel_paths: &refs,
+                    session: Some(&session),
+                },
+            );
+        }
+        effect_lines.push_str(&msg);
+        effect_lines.push('\n');
+        if decision == "recover" {
+            stats::record(
+                "mas_finalize",
+                estimate_tokens(&result) as u64,
+                estimate_tokens(&effect_lines) as u64,
+            );
+            effect_lines.push_str(&format!(
+                "mas_finalize - session {session} not finalized (effects recovered)\n"
+            ));
+            return Ok(effect_lines);
+        }
+    } else if let Some(decision) = effects {
+        let paths = effect_journal::pending_paths(root, &session)?;
+        let msg = effect_journal::resolve_effects(root, &session, &decision)?;
+        if decision == "recover" && !paths.is_empty() {
+            let refs: Vec<&str> = paths.iter().map(|s| s.as_str()).collect();
+            coeffects::notify(
+                root,
+                "knowledge_upsert",
+                coeffects::NotifyCtx {
+                    rel_paths: &refs,
+                    session: Some(&session),
+                },
+            );
+        }
+        effect_lines.push_str(&msg);
+        effect_lines.push('\n');
+    }
 
     let mut s =
         load_session(root, &session)?.ok_or_else(|| format!("session {session} not found"))?;
@@ -871,12 +978,13 @@ pub fn finalize(root: &Path, args: &Value) -> Result<String, String> {
         save_session(root, &s)?;
     }
 
-    let mut out = format!(
+    let mut out = effect_lines;
+    out.push_str(&format!(
         "mas_finalize - session {session} marked final ({} entries, round {}/{})\n",
         s.entries.len(),
         s.round,
         s.max_rounds
-    );
+    ));
 
     if promote {
         let rel = note_path.unwrap_or_else(|| format!(".wordkeep/notes/mas-{session}.md"));
@@ -912,6 +1020,14 @@ pub fn finalize(root: &Path, args: &Value) -> Result<String, String> {
         distilled as u64,
         estimate_tokens(&out) as u64,
     );
+    coeffects::notify(
+        root,
+        "mas_finalize",
+        coeffects::NotifyCtx {
+            rel_paths: &[],
+            session: Some(&session),
+        },
+    );
     Ok(out)
 }
 
@@ -938,6 +1054,7 @@ pub fn session_handoff(root: &Path, args: &Value) -> Result<String, String> {
             "include_handoff_prompt": true,
             "note_path": optional_str(args, "note_path"),
             "note_heading": optional_str(args, "note_heading"),
+            "effects": optional_str(args, "effects"),
         });
         return finalize(root, &fin_args);
     }

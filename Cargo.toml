@@ -38,6 +38,7 @@ dashboard = ["dep:ratatui"]
 [dependencies]
 serde_json = "1"
 walkdir = "2"
+fs2 = "0.4"
 wordkeep-knowledge = { path = "crates/wordkeep-knowledge" }
 tree-sitter = "0.25"
 tree-sitter-cpp = "0.23"

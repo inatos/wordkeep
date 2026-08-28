@@ -7,7 +7,7 @@ use serde_json::Value;
 
 use crate::walk;
 
-const CONFIG_REL: &str = ".wordkeep/config.json";
+pub const CONFIG_REL: &str = ".wordkeep/config.json";
 
 /// Reject absolute paths and `..` traversal. Returns a normalized forward-slash path.
 pub fn validate_rel_path(rel: &str) -> Result<String, String> {
@@ -426,7 +426,7 @@ pub fn rel_path(root: &Path, path: &Path) -> String {
 /// Appended to symbol_context not-found lines.
 pub fn symbol_not_found_hint(paths: &[String]) -> String {
     format!(
-        "Hint: broaden with paths:[...] or profile, or set default_paths in .wordkeep/config.json \
+        "Hint: broaden with paths:[...] or profile, or profile_upsert to add a missing tree \
          (currently searching {paths:?}); names match on the trailing :: segment."
     )
 }
@@ -437,12 +437,13 @@ pub fn coverage_hint(root: &Path, paths: &[String]) -> String {
     let profiles = list_profile_names(root);
     if profiles.is_empty() {
         return format!(
-            "Hint: zero results under {paths:?}; broaden paths or check index_stale after a large diff."
+            "Hint: zero results under {paths:?}; broaden paths, call profile_upsert, \
+             or check index_stale after a large diff."
         );
     }
     format!(
         "Hint: zero results under {paths:?}; try profile one of {:?} or broaden paths; \
-         check index_stale after a large diff.",
+         use profile_upsert to persist a new tree; check index_stale after a large diff.",
         profiles
     )
 }

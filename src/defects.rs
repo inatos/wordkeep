@@ -7,7 +7,7 @@
 use serde_json::{json, Value};
 use std::path::Path;
 
-use crate::{stats, workspace};
+use crate::{coeffects, stats, workspace};
 
 const STORE_VERSION: u64 = 1;
 const REL: &str = ".wordkeep/defects.json";
@@ -224,6 +224,7 @@ pub fn upsert(root: &Path, args: &Value) -> Result<String, String> {
         "created"
     };
     save_all(root, &defects)?;
+    coeffects::notify(root, "defect_upsert", coeffects::NotifyCtx::EMPTY);
     let out = format!("defect_upsert - {action} {id} status={status} {summary}");
     stats::record("defect_upsert", 64, (out.len() / 4) as u64);
     Ok(out)

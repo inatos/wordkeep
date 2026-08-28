@@ -4,7 +4,8 @@
 //! language-aware without each one re-deriving the extension table.
 //!
 //! Polyglot repos commonly mix C/C++, Rust, Python, C#, GLSL shaders, and
-//! TypeScript/TSX/Svelte; some also ship Daslang (`.das`) scripts. C/C++, Rust,
+//! TypeScript/TSX/Svelte (plus plain `.js` / `.mjs` / `.cjs` via the TypeScript
+//! grammar); some also ship Daslang (`.das`) scripts. C/C++, Rust,
 //! Python, C#, GLSL, and TypeScript all have tree-sitter grammars, so they get exact
 //! extraction (GLSL via `tree-sitter-glsl`, a `tree-sitter-c` fork sharing the C
 //! node kinds; TSX and Svelte ride the TypeScript grammar). Svelte single-file
@@ -61,7 +62,7 @@ impl Lang {
             "glsl" | "vert" | "frag" | "comp" | "geom" | "tesc" | "tese" | "vs" | "fs" => {
                 Lang::Glsl
             }
-            "ts" | "mts" | "cts" => Lang::Ts,
+            "ts" | "mts" | "cts" | "js" | "mjs" | "cjs" => Lang::Ts,
             "tsx" => Lang::Tsx,
             "svelte" => Lang::Svelte,
             "cs" => Lang::CSharp,
@@ -151,6 +152,9 @@ mod tests {
         assert_eq!(Lang::from_ext("frag"), Some(Lang::Glsl));
         assert_eq!(Lang::from_ext("ts"), Some(Lang::Ts));
         assert_eq!(Lang::from_ext("mts"), Some(Lang::Ts));
+        assert_eq!(Lang::from_ext("js"), Some(Lang::Ts));
+        assert_eq!(Lang::from_ext("mjs"), Some(Lang::Ts));
+        assert_eq!(Lang::from_ext("cjs"), Some(Lang::Ts));
         assert_eq!(Lang::from_ext("tsx"), Some(Lang::Tsx));
         assert_eq!(Lang::from_ext("svelte"), Some(Lang::Svelte));
         assert_eq!(Lang::from_ext("cs"), Some(Lang::CSharp));

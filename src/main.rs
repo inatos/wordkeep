@@ -63,6 +63,7 @@ mod big_functions;
 mod cache;
 mod call_graph;
 mod call_path;
+mod coeffects;
 mod commit_scope;
 mod config;
 #[cfg(feature = "dashboard")]
@@ -71,6 +72,7 @@ mod dead_code;
 mod defects;
 mod diff_map;
 mod doc_comment;
+mod effect_journal;
 mod include_graph;
 mod incremental;
 mod index_stale;
@@ -81,6 +83,7 @@ mod mas;
 mod mcp;
 mod module_map;
 mod outline;
+mod profile_upsert;
 mod repo_map;
 mod runs;
 mod runtime;
@@ -213,7 +216,8 @@ fn main() {
     let root_run_history = root.clone();
     let root_artifact_index = root.clone();
     let root_session_pressure = root.clone();
-    let root_commit_scope = root;
+    let root_commit_scope = root.clone();
+    let root_profile_upsert = root;
 
     let raw_tools = vec![
         mcp::Tool {
@@ -660,7 +664,9 @@ fn main() {
                     "symptom": { "type": "string", "description": "Required for mode pitfall - what the user sees." },
                     "root_cause": { "type": "string", "description": "Required for mode pitfall - why it happens." },
                     "fix": { "type": "string", "description": "Required for mode pitfall - verified fix." },
-                    "test_tag": { "type": "string", "description": "Optional Catch2 tag for mode pitfall (e.g. unit)." }
+                    "test_tag": { "type": "string", "description": "Optional Catch2 tag for mode pitfall (e.g. unit)." },
+                    "effect_session": { "type": "string",
+                                        "description": "Optional MAS session slug. When set, the write is journaled for revertible effects; session must exist and be open." }
                 },
                 "required": ["path"]
             }),
@@ -938,7 +944,10 @@ fn main() {
                     "note_path": { "type": "string",
                                    "description": "Relative note path when promote is true. Default .wordkeep/notes/mas-<session>.md." },
                     "note_heading": { "type": "string",
-                                      "description": "Section heading when promote is true." }
+                                      "description": "Section heading when promote is true." },
+                    "effects": { "type": "string",
+                                 "enum": ["commit", "recover"],
+                                 "description": "When the session has pending effect_session writes, required: commit (keep writes) or recover (LIFO revert before finalize)." }
                 },
                 "required": ["session", "result"]
             }),
@@ -958,7 +967,10 @@ fn main() {
                     "finalize": { "type": "boolean", "description": "Also finalize the session. Default false." },
                     "promote": { "type": "boolean", "description": "When finalize, promote to notes." },
                     "note_path": { "type": "string" },
-                    "note_heading": { "type": "string" }
+                    "note_heading": { "type": "string" },
+                    "effects": { "type": "string",
+                                 "enum": ["commit", "recover"],
+                                 "description": "When finalize:true and pending effect_session writes exist." }
                 },
                 "required": ["session"]
             }),
@@ -1084,6 +1096,37 @@ fn main() {
             }),
             handler: Box::new(move |args| commit_scope::propose(&root_commit_scope, args)),
         },
+        mcp::Tool {
+            name: "profile_upsert",
+            description: "Propose or persist a path_profiles entry in .wordkeep/config.json so \
+                          symbol tools can search a new tree via profile:\"name\". Default mode \
+                          propose is dry-run; mode apply writes path_profiles, profile_hints, and \
+                          commit_scopes. Derives the profile name from paths (web/bifrost → bifrost). \
+                          Optional symbol scans unprofiled web/*, tools/*, assets/scripts for hits. \
+                          Never changes default_profile unless set_default:true.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "mode": { "type": "string", "enum": ["propose", "apply"],
+                              "description": "propose (default) dry-run; apply writes config.json." },
+                    "paths": { "type": "array", "items": { "type": "string" },
+                               "description": "Repo-relative roots to include (e.g. web/bifrost)." },
+                    "name": { "type": "string",
+                              "description": "Profile name. Default: deepest path segment." },
+                    "hints": { "type": "array", "items": { "type": "string" },
+                               "description": "Extra profile_hints keywords." },
+                    "symbol": { "type": "string",
+                                "description": "If paths omitted, discover unprofiled trees where this symbol hits." },
+                    "query": { "type": "string",
+                               "description": "Optional tokens to seed profile_hints." },
+                    "force": { "type": "boolean",
+                               "description": "Overwrite an existing profile name. Default false." },
+                    "set_default": { "type": "boolean",
+                                     "description": "Also set default_profile to this name. Default false." }
+                }
+            }),
+            handler: Box::new(move |args| profile_upsert::run(&root_profile_upsert, args)),
+        },
     ];
 
     stats::init_registry(raw_tools.iter().map(|t| t.name).collect());
@@ -1102,13 +1145,23 @@ fn main() {
         .collect();
 
     const README_RESOURCE: &str = include_str!("../README.md");
-    let resources = vec![mcp::Resource {
-        uri: "wordkeep://readme",
-        name: "Wordkeep README",
-        description: "Canonical Wordkeep README (also accepted as wordkeep://README).",
-        mime_type: "text/markdown",
-        text: README_RESOURCE,
-    }];
+    const CAPABILITIES_RESOURCE: &str = include_str!("../resources/capabilities.json");
+    let resources = vec![
+        mcp::Resource {
+            uri: "wordkeep://readme",
+            name: "Wordkeep README",
+            description: "Canonical Wordkeep README (also accepted as wordkeep://README).",
+            mime_type: "text/markdown",
+            text: README_RESOURCE,
+        },
+        mcp::Resource {
+            uri: "wordkeep://capabilities",
+            name: "Wordkeep capabilities manifest",
+            description: "Static effect/coeffect manifest for write tools (FIG-2026-005 Phase 2).",
+            mime_type: "application/json",
+            text: CAPABILITIES_RESOURCE,
+        },
+    ];
 
     let server = mcp::Server {
         tools,

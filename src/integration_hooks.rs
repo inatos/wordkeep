@@ -56,11 +56,18 @@ pub fn find(root: &Path, args: &Value) -> Result<String, String> {
         ));
     } else {
         let sections = split_sections(&src);
-        let q = query.to_lowercase();
+        let q_tokens: Vec<String> = query
+            .split_whitespace()
+            .map(|t| t.to_lowercase())
+            .filter(|t| !t.is_empty())
+            .collect();
         let mut matched = 0usize;
         for sec in &sections {
-            if !q.is_empty() && !sec.to_lowercase().contains(&q) {
-                continue;
+            if !q_tokens.is_empty() {
+                let lower = sec.to_lowercase();
+                if !q_tokens.iter().all(|t| lower.contains(t)) {
+                    continue;
+                }
             }
             if from.is_some() || to.is_some() {
                 let lower = sec.to_lowercase();
@@ -146,6 +153,10 @@ mod tests {
         .unwrap();
         let out = find(&dir, &json!({ "query": "render" })).unwrap();
         assert!(out.contains("A → B"), "{out}");
+        let multi = find(&dir, &json!({ "query": "a b tags" })).unwrap();
+        assert!(multi.contains("A → B"), "token AND should match: {multi}");
+        let miss = find(&dir, &json!({ "query": "render water" })).unwrap();
+        assert!(miss.contains("no matching hooks"), "{miss}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

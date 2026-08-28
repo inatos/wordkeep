@@ -86,6 +86,16 @@ impl DiskMap {
         self.dirty = true;
     }
 
+    /// Remove an entry; returns whether a key was present.
+    pub fn remove(&mut self, key: &str) -> bool {
+        if self.map.remove(key).is_some() {
+            self.dirty = true;
+            true
+        } else {
+            false
+        }
+    }
+
     /// Flush atomically (temp file + rename) when something changed since load.
     pub fn save(&mut self) {
         if !self.dirty {
@@ -126,10 +136,12 @@ mod tests {
         m.put("a", 100, json!(["x", "y"]));
         m.save();
 
-        let reloaded = DiskMap::load_path(path.clone());
+        let mut reloaded = DiskMap::load_path(path.clone());
         assert_eq!(reloaded.get("a", 100), Some(&json!(["x", "y"])));
         // Stale mtime is a miss, not a hit.
         assert!(reloaded.get("a", 101).is_none());
+        reloaded.remove("a");
+        assert!(!reloaded.get("a", 100).is_some());
 
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }

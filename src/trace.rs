@@ -18,6 +18,7 @@ use std::path::{Path, PathBuf};
 
 use crate::stats;
 
+#[derive(Debug)]
 struct Row {
     name: String,
     src_file: String,
@@ -289,16 +290,35 @@ fn rel_to(root: &Path, p: &Path) -> String {
 
 fn parse(text: &str) -> Result<Vec<Row>, String> {
     let mut lines = text.lines();
-    let header = lines.next().ok_or("empty file")?;
-    let cols: Vec<&str> = header.split(',').collect();
-    let idx = |name: &str| cols.iter().position(|c| c.trim() == name);
-    let i_name = idx("name").ok_or("missing 'name' column")?;
-    let i_total = idx("total_ns").ok_or("missing 'total_ns' column")?;
-    let i_file = idx("src_file");
-    let i_line = idx("src_line");
-    let i_counts = idx("counts");
-    let i_mean = idx("mean_ns");
-    let i_max = idx("max_ns");
+    let header = lines.next().ok_or_else(|| {
+        "empty file (expected Tracy csvexport header with name/zone + total_ns)".to_string()
+    })?;
+    let cols: Vec<&str> = header.split(',').map(str::trim).collect();
+    let idx_any = |aliases: &[&str]| -> Option<usize> {
+        cols.iter().position(|c| {
+            let lower = c.to_ascii_lowercase();
+            aliases.iter().any(|a| lower == *a)
+        })
+    };
+    let i_name = idx_any(&["name", "zone", "zonename", "label"]).ok_or_else(|| {
+        format!(
+            "invalid trace CSV: missing name/zone column (expected Tracy csvexport; got header: {})",
+            truncate(header, 120)
+        )
+    })?;
+    let i_total = idx_any(&["total_ns", "time", "time_ns", "total", "duration_ns"]).ok_or_else(
+        || {
+            format!(
+                "invalid trace CSV: missing total_ns/time column (expected Tracy csvexport; got header: {})",
+                truncate(header, 120)
+            )
+        },
+    )?;
+    let i_file = idx_any(&["src_file", "file", "source", "src"]);
+    let i_line = idx_any(&["src_line", "line", "lineno"]);
+    let i_counts = idx_any(&["counts", "count", "calls"]);
+    let i_mean = idx_any(&["mean_ns", "mean", "avg_ns", "average_ns"]);
+    let i_max = idx_any(&["max_ns", "max", "peak_ns"]);
 
     let mut rows = Vec::new();
     for line in lines {
@@ -306,12 +326,16 @@ fn parse(text: &str) -> Result<Vec<Row>, String> {
             continue;
         }
         let f: Vec<&str> = line.split(',').collect();
-        if f.len() < cols.len() {
+        if f.len() < cols.len().min(i_name.max(i_total) + 1) {
             continue;
         }
         let get = |i: Option<usize>| i.and_then(|i| f.get(i)).copied().unwrap_or("").trim();
+        let name = f.get(i_name).copied().unwrap_or("").trim().to_string();
+        if name.is_empty() {
+            continue;
+        }
         rows.push(Row {
-            name: f.get(i_name).copied().unwrap_or("").trim().to_string(),
+            name,
             src_file: get(i_file).to_string(),
             src_line: get(i_line).to_string(),
             total_ns: f
@@ -322,6 +346,12 @@ fn parse(text: &str) -> Result<Vec<Row>, String> {
             mean_ns: get(i_mean).parse().unwrap_or(0.0),
             max_ns: get(i_max).parse().unwrap_or(0.0),
         });
+    }
+    if rows.is_empty() {
+        return Err(
+            "invalid trace CSV: header present but no data rows (check export or pick another file)"
+                .into(),
+        );
     }
     Ok(rows)
 }
@@ -410,6 +440,30 @@ mod tests {
         assert_eq!(r.counts, 100);
         assert_eq!(r.mean_ns, 20.0);
         assert_eq!(r.max_ns, 40.0);
+    }
+
+    #[test]
+    fn parse_accepts_zone_and_time_aliases() {
+        let text = "zone,file,line,time,count\nPhysicsStep,/a/phys.cpp,12,2000,100\n";
+        let rows = parse(text).unwrap();
+        assert_eq!(rows[0].name, "PhysicsStep");
+        assert_eq!(rows[0].total_ns, 2000.0);
+        assert_eq!(rows[0].counts, 100);
+        assert_eq!(rows[0].src_file, "/a/phys.cpp");
+    }
+
+    #[test]
+    fn parse_missing_name_is_invalid_guidance() {
+        let err = parse("total_ns,counts\n100,1\n").unwrap_err();
+        assert!(err.contains("invalid trace CSV"), "{err}");
+        assert!(err.contains("name/zone"), "{err}");
+    }
+
+    #[test]
+    fn parse_missing_total_is_invalid_guidance() {
+        let err = parse("name,counts\nPhysicsStep,1\n").unwrap_err();
+        assert!(err.contains("invalid trace CSV"), "{err}");
+        assert!(err.contains("total_ns"), "{err}");
     }
 
     #[test]

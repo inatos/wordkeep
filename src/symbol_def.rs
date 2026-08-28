@@ -278,12 +278,18 @@ fn def_name(node: Node, lang: Lang, bytes: &[u8]) -> Option<(String, DefKind)> {
                 named("name", DefKind::Record)
             }
             "enum_specifier" => named("name", DefKind::Record),
+            // Flecs `ecs.system("Name")` / Tracy `ZoneScopedN("Name")` string names.
+            "string_literal" => {
+                flecs_tracy_system_name(node, bytes).map(|n| (n, DefKind::Other))
+            }
             _ => None,
         },
         Lang::Rust => match node.kind() {
             "function_item" | "function_signature_item" => named("name", DefKind::Function),
             "struct_item" | "enum_item" | "union_item" => named("name", DefKind::Record),
-            "trait_item" | "type_item" => named("name", DefKind::Other),
+            "trait_item" | "type_item" | "const_item" | "static_item" => {
+                named("name", DefKind::Other)
+            }
             _ => None,
         },
         Lang::Python => match node.kind() {
@@ -327,6 +333,70 @@ fn def_name(node: Node, lang: Lang, bytes: &[u8]) -> Option<(String, DefKind)> {
             _ => None,
         },
         Lang::Daslang => None,
+    }
+}
+
+/// If `node` is a string literal naming a Flecs `ecs.system("…")` or Tracy
+/// `ZoneScopedN("…")` / `ZoneNamedN("…")` site, return the unquoted name.
+/// Other string literals return `None` so ordinary string content stays invisible.
+pub(crate) fn flecs_tracy_system_name(node: Node, bytes: &[u8]) -> Option<String> {
+    if node.kind() != "string_literal" {
+        return None;
+    }
+    let raw = text(node, bytes).trim();
+    let name = raw
+        .strip_prefix('"')
+        .and_then(|s| s.strip_suffix('"'))
+        .unwrap_or(raw);
+    if name.is_empty()
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_')
+    {
+        return None;
+    }
+    let args = node.parent()?;
+    if args.kind() != "argument_list" {
+        return None;
+    }
+    // Only the first string argument (the system/zone name).
+    let mut cursor = args.walk();
+    let first_str = args
+        .named_children(&mut cursor)
+        .find(|ch| ch.kind() == "string_literal");
+    if first_str != Some(node) {
+        return None;
+    }
+    let call = args.parent()?;
+    if call.kind() != "call_expression" {
+        return None;
+    }
+    let func = call.child_by_field_name("function")?;
+    if flecs_tracy_callee_is_named_zone(func, bytes) {
+        Some(name.to_string())
+    } else {
+        None
+    }
+}
+
+fn flecs_tracy_callee_is_named_zone(func: Node, bytes: &[u8]) -> bool {
+    match func.kind() {
+        "identifier" => {
+            let n = text(func, bytes);
+            matches!(n, "ZoneScopedN" | "ZoneNamedN" | "system")
+        }
+        "field_expression" => func
+            .child_by_field_name("field")
+            .map(|f| text(f, bytes) == "system")
+            .unwrap_or(false),
+        "qualified_identifier" => func
+            .child_by_field_name("name")
+            .map(|n| {
+                let t = text(n, bytes);
+                matches!(t, "ZoneScopedN" | "ZoneNamedN")
+            })
+            .unwrap_or(false),
+        _ => false,
     }
 }
 
@@ -662,6 +732,39 @@ mod tests {
     fn is_exported_rust_pub_fn() {
         assert!(exported_in("pub fn open() {}", Lang::Rust));
         assert!(!exported_in("fn hidden() {}", Lang::Rust));
+    }
+
+    #[test]
+    fn rust_const_item_is_located() {
+        let src = "pub const INPUT_SPIN: u8 = 1 << 5;\n";
+        let mut parser = Parser::new();
+        let lang = Lang::Rust;
+        parser
+            .set_language(&lang.ts_language().unwrap())
+            .unwrap();
+        let tree = parser.parse(src, None).unwrap();
+        let bytes = src.as_bytes();
+        let found = find_def(tree.root_node(), lang, bytes, "INPUT_SPIN");
+        assert!(found.is_some(), "const should be a definition");
+        let (_node, kind, name) = found.unwrap();
+        assert_eq!(kind, DefKind::Other);
+        assert_eq!(name, "INPUT_SPIN");
+    }
+
+    #[test]
+    fn flecs_system_string_is_located() {
+        let src = r#"void Register() { ecs.system("LightCollect").run([]{}); }"#;
+        let mut parser = Parser::new();
+        let lang = Lang::Cpp;
+        parser
+            .set_language(&lang.ts_language().unwrap())
+            .unwrap();
+        let tree = parser.parse(src, None).unwrap();
+        let found = find_def(tree.root_node(), lang, src.as_bytes(), "LightCollect");
+        assert!(found.is_some(), "Flecs system string should locate");
+        let (_n, kind, name) = found.unwrap();
+        assert_eq!(kind, DefKind::Other);
+        assert_eq!(name, "LightCollect");
     }
 
     #[test]

@@ -109,6 +109,7 @@ struct Tool {
     cache_hits: u64,
     cache_misses: u64,
     invalid_count: u64,
+    not_found_count: u64,
 }
 
 impl Tool {
@@ -137,7 +138,8 @@ impl Tool {
             Outcome::Truncated => self.trunc_count += 1,
             Outcome::Error => self.error_count += 1,
             Outcome::LowYield => self.low_yield_count += 1,
-            Outcome::NotFound | Outcome::Invalid => self.invalid_count += 1,
+            Outcome::NotFound => self.not_found_count += 1,
+            Outcome::Invalid => self.invalid_count += 1,
             Outcome::Empty | Outcome::Ok => {}
         }
     }
@@ -174,6 +176,7 @@ impl Tool {
             "cache_hits": self.cache_hits,
             "cache_misses": self.cache_misses,
             "invalid_count": self.invalid_count,
+            "not_found_count": self.not_found_count,
         })
     }
 }
@@ -439,6 +442,7 @@ fn tool_from_value(tv: &Value) -> Tool {
         cache_hits: field(tv, "cache_hits"),
         cache_misses: field(tv, "cache_misses"),
         invalid_count: field(tv, "invalid_count"),
+        not_found_count: field(tv, "not_found_count"),
     }
 }
 
@@ -1131,6 +1135,20 @@ fn render_insights(now: u64, tools: &BTreeMap<String, Tool>, registry: &[&'stati
         signals.push_str(&format!("invalid-prone: {}\n", invalid_tools.join(", ")));
     }
 
+    let not_found_tools: Vec<&str> = tools
+        .iter()
+        .filter(|(_, t)| {
+            t.calls >= ERROR_MIN_CALLS && t.not_found_count * 100 / t.calls >= ERROR_RATE_PCT
+        })
+        .map(|(n, _)| n.as_str())
+        .collect();
+    if !not_found_tools.is_empty() {
+        signals.push_str(&format!(
+            "not-found-prone: {}\n",
+            not_found_tools.join(", ")
+        ));
+    }
+
     let inverted: Vec<&str> = tools
         .iter()
         .filter(|(_, t)| is_net_negative(t.baseline_tokens, t.returned_tokens))
@@ -1314,7 +1332,8 @@ mod tests {
         assert_eq!(t.peak_ms(), 150);
         assert_eq!(t.trunc_count, 1);
         assert_eq!(t.error_count, 1);
-        assert_eq!(t.invalid_count, 1);
+        assert_eq!(t.not_found_count, 1);
+        assert_eq!(t.invalid_count, 0);
         assert_eq!(t.avg_ms(), 55);
     }
 
