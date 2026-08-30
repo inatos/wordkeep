@@ -24,4 +24,5 @@ wordkeep-knowledge = { path = "../wordkeep-knowledge" }
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_System_Diagnostics_Etw",
+    "Win32_System_Time",
 ] }

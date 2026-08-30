@@ -111,11 +111,14 @@ mod tests {
         assert!(peek_bytes(std::process::id(), 0, 0).is_err());
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn peeks_own_maps_text() {
         let pid = std::process::id();
-        let maps = std::fs::read_to_string(format!("/proc/{pid}/maps")).unwrap();
+        let maps = match std::fs::read_to_string(format!("/proc/{pid}/maps")) {
+            Ok(text) => text,
+            Err(_) => return, // no /proc (containers, hardened hosts)
+        };
         // First readable file-backed mapping start.
         let mut addr = None;
         for line in maps.lines() {
