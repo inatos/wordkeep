@@ -918,10 +918,8 @@ fn classify_rust(node: Node) -> Role {
     // Function / const / static definition names are `identifier` children.
     if node.kind() == "identifier" {
         if let Some(p) = node.parent() {
-            if matches!(
-                p.kind(),
-                "function_item" | "const_item" | "static_item"
-            ) && p.child_by_field_name("name") == Some(node)
+            if matches!(p.kind(), "function_item" | "const_item" | "static_item")
+                && p.child_by_field_name("name") == Some(node)
             {
                 return Role::Def;
             }
@@ -1113,7 +1111,11 @@ mod tests {
     #[test]
     fn rust_const_and_static_are_defs() {
         assert_eq!(
-            roles_in("pub const INPUT_SPIN: u8 = 1 << 5;\n", "INPUT_SPIN", Lang::Rust),
+            roles_in(
+                "pub const INPUT_SPIN: u8 = 1 << 5;\n",
+                "INPUT_SPIN",
+                Lang::Rust
+            ),
             vec![Role::Def]
         );
         let rs = roles_in(

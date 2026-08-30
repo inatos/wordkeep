@@ -29,10 +29,7 @@ pub fn run(root: &Path, args: &Value) -> Result<String, String> {
         ));
     }
 
-    let force = args
-        .get("force")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
+    let force = args.get("force").and_then(Value::as_bool).unwrap_or(false);
     let set_default = args
         .get("set_default")
         .and_then(Value::as_bool)
@@ -170,9 +167,7 @@ fn sanitize_profile_name(name: &str) -> Result<String, String> {
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
     {
-        return Err(format!(
-            "name must be alphanumeric/[_-]: {name:?}"
-        ));
+        return Err(format!("name must be alphanumeric/[_-]: {name:?}"));
     }
     Ok(n)
 }
@@ -268,7 +263,7 @@ fn discover_paths_for_symbol(root: &Path, symbol: &str) -> Result<Vec<String>, S
 
     let mut hits = Vec::new();
     for cand in candidates {
-        let (files, _) = symbol_refs::refs_by_file(root, symbol, &[cand.clone()]);
+        let (files, _) = symbol_refs::refs_by_file(root, symbol, std::slice::from_ref(&cand));
         if !files.is_empty() {
             hits.push(cand);
         }
@@ -302,7 +297,9 @@ fn covered_path_prefixes(root: &Path) -> Vec<String> {
 
 fn is_covered(rel: &str, covered: &[String]) -> bool {
     let r = rel.trim_end_matches('/');
-    covered.iter().any(|c| r == c || r.starts_with(&format!("{c}/")) || c.starts_with(&format!("{r}/")))
+    covered
+        .iter()
+        .any(|c| r == c || r.starts_with(&format!("{c}/")) || c.starts_with(&format!("{r}/")))
 }
 
 fn apply_patch(
@@ -315,8 +312,8 @@ fn apply_patch(
 ) -> Result<(), String> {
     let cfg_path = root.join(CONFIG_REL);
     let mut cfg: Value = if cfg_path.exists() {
-        let raw = std::fs::read_to_string(&cfg_path)
-            .map_err(|e| format!("read {CONFIG_REL}: {e}"))?;
+        let raw =
+            std::fs::read_to_string(&cfg_path).map_err(|e| format!("read {CONFIG_REL}: {e}"))?;
         serde_json::from_str(&raw).map_err(|e| format!("parse {CONFIG_REL}: {e}"))?
     } else {
         json!({})
@@ -326,10 +323,14 @@ fn apply_patch(
     }
     let obj = cfg.as_object_mut().unwrap();
 
-    ensure_object(obj, "path_profiles")
-        .insert(name.to_string(), Value::Array(paths.iter().cloned().map(Value::String).collect()));
-    ensure_object(obj, "profile_hints")
-        .insert(name.to_string(), Value::Array(hints.iter().cloned().map(Value::String).collect()));
+    ensure_object(obj, "path_profiles").insert(
+        name.to_string(),
+        Value::Array(paths.iter().cloned().map(Value::String).collect()),
+    );
+    ensure_object(obj, "profile_hints").insert(
+        name.to_string(),
+        Value::Array(hints.iter().cloned().map(Value::String).collect()),
+    );
     ensure_object(obj, "commit_scopes").insert(
         name.to_string(),
         Value::Array(commit_paths.iter().cloned().map(Value::String).collect()),
@@ -342,7 +343,8 @@ fn apply_patch(
         std::fs::create_dir_all(parent).map_err(|e| format!("mkdir .wordkeep: {e}"))?;
     }
     let pretty = serde_json::to_string_pretty(&cfg).map_err(|e| format!("serialize: {e}"))?;
-    std::fs::write(&cfg_path, format!("{pretty}\n")).map_err(|e| format!("write {CONFIG_REL}: {e}"))?;
+    std::fs::write(&cfg_path, format!("{pretty}\n"))
+        .map_err(|e| format!("write {CONFIG_REL}: {e}"))?;
     Ok(())
 }
 
@@ -369,10 +371,7 @@ mod tests {
 
     #[test]
     fn derive_name_from_deepest_segment() {
-        assert_eq!(
-            derive_name(&["web/bifrost".into()]).unwrap(),
-            "bifrost"
-        );
+        assert_eq!(derive_name(&["web/bifrost".into()]).unwrap(), "bifrost");
         assert_eq!(derive_name(&["tools/kkbp/".into()]).unwrap(), "kkbp");
     }
 
@@ -386,11 +385,7 @@ mod tests {
         )
         .unwrap();
         let before = fs::read_to_string(dir.join(".wordkeep/config.json")).unwrap();
-        let out = run(
-            &dir,
-            &json!({"mode":"propose","paths":["web/bifrost"]}),
-        )
-        .unwrap();
+        let out = run(&dir, &json!({"mode":"propose","paths":["web/bifrost"]})).unwrap();
         assert!(out.contains("dry-run"), "{out}");
         assert!(out.contains("bifrost"), "{out}");
         assert_eq!(
@@ -420,7 +415,10 @@ mod tests {
                 .unwrap();
         assert_eq!(cfg["keep"], true);
         assert_eq!(cfg["path_profiles"]["bifrost"][0], "web/bifrost");
-        assert!(cfg["profile_hints"]["bifrost"].as_array().unwrap().len() >= 1);
+        assert!(!cfg["profile_hints"]["bifrost"]
+            .as_array()
+            .unwrap()
+            .is_empty());
         assert_eq!(cfg["commit_scopes"]["bifrost"][0], "web/bifrost/");
 
         let err = run(

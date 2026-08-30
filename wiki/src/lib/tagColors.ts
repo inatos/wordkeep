@@ -1,4 +1,6 @@
-/** Client-side tag → color map (localStorage). Does not alter Markdown frontmatter. */
+/** Client-side tag → color map (safeStorage). Does not alter Markdown frontmatter. */
+
+import { safeStorage } from './safeStorage';
 
 const STORAGE_KEY = 'wordkeep-wiki-tag-colors';
 
@@ -45,7 +47,7 @@ function hslToHex(h: number, s: number, l: number): string {
 
 export function loadTagColors(): TagColorMap {
   try {
-    const raw = localStorage.getItem(STORAGE_KEY);
+    const raw = safeStorage.getItem(STORAGE_KEY);
     if (!raw) return {};
     const parsed = JSON.parse(raw) as unknown;
     if (!parsed || typeof parsed !== 'object') return {};
@@ -62,7 +64,7 @@ export function loadTagColors(): TagColorMap {
 }
 
 export function saveTagColors(map: TagColorMap): void {
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(map));
+  safeStorage.setItem(STORAGE_KEY, JSON.stringify(map));
 }
 
 export function resolveTagColor(map: TagColorMap, tag: string): string {

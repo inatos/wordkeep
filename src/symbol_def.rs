@@ -279,9 +279,7 @@ fn def_name(node: Node, lang: Lang, bytes: &[u8]) -> Option<(String, DefKind)> {
             }
             "enum_specifier" => named("name", DefKind::Record),
             // Flecs `ecs.system("Name")` / Tracy `ZoneScopedN("Name")` string names.
-            "string_literal" => {
-                flecs_tracy_system_name(node, bytes).map(|n| (n, DefKind::Other))
-            }
+            "string_literal" => flecs_tracy_system_name(node, bytes).map(|n| (n, DefKind::Other)),
             _ => None,
         },
         Lang::Rust => match node.kind() {
@@ -348,11 +346,7 @@ pub(crate) fn flecs_tracy_system_name(node: Node, bytes: &[u8]) -> Option<String
         .strip_prefix('"')
         .and_then(|s| s.strip_suffix('"'))
         .unwrap_or(raw);
-    if name.is_empty()
-        || !name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_')
-    {
+    if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
         return None;
     }
     let args = node.parent()?;
@@ -739,9 +733,7 @@ mod tests {
         let src = "pub const INPUT_SPIN: u8 = 1 << 5;\n";
         let mut parser = Parser::new();
         let lang = Lang::Rust;
-        parser
-            .set_language(&lang.ts_language().unwrap())
-            .unwrap();
+        parser.set_language(&lang.ts_language().unwrap()).unwrap();
         let tree = parser.parse(src, None).unwrap();
         let bytes = src.as_bytes();
         let found = find_def(tree.root_node(), lang, bytes, "INPUT_SPIN");
@@ -756,9 +748,7 @@ mod tests {
         let src = r#"void Register() { ecs.system("LightCollect").run([]{}); }"#;
         let mut parser = Parser::new();
         let lang = Lang::Cpp;
-        parser
-            .set_language(&lang.ts_language().unwrap())
-            .unwrap();
+        parser.set_language(&lang.ts_language().unwrap()).unwrap();
         let tree = parser.parse(src, None).unwrap();
         let found = find_def(tree.root_node(), lang, src.as_bytes(), "LightCollect");
         assert!(found.is_some(), "Flecs system string should locate");

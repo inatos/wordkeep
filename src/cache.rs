@@ -141,7 +141,7 @@ mod tests {
         // Stale mtime is a miss, not a hit.
         assert!(reloaded.get("a", 101).is_none());
         reloaded.remove("a");
-        assert!(!reloaded.get("a", 100).is_some());
+        assert!(reloaded.get("a", 100).is_none());
 
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }

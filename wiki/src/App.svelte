@@ -45,6 +45,7 @@
     type TagColorMap,
   } from './lib/tagColors';
   import CollapsibleSection from './lib/CollapsibleSection.svelte';
+  import { safeSessionStorage, safeStorage } from './lib/safeStorage';
   import BarChart from './lib/charts/BarChart.svelte';
   import DonutChart from './lib/charts/DonutChart.svelte';
   import Sparkline from './lib/charts/Sparkline.svelte';
@@ -151,13 +152,13 @@
   const AUTOSAVE_MS = 450;
 
   onMount(() => {
-    const stored = Number(localStorage.getItem(SIDEBAR_KEY));
+    const stored = Number(safeStorage.getItem(SIDEBAR_KEY));
     if (Number.isFinite(stored)) {
       sidebarWidth = clampSidebar(stored);
     }
-    sidebarCollapsed = localStorage.getItem(SIDEBAR_COLLAPSED_KEY) === '1';
+    sidebarCollapsed = safeStorage.getItem(SIDEBAR_COLLAPSED_KEY) === '1';
     try {
-      const raw = localStorage.getItem(TREE_COLLAPSED_KEY);
+      const raw = safeStorage.getItem(TREE_COLLAPSED_KEY);
       if (raw) {
         const parsed = JSON.parse(raw);
         if (Array.isArray(parsed)) collapsedDirs = new Set(parsed.filter((k) => typeof k === 'string'));
@@ -166,7 +167,7 @@
       /* ignore bad cache */
     }
     try {
-      const raw = localStorage.getItem(EDITOR_TABS_KEY);
+      const raw = safeStorage.getItem(EDITOR_TABS_KEY);
       if (raw) {
         const parsed = JSON.parse(raw);
         if (Array.isArray(parsed)) {
@@ -312,7 +313,7 @@
 
   function toggleSidebarCollapsed() {
     sidebarCollapsed = !sidebarCollapsed;
-    localStorage.setItem(SIDEBAR_COLLAPSED_KEY, sidebarCollapsed ? '1' : '0');
+    safeStorage.setItem(SIDEBAR_COLLAPSED_KEY, sidebarCollapsed ? '1' : '0');
   }
 
   function startResize(event: PointerEvent) {
@@ -325,7 +326,7 @@
     };
     resizeUp = () => {
       stopResize();
-      localStorage.setItem(SIDEBAR_KEY, String(sidebarWidth));
+      safeStorage.setItem(SIDEBAR_KEY, String(sidebarWidth));
     };
     window.addEventListener('pointermove', resizeMove);
     window.addEventListener('pointerup', resizeUp, { once: true });
@@ -407,10 +408,10 @@
       dashboard = payload;
       dashboardError = '';
       const saved = payload.overview?.saved_tokens ?? 0;
-      let baseline = Number(sessionStorage.getItem(DASH_BASELINE_KEY));
+      let baseline = Number(safeSessionStorage.getItem(DASH_BASELINE_KEY));
       if (!Number.isFinite(baseline)) {
         baseline = saved;
-        sessionStorage.setItem(DASH_BASELINE_KEY, String(baseline));
+        safeSessionStorage.setItem(DASH_BASELINE_KEY, String(baseline));
       }
       sessionSavedFmt = commafyClient(Math.max(0, saved - baseline));
     } catch (e) {
@@ -521,7 +522,7 @@
   }
 
   function persistEditorTabs() {
-    localStorage.setItem(EDITOR_TABS_KEY, JSON.stringify(editorTabs));
+    safeStorage.setItem(EDITOR_TABS_KEY, JSON.stringify(editorTabs));
   }
 
   function tabLabel(path: string): string {
@@ -942,7 +943,7 @@
   }
 
   function persistCollapsed() {
-    localStorage.setItem(TREE_COLLAPSED_KEY, JSON.stringify([...collapsedDirs]));
+    safeStorage.setItem(TREE_COLLAPSED_KEY, JSON.stringify([...collapsedDirs]));
   }
 
   function toggleDir(key: string) {
@@ -1818,10 +1819,10 @@
     onkeydown={(event) => {
       if (event.key === 'ArrowLeft') {
         sidebarWidth = clampSidebar(sidebarWidth - 16);
-        localStorage.setItem(SIDEBAR_KEY, String(sidebarWidth));
+        safeStorage.setItem(SIDEBAR_KEY, String(sidebarWidth));
       } else if (event.key === 'ArrowRight') {
         sidebarWidth = clampSidebar(sidebarWidth + 16);
-        localStorage.setItem(SIDEBAR_KEY, String(sidebarWidth));
+        safeStorage.setItem(SIDEBAR_KEY, String(sidebarWidth));
       }
     }}
   ></button>
@@ -3049,11 +3050,10 @@
     overflow: hidden;
     transition: grid-template-columns var(--sidebar-transition);
   }
+  /* Keep main on column 3 (the 1fr track). Column 1 is width 0 when collapsed —
+     assigning main there made the whole reader disappear. */
   .shell.sidebar-collapsed {
     grid-template-columns: 0 0 1fr;
-  }
-  .shell.sidebar-collapsed main {
-    grid-column: 1;
   }
   .subviews {
     display: flex;
@@ -4119,7 +4119,8 @@
     font-size: 0.78rem;
   }
   @media (max-width: 860px) {
-    .shell {
+    .shell,
+    .shell.sidebar-collapsed {
       grid-template-columns: 1fr;
       grid-template-rows: auto auto 6px 1fr;
     }

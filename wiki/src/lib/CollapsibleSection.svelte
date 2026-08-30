@@ -16,7 +16,7 @@
     heading: Snippet;
   } = $props();
 
-  // Section ids are stable; capture localStorage once at create (not reactively).
+  // Section ids are stable; capture collapse state once at create (not reactively).
   let open = $state(
     untrack(() => isSectionOpen(id, defaultOpen)),
   );
