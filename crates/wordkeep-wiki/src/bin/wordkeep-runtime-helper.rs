@@ -6,7 +6,9 @@
 use clap::{Parser, ValueEnum};
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader};
+use std::io::BufRead;
+#[cfg(unix)]
+use std::io::BufReader;
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -873,9 +875,10 @@ mod windows_etw {
     use windows_sys::Win32::Foundation::{ERROR_SUCCESS, WIN32_ERROR};
     use windows_sys::Win32::System::Diagnostics::Etw::{
         CloseTrace, ControlTraceW, EnableTraceEx2, OpenTraceW, ProcessTrace, StartTraceW,
-        EVENT_CONTROL_CODE_ENABLE_PROVIDER, EVENT_RECORD, EVENT_TRACE_LOGFILEW,
-        EVENT_TRACE_PROPERTIES, EVENT_TRACE_REAL_TIME_MODE, PROCESS_TRACE_MODE_EVENT_RECORD,
-        PROCESS_TRACE_MODE_REAL_TIME, TRACEHANDLE, WNODE_FLAG_TRACED_GUID,
+        CONTROLTRACE_HANDLE, EVENT_CONTROL_CODE_ENABLE_PROVIDER, EVENT_RECORD,
+        EVENT_TRACE_LOGFILEW, EVENT_TRACE_PROPERTIES, EVENT_TRACE_REAL_TIME_MODE,
+        PROCESS_TRACE_MODE_EVENT_RECORD, PROCESS_TRACE_MODE_REAL_TIME,
+        WNODE_FLAG_TRACED_GUID,
     };
 
     const HEAP_PROVIDER: windows_sys::core::GUID = windows_sys::core::GUID {
@@ -923,7 +926,7 @@ mod windows_etw {
             (*props).LogFileMode = EVENT_TRACE_REAL_TIME_MODE;
             (*props).LoggerNameOffset = std::mem::size_of::<EVENT_TRACE_PROPERTIES>() as u32;
         }
-        let mut handle: TRACEHANDLE = 0;
+        let mut handle = CONTROLTRACE_HANDLE { Value: 0 };
         let started = unsafe { StartTraceW(&mut handle, name.as_ptr(), props) };
         if started != ERROR_SUCCESS {
             return Err(format!(
@@ -951,10 +954,11 @@ mod windows_etw {
 
         let mut logfile = unsafe { std::mem::zeroed::<EVENT_TRACE_LOGFILEW>() };
         logfile.LoggerName = name.as_mut_ptr();
-        logfile.ProcessTraceMode = PROCESS_TRACE_MODE_REAL_TIME | PROCESS_TRACE_MODE_EVENT_RECORD;
-        logfile.EventRecordCallback = Some(on_event);
+        logfile.Anonymous1.ProcessTraceMode =
+            PROCESS_TRACE_MODE_REAL_TIME | PROCESS_TRACE_MODE_EVENT_RECORD;
+        logfile.Anonymous2.EventRecordCallback = Some(on_event);
         let session = unsafe { OpenTraceW(&mut logfile) };
-        if session == !0u64 {
+        if session.Value == !0u64 {
             let _ = unsafe { ControlTraceW(handle, name.as_ptr(), props, 1) };
             return Err("OpenTraceW failed for real-time ETW session".into());
         }
