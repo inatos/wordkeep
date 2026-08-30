@@ -316,6 +316,91 @@
     safeStorage.setItem(SIDEBAR_COLLAPSED_KEY, sidebarCollapsed ? '1' : '0');
   }
 
+  /* Mobile: hold sidebar chrome / empty chrome to toggle; double-tap chrome label. */
+  const SIDEBAR_HOLD_MS = 480;
+  const SIDEBAR_DOUBLE_MS = 340;
+  let sidebarHoldTimer = 0;
+  let sidebarLastTapAt = 0;
+  let contentZoom = $state(1);
+  let pinchStartDist = 0;
+  let pinchStartZoom = 1;
+  const ZOOM_MIN = 0.7;
+  const ZOOM_MAX = 2.4;
+
+  function clearSidebarHold() {
+    if (sidebarHoldTimer) {
+      clearTimeout(sidebarHoldTimer);
+      sidebarHoldTimer = 0;
+    }
+  }
+
+  function isSidebarGestureTarget(target: EventTarget | null): boolean {
+    if (!(target instanceof Element)) return false;
+    if (
+      target.closest(
+        'input, textarea, select, a, button, .tree-item, .tree-dir, .search, .hit-list, .filter-row'
+      )
+    ) {
+      return false;
+    }
+    return !!target.closest('aside, .sidebar-chrome');
+  }
+
+  function onSidebarPointerDown(event: PointerEvent) {
+    if (event.pointerType === 'mouse' && event.button !== 0) return;
+    if (!isSidebarGestureTarget(event.target)) return;
+    clearSidebarHold();
+    sidebarHoldTimer = window.setTimeout(() => {
+      sidebarHoldTimer = 0;
+      toggleSidebarCollapsed();
+    }, SIDEBAR_HOLD_MS);
+  }
+
+  function onSidebarPointerUp(event: PointerEvent) {
+    const wasHolding = sidebarHoldTimer !== 0;
+    clearSidebarHold();
+    if (!wasHolding) return;
+    if (!isSidebarGestureTarget(event.target)) return;
+    const now = performance.now();
+    if (now - sidebarLastTapAt < SIDEBAR_DOUBLE_MS) {
+      sidebarLastTapAt = 0;
+      toggleSidebarCollapsed();
+      return;
+    }
+    sidebarLastTapAt = now;
+  }
+
+  function onSidebarPointerCancel() {
+    clearSidebarHold();
+  }
+
+  function touchDist(a: Touch, b: Touch): number {
+    const dx = a.clientX - b.clientX;
+    const dy = a.clientY - b.clientY;
+    return Math.hypot(dx, dy);
+  }
+
+  function onShellTouchStart(event: TouchEvent) {
+    if (event.touches.length === 2) {
+      pinchStartDist = touchDist(event.touches[0], event.touches[1]);
+      pinchStartZoom = contentZoom;
+    }
+  }
+
+  function onShellTouchMove(event: TouchEvent) {
+    if (event.touches.length !== 2 || pinchStartDist <= 0) return;
+    event.preventDefault();
+    const dist = touchDist(event.touches[0], event.touches[1]);
+    const next = pinchStartZoom * (dist / pinchStartDist);
+    contentZoom = Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, next));
+  }
+
+  function onShellTouchEnd(event: TouchEvent) {
+    if (event.touches.length < 2) {
+      pinchStartDist = 0;
+    }
+  }
+
   function startResize(event: PointerEvent) {
     event.preventDefault();
     resizing = true;
@@ -1147,7 +1232,11 @@
   class="shell"
   class:resizing
   class:sidebar-collapsed={sidebarCollapsed}
-  style={`--sidebar-width:${sidebarWidth}px`}
+  style={`--sidebar-width:${sidebarWidth}px;--content-zoom:${contentZoom}`}
+  ontouchstart={onShellTouchStart}
+  ontouchmove={onShellTouchMove}
+  ontouchend={onShellTouchEnd}
+  ontouchcancel={onShellTouchEnd}
 >
   <header class="top" bind:this={headerEl}>
     <div class="brand">
@@ -1259,9 +1348,14 @@
     </nav>
   </header>
 
-  <aside aria-hidden={sidebarCollapsed}>
+  <aside
+    aria-hidden={sidebarCollapsed}
+    onpointerdown={onSidebarPointerDown}
+    onpointerup={onSidebarPointerUp}
+    onpointercancel={onSidebarPointerCancel}
+  >
     <div class="sidebar-chrome">
-      <span class="sidebar-chrome-label">Browse</span>
+      <span class="sidebar-chrome-label" title="Double-tap or hold to hide sidebar">Browse</span>
       <div class="sidebar-chrome-actions">
         <button
           type="button"
@@ -3755,6 +3849,7 @@
     min-height: 0;
     display: flex;
     flex-direction: column;
+    zoom: var(--content-zoom, 1);
   }
   .main-body {
     flex: 1 1 auto;
@@ -4122,7 +4217,10 @@
     .shell,
     .shell.sidebar-collapsed {
       grid-template-columns: 1fr;
-      grid-template-rows: auto auto 6px 1fr;
+      grid-template-rows: auto auto 0 1fr;
+    }
+    .shell.sidebar-collapsed {
+      grid-template-rows: auto 0 0 1fr;
     }
     .dash-split {
       grid-template-columns: 1fr;
@@ -4139,6 +4237,17 @@
       top: auto;
       bottom: auto;
       width: auto;
+      transform: none;
+    }
+    .shell.sidebar-collapsed aside {
+      display: none;
+      max-height: 0;
+      border: 0;
+      padding: 0;
+      margin: 0;
+      overflow: hidden;
+      transform: none;
+      pointer-events: none;
     }
     .sidebar-resizer {
       display: none;
@@ -4146,6 +4255,19 @@
     main {
       grid-column: 1;
       grid-row: 4;
+      min-height: 0;
+    }
+    .shell.sidebar-collapsed main {
+      grid-row: 4;
+    }
+    .sidebar-expand-tab {
+      top: calc(var(--header-h, 3.25rem) + 0.35rem);
+      left: 0.35rem;
+    }
+    .sidebar-chrome-label {
+      cursor: pointer;
+      user-select: none;
+      -webkit-user-select: none;
     }
   }
 </style>
