@@ -77,6 +77,7 @@ mod include_graph;
 mod incremental;
 mod index_stale;
 mod integration_hooks;
+mod izakaya;
 mod knowledge;
 mod lang;
 mod mas;
@@ -139,10 +140,26 @@ fn main() {
                 run_record_args = Some(it.collect());
                 break;
             }
+            "izakaya" => {
+                let argv: Vec<String> = it.collect();
+                match izakaya::cli(&root, &argv) {
+                    Ok(msg) => {
+                        if !msg.is_empty() {
+                            println!("{msg}");
+                        }
+                        return;
+                    }
+                    Err(e) => {
+                        eprintln!("[wordkeep] izakaya: {e}");
+                        std::process::exit(1);
+                    }
+                }
+            }
             "--help" | "-h" => {
                 eprintln!(
                     "wordkeep [--root <workspace>]   speak MCP over stdio (default)\n\
                      wordkeep run-record [flags]     record gate/run metadata (no command exec)\n\
+                     wordkeep izakaya <command>      agent presence / replay (see izakaya --help)\n\
                      wordkeep dashboard              live savings dashboard (build --features dashboard)"
                 );
                 return;
@@ -217,9 +234,10 @@ fn main() {
     let root_artifact_index = root.clone();
     let root_session_pressure = root.clone();
     let root_commit_scope = root.clone();
-    let root_profile_upsert = root;
+    let root_profile_upsert = root.clone();
+    let root_izakaya = root;
 
-    let raw_tools = vec![
+    let mut raw_tools = vec![
         mcp::Tool {
             name: "repo_map",
             description: "Token-budgeted STRUCTURAL map of the source tree (C/C++, GLSL, Rust, \
@@ -1128,6 +1146,7 @@ fn main() {
             handler: Box::new(move |args| profile_upsert::run(&root_profile_upsert, args)),
         },
     ];
+    raw_tools.extend(izakaya::mcp_tools(root_izakaya));
 
     stats::init_registry(raw_tools.iter().map(|t| t.name).collect());
 

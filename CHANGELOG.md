@@ -5,6 +5,16 @@ All notable changes to wordkeep are documented here. The project follows
 
 ## [Unreleased]
 
+### Added
+
+- **Izakaya** — local agent presence for linked Git worktrees: append-only
+  journal, advisory path/symbol claims, two-phase handoffs, and a read-only
+  Dream-RSI-style replay lab. New tools: `izakaya_status`, `izakaya_check_in`,
+  `izakaya_update`, `izakaya_check_out`, `izakaya_record_decision`,
+  `izakaya_record_outcome`, `izakaya_replay`, `izakaya_advise`. CLI:
+  `wordkeep izakaya policy list|evaluate|promote|retire`. Promotion only
+  activates advice; it does not assign work or mutate Git. Surface is 48 tools.
+
 ## [0.4.2] - 2026-08-22
 
 ### Fixed

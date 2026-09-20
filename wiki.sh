@@ -153,10 +153,21 @@ runtime_attach_ok() {
   [[ "$body" == *'"attach_enabled":true'* || "$body" == *'"attach_enabled": true'* ]]
 }
 
+izakaya_ok() {
+  # Dashboard → Izakaya reads the coordination journal. Older binaries 404 it.
+  [[ "$(http_code /api/izakaya)" == "200" ]]
+}
+
 ui_has_runtime_view() {
   # Built SPA must include the Runtime/Knowledge Health subview.
   grep -q 'Health — Runtime' "$WK/wiki/dist"/assets/*.js 2>/dev/null \
     || grep -q 'attach_enabled' "$WK/wiki/dist"/assets/*.js 2>/dev/null
+}
+
+ui_has_izakaya_view() {
+  grep -q 'Izakaya board' "$WK/wiki/dist"/assets/*.js 2>/dev/null \
+    && grep -q 'Izakaya charts' "$WK/wiki/dist"/assets/*.js 2>/dev/null \
+    && grep -q 'dash-table' "$WK/wiki/dist"/assets/*.js 2>/dev/null
 }
 
 ui_has_local_base() {
@@ -177,20 +188,22 @@ rebuild_ui_dist() {
 }
 
 ensure_ui_dist() {
-  if ui_has_runtime_view && ui_has_local_base; then
+  if ui_has_runtime_view && ui_has_local_base && ui_has_izakaya_view; then
     return 0
   fi
   if ! ui_has_local_base && [[ -f "$WK/wiki/dist/index.html" ]]; then
     echo "[wordkeep:wiki] wiki/dist has lab base (/lab/wordkeep/ui) — forcing local /"
   elif ! ui_has_runtime_view; then
     echo "[wordkeep:wiki] wiki/dist is stale (no Runtime Health UI)"
+  elif ! ui_has_izakaya_view; then
+    echo "[wordkeep:wiki] wiki/dist is stale (no Izakaya dashboard page)"
   fi
   rebuild_ui_dist || return 1
-  ui_has_runtime_view && ui_has_local_base
+  ui_has_runtime_view && ui_has_local_base && ui_has_izakaya_view
 }
 
 healthy() {
-  ui_up && dashboard_ok && runtime_ok && runtime_attach_ok && ui_has_runtime_view && ui_has_local_base
+  ui_up && dashboard_ok && izakaya_ok && runtime_ok && runtime_attach_ok && ui_has_runtime_view && ui_has_izakaya_view && ui_has_local_base
 }
 
 alive_pid() {

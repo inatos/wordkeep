@@ -25,6 +25,7 @@ mod include_graph;
 mod incremental;
 mod index_stale;
 mod integration_hooks;
+mod izakaya;
 pub mod knowledge;
 mod lang;
 mod mas;

@@ -341,6 +341,14 @@ pub fn recent(root: &Path, limit: usize) -> Vec<Run> {
     runs
 }
 
+/// Look up one recorded run by id. Metadata only; never executes the command.
+pub fn get(root: &Path, id: &str) -> Option<Run> {
+    load_all(root)
+        .unwrap_or_default()
+        .into_iter()
+        .find(|r| r.id == id)
+}
+
 /// CLI entry: `wordkeep run-record --command ... --status ...` (metadata only).
 pub fn cli_record(root: &Path, argv: &[String]) -> Result<(), i32> {
     let mut args = json!({});

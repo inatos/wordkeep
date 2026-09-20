@@ -19,7 +19,7 @@ wordkeep runs locally as an MCP stdio subprocess. It reads files under the `--ro
 
 - validated paths under `.wordkeep/`, `docs/`, `.cursor/rules/`, root `README.md`, and configured `knowledge_write_roots` via `knowledge_upsert`
 - `.wordkeep/defects.json` via `defect_upsert`
-- cache files under your platform cache directory (`$XDG_CACHE_HOME/wordkeep/` or `%LOCALAPPDATA%/wordkeep/`), including workspace-scoped MAS/run/artifact stores
+- cache files under your platform cache directory (`$XDG_CACHE_HOME/wordkeep/` or `%LOCALAPPDATA%/wordkeep/`), including workspace-scoped MAS/run/artifact stores and the Izakaya coordination journal (`coordination/<id>/izakaya/`)
 
 It does **not**:
 
@@ -27,6 +27,8 @@ It does **not**:
 - stage or commit via `commit_scope`
 - follow artifact symlinks outside `--root`
 - grade image quality from `artifact_index`
+- store source bodies or patches in the Izakaya journal (paths, symbols, and references only)
+- let a promoted Izakaya policy assign work, suspend agents, check them out, or run Git
 
 Treat `--root` like any local code-execution tool: point it only at repositories you trust.
 

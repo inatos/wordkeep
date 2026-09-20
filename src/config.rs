@@ -249,6 +249,52 @@ pub fn mas_handoff_tokens(root: &Path) -> usize {
         .unwrap_or(1600)
 }
 
+fn izakaya_u64(root: &Path, key: &str, default: u64) -> u64 {
+    load_config(root)
+        .and_then(|cfg| {
+            cfg.get("izakaya")
+                .and_then(|m| m.get(key))
+                .and_then(Value::as_u64)
+        })
+        .unwrap_or(default)
+}
+
+/// Active-agent lease seconds (default 300). `WORDKEEP_IZAKAYA_TTL_SECS` overrides for tests.
+pub fn izakaya_ttl_secs(root: &Path) -> u64 {
+    std::env::var("WORDKEEP_IZAKAYA_TTL_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(|| izakaya_u64(root, "ttl_secs", 300))
+}
+
+/// Suspended-agent lease seconds (default 86400).
+pub fn izakaya_suspend_ttl_secs(root: &Path) -> u64 {
+    std::env::var("WORDKEEP_IZAKAYA_SUSPEND_TTL_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(|| izakaya_u64(root, "suspend_ttl_secs", 86_400))
+}
+
+/// Age after which an unaccepted handoff from a checked-out agent is orphaned.
+pub fn izakaya_orphan_secs(root: &Path) -> u64 {
+    std::env::var("WORDKEEP_IZAKAYA_ORPHAN_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(|| izakaya_u64(root, "orphan_secs", 86_400))
+}
+
+/// Repo-relative directory of declarative discovery profiles.
+pub fn izakaya_profiles_dir(root: &Path) -> String {
+    load_config(root)
+        .and_then(|cfg| {
+            cfg.get("izakaya")
+                .and_then(|m| m.get("profiles_dir"))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| ".wordkeep/izakaya/profiles".to_string())
+}
+
 /// Like [`paths_from_args`], but uses `fallback` when `paths` is omitted or empty.
 pub fn paths_from_args_or(
     _root: &Path,

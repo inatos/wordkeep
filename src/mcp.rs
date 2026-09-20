@@ -64,10 +64,25 @@ impl Server {
             let params = req.get("params").cloned().unwrap_or(Value::Null);
 
             // Notifications carry no `id` and get no response.
-            let id = match req.get("id") {
-                Some(id) => id.clone(),
-                None => continue,
-            };
+            // Cursor caches tools across reconnects. After it finishes
+            // `notifications/initialized` it registers list-changed handlers, so
+            // a short delay lets that registration land before we announce.
+            if req.get("id").is_none() {
+                if method == "notifications/initialized" {
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                    let note = json!({
+                        "jsonrpc": "2.0",
+                        "method": "notifications/tools/list_changed"
+                    });
+                    let s = serde_json::to_string(&note).unwrap_or_else(|_| "{}".to_string());
+                    out.write_all(s.as_bytes())?;
+                    out.write_all(b"\n")?;
+                    out.flush()?;
+                }
+                continue;
+            }
+
+            let id = req.get("id").cloned().unwrap_or(Value::Null);
 
             let response = match method {
                 "initialize" => self.handle_initialize(&params, id),
@@ -98,7 +113,7 @@ impl Server {
             json!({
                 "protocolVersion": pv,
                 "capabilities": {
-                    "tools": { "listChanged": false },
+                    "tools": { "listChanged": true },
                     "resources": { "listChanged": false, "subscribe": false }
                 },
                 "serverInfo": {

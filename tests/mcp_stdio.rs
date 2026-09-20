@@ -220,13 +220,21 @@ fn lists_all_tools() {
         "session_pressure",
         "commit_scope",
         "profile_upsert",
+        "izakaya_status",
+        "izakaya_check_in",
+        "izakaya_update",
+        "izakaya_check_out",
+        "izakaya_record_decision",
+        "izakaya_record_outcome",
+        "izakaya_replay",
+        "izakaya_advise",
     ] {
         assert!(names.contains(&n), "missing tool {n}: {names:?}");
     }
     assert_eq!(
         names.len(),
-        40,
-        "expected 40 tools, got {}: {names:?}",
+        48,
+        "expected 48 tools, got {}: {names:?}",
         names.len()
     );
 }
@@ -293,7 +301,7 @@ fn resources_list_and_read_readme() {
         "params": { "uri": "wordkeep://capabilities" }
     }));
     let caps_text = caps["result"]["contents"][0]["text"].as_str().unwrap_or("");
-    assert!(caps_text.contains("\"tool_count\": 40"), "{caps}");
+    assert!(caps_text.contains("\"tool_count\": 48"), "{caps}");
     assert!(caps_text.contains("knowledge_upsert"), "{caps}");
 }
 
@@ -894,4 +902,26 @@ fn repo_map_uses_config_default_paths() {
     let mut s = Server::start();
     let out = s.tool_text("repo_map", json!({}));
     assert!(out.contains("sample.cpp"), "{out}");
+}
+
+#[test]
+fn izakaya_presence_round_trip() {
+    let mut s = Server::start();
+    let inn = s.tool_text(
+        "izakaya_check_in",
+        json!({
+            "agent_id": "alpha",
+            "task": "smoke",
+            "observe_git": false,
+            "claims": [{"path": "src/sample.cpp", "symbols": ["run"]}]
+        }),
+    );
+    assert!(inn.contains("lease_id:"), "{inn}");
+    let board = s.tool_text("izakaya_status", json!({}));
+    assert!(board.contains("alpha"), "{board}");
+    let advice = s.tool_text("izakaya_advise", json!({}));
+    assert!(
+        advice.contains("inert") || advice.contains("no promoted"),
+        "{advice}"
+    );
 }

@@ -1,7 +1,7 @@
 {
   "version": 1,
-  "tool_count": 40,
-  "notes": "Effect/coeffect manifest (FIG-2026-005). Wired: knowledge-chunks-cache, mas-session, workspace-cache. config/defects/runs/effect-journal are disk-fresh reads.",
+  "tool_count": 48,
+  "notes": "Effect/coeffect manifest (FIG-2026-005). Wired: knowledge-chunks-cache, mas-session, workspace-cache. config/defects/runs/effect-journal are disk-fresh reads. Izakaya writes only its coordination journal (FIG-2026-006); replay and advise stay read-only.",
   "tools": {
     "knowledge_upsert": {
       "effects": ["write-notes"],
@@ -35,6 +35,26 @@
     "profile_upsert": {
       "effects": ["write-config"],
       "coeffects": ["config"]
+    },
+    "izakaya_check_in": {
+      "effects": ["write-izakaya-journal"],
+      "coeffects": []
+    },
+    "izakaya_update": {
+      "effects": ["write-izakaya-journal"],
+      "coeffects": []
+    },
+    "izakaya_check_out": {
+      "effects": ["write-izakaya-journal"],
+      "coeffects": []
+    },
+    "izakaya_record_decision": {
+      "effects": ["write-izakaya-journal"],
+      "coeffects": []
+    },
+    "izakaya_record_outcome": {
+      "effects": ["write-izakaya-journal"],
+      "coeffects": []
     }
   },
   "read_only_default": "All tools not listed above are read-only over workspace paths (no durable writes)."

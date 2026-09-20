@@ -151,7 +151,7 @@ CLI: `wordkeep run-record …` records gate metadata without executing commands.
 
 ## What you get
 
-40 MCP tools + 2 MCP resources (`wordkeep://readme`, `wordkeep://capabilities`), including:
+48 MCP tools + 2 MCP resources (`wordkeep://readme`, `wordkeep://capabilities`), including:
 
 | Tool | Use when you need |
 | --- | --- |
@@ -169,9 +169,11 @@ CLI: `wordkeep run-record …` records gate metadata without executing commands.
 | `runtime_snapshot` / `memory_diff` | Runtime memory census or signed capture deltas |
 | `locality_hotspots` | Sampled PMC/ETW/perf hotspots, or explicit unavailable |
 | `stats` | Measured token displacement per tool |
+| `izakaya_status` / `izakaya_check_in` | Who has live work, then take a lease before editing |
 
 Full catalog: [docs/tools.md](docs/tools.md). Design notes:
-[docs/onboarding.md](docs/onboarding.md).
+[docs/onboarding.md](docs/onboarding.md). Izakaya presence and the offline replay
+lab: [docs/designs/izakaya.md](docs/designs/izakaya.md).
 
 Languages (via tree-sitter): C/C++, GLSL, Rust, Python, C#, TypeScript/TSX/Svelte/JS.
 Daslang (`.das`) uses a lightweight scanner by default; exact parsing is
@@ -254,6 +256,7 @@ See [docs/designs/wiki.md](docs/designs/wiki.md).
 - [docs/performance.md](docs/performance.md) - telemetry methodology & baselines
 - [docs/designs/wiki.md](docs/designs/wiki.md) - searchable wiki companion
 - [docs/designs/recursive_mas.md](docs/designs/recursive_mas.md) - MAS blackboard
+- [docs/designs/izakaya.md](docs/designs/izakaya.md) - agent presence and replay lab
 - [blog.md](blog.md) - why the project exists
 - [CHANGELOG.md](CHANGELOG.md) - release notes
 - [CONTRIBUTING.md](CONTRIBUTING.md) / [SECURITY.md](SECURITY.md)

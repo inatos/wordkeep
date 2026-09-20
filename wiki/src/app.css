@@ -212,3 +212,83 @@ article h1, article h2, article h3 { scroll-margin-top: 4rem; }
     display: none;
   }
 }
+
+/* Shared by the telemetry dashboard and the Izakaya page. */
+.table-wrap {
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  margin-bottom: 1rem;
+}
+.dash-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.82rem;
+  white-space: nowrap;
+}
+.dash-table th,
+.dash-table td {
+  padding: 0.4rem 0.55rem;
+  border-bottom: 1px solid var(--border);
+  text-align: right;
+}
+.dash-table th:first-child,
+.dash-table td:first-child {
+  text-align: left;
+  position: sticky;
+  left: 0;
+  background: var(--bg-elevated);
+}
+.dash-table thead th {
+  color: var(--muted);
+  font-weight: 600;
+  background: rgba(0, 0, 0, 0.18);
+  padding: 0;
+}
+.sort-btn {
+  width: 100%;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  font-weight: 600;
+  padding: 0.4rem 0.55rem;
+  cursor: pointer;
+  text-align: inherit;
+}
+.sort-btn:hover {
+  color: var(--accent-strong);
+  background: var(--accent-soft);
+}
+.dash-table tr.inverted td {
+  color: #e87b7b;
+}
+.dash-table .bar {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  letter-spacing: 0.02em;
+}
+.dash-table .tool-name {
+  text-align: left;
+}
+.dash-table .tool-name code {
+  font-size: 0.9em;
+}
+.dash-table .num {
+  font-variant-numeric: tabular-nums;
+}
+.dash-table .good,
+.metric.good code {
+  color: #7dce9a;
+}
+.dash-table tr.signal-ok .signal-value {
+  color: #7dce9a;
+}
+.dash-table tr.signal-warn .signal-value,
+.dash-table tr.signal-danger .signal-value {
+  color: #e87b7b;
+}
+.dash-table .text {
+  text-align: left;
+  white-space: normal;
+  max-width: 28rem;
+}

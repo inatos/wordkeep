@@ -40,6 +40,12 @@ This is the MCP-feasible analog: structured, bounded state instead of re-pasting
 agent output into chat. Cross-session continuity (defects, runs, pressure) is documented
 in [session_continuity.md](session_continuity.md).
 
+Izakaya ([izakaya.md](izakaya.md)) is a separate presence journal. A checkout may
+store `mas_session` and `mas_entry_id` on a handoff capsule, and check-in may
+read a session snapshot so the recipient sees the round. That reference does
+not call `mas_finalize` and does not change session status. Long handoff prose
+still belongs in `mas_post` with `kind: "handoff"`.
+
 ## Typical loop
 
 Documented step-by-step in the [README MAS section](../../README.md#recursive-mas-multi-agent-blackboard):

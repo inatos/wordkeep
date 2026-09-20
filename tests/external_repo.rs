@@ -271,6 +271,40 @@ fn workspace_mas_isolation_across_roots() {
 }
 
 #[test]
+fn izakaya_presence_is_isolated_across_roots() {
+    let root_a = temp("iza_a");
+    let root_b = temp("iza_b");
+    let cache = temp("iza_cache");
+    let cwd = temp("iza_cwd");
+    let _ = std::fs::remove_dir_all(&root_a);
+    let _ = std::fs::remove_dir_all(&root_b);
+    let _ = std::fs::remove_dir_all(&cache);
+    std::fs::create_dir_all(&cwd).unwrap();
+    write_consumer_repo(&root_a);
+    write_consumer_repo(&root_b);
+
+    let checked = tool_text(
+        &root_a,
+        &cache,
+        &cwd,
+        "izakaya_check_in",
+        json!({
+            "agent_id": "alpha",
+            "task": "only-a",
+            "observe_git": false
+        }),
+    );
+    assert!(checked.contains("alpha"), "{checked}");
+    let other = tool_text(&root_b, &cache, &cwd, "izakaya_status", json!({}));
+    assert!(!other.contains("only-a"), "{other}");
+
+    let _ = std::fs::remove_dir_all(&root_a);
+    let _ = std::fs::remove_dir_all(&root_b);
+    let _ = std::fs::remove_dir_all(&cache);
+    let _ = std::fs::remove_dir_all(&cwd);
+}
+
+#[test]
 fn commit_scope_degrades_without_git() {
     let root = temp("nongit_scope");
     let cache = temp("cache_scope");

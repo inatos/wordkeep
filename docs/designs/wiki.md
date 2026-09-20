@@ -75,7 +75,15 @@ else CMake/`Cargo.toml`/`package.json`, else the workspace folder name.
 - MCP savings dashboard (GUI): overview / live charts / sortable tools table
   (incl. **Inv** for validation/missing-arg calls) / recent activity + health
   as tables / outcome hover shows `reason` when present; via `/api/dashboard`,
-  auto-refresh while the tab is open
+  auto-refresh while the tab is open. Every dashboard table header sorts on
+  press and flips direction on the next press.
+- Izakaya page (`?tab=dashboard&view=izakaya`): live presence donut, journal
+  sequence line, event-kind / dirty-path / MCP call and latency bars, plus
+  tables for agents, claims, handoffs, journal, notes, and `izakaya_*` calls.
+  `GET /api/izakaya` reads the coordination projection and does not write it.
+  Both dashboard pages share a `dq` filter (URL `?dq=`): space-separated
+  substrings over Izakaya data and over MCP telemetry charts, tables, and
+  overview totals. Session savings is not filtered.
 - Dashboard charts (SVG, no chart npm deps): tokens-saved + calls bars, outcome
   donut with hover metrics, recent-savings line chart with axes + point hover;
   chart/section tooltips via `CHART_HELP` / `OUTCOME_HELP`

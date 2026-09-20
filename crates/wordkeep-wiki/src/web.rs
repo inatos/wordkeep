@@ -97,6 +97,7 @@ pub(crate) async fn serve(
         .route("/api/search-telemetry/click", post(search_click))
         .route("/api/stats", get(stats))
         .route("/api/dashboard", get(dashboard_api))
+        .route("/api/izakaya", get(izakaya_api))
         .route("/api/runtime", get(runtime_get))
         .route("/api/runtime/stream", get(runtime_stream))
         .route("/api/runtime/ingest", post(runtime_ingest))
@@ -506,6 +507,10 @@ async fn dashboard_api() -> ApiResult {
     crate::dashboard::build()
         .map(Json)
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error))
+}
+
+async fn izakaya_api(State(state): State<AppState>) -> ApiResult {
+    Ok(Json(crate::izakaya::board(&state.root)))
 }
 
 fn origin_ok(headers: &HeaderMap) -> bool {

@@ -27,6 +27,12 @@ Lives at the **root of the repository you analyze** (the `--root` path).
     "auto_promote": false,
     "handoff_tokens": 1600
   },
+  "izakaya": {
+    "ttl_secs": 300,
+    "suspend_ttl_secs": 86400,
+    "orphan_secs": 86400,
+    "profiles_dir": ".wordkeep/izakaya/profiles"
+  },
   "test_command": "ctest -R"
 }
 ```
@@ -44,6 +50,10 @@ Lives at the **root of the repository you analyze** (the `--root` path).
 | `large_file_bytes` | Large-file warning threshold for `commit_scope` (default 5 MiB). |
 | `mas.auto_promote` | Default `promote` for `mas_finalize` / `session_handoff` when omitted. |
 | `mas.handoff_tokens` | Token cap for `kind: "handoff"` MAS entries (default 1600). |
+| `izakaya.ttl_secs` | Active lease. Default 300. Expiry marks an agent stale; it does not check them out. |
+| `izakaya.suspend_ttl_secs` | Lease used while `suspended`. Default 86400. |
+| `izakaya.orphan_secs` | Age before an unaccepted handoff from a checked-out agent is orphaned. Default 86400. |
+| `izakaya.profiles_dir` | Declarative discovery profiles. Default `.wordkeep/izakaya/profiles`. Profiles cannot declare shell or command keys. |
 | `test_command` | Prefix for `test_map` filter hints and `knowledge_upsert` pitfall verify lines. |
 
 **Path resolution order:** explicit `paths` → explicit `profile` → keyword-inferred
@@ -61,6 +71,7 @@ Template: [`.wordkeep/config.example.json`](../.wordkeep/config.example.json).
 | --- | --- |
 | (default) | Speak MCP over stdio |
 | `run-record` | Record gate/run metadata without executing commands |
+| `izakaya` | Presence, handoffs, and `policy list\|evaluate\|promote\|retire` |
 | `dashboard` | Live savings UI (`--features dashboard`) |
 
 | Variable | Effect |
@@ -70,9 +81,15 @@ Template: [`.wordkeep/config.example.json`](../.wordkeep/config.example.json).
 | `LOCALAPPDATA` | Windows cache base |
 | `WORDKEEP_TRACY_CSVEXPORT` | Path to Tracy CSV export binary |
 | `WORDKEEP_MAS_ENTRY_TOKENS` | Max tokens per normal MAS blackboard entry |
+| `WORDKEEP_IZAKAYA_TTL_SECS` | Override `izakaya.ttl_secs` |
+| `WORDKEEP_IZAKAYA_SUSPEND_TTL_SECS` | Override `izakaya.suspend_ttl_secs` |
+| `WORDKEEP_IZAKAYA_ORPHAN_SECS` | Override `izakaya.orphan_secs` |
+| `WORDKEEP_IZAKAYA_NOW` | Test clock (integer unix seconds). Not for agents. |
 
 Caches and telemetry persist under `<cache-base>/wordkeep/`. Workspace-scoped
 MAS/runs/artifacts live under `<cache-base>/wordkeep/workspaces/<root-hash>/`.
+Izakaya journals live under `<cache-base>/wordkeep/coordination/<git-common-dir-hash>/izakaya/`
+so linked worktrees share one board. Non-git roots use the workspace id instead.
 Legacy `<cache-base>/wordkeep/mas/` sessions migrate on first access.
 
 ## Path safety

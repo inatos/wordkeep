@@ -35,6 +35,8 @@
     toolHelp,
   } from './lib/toolHelp';
   import { KIND_OPTIONS, kindOption } from './lib/filterMeta';
+  import { matchesQuery } from './lib/boardFilter';
+  import { sortRows, toggleColumn, type ColumnSort } from './lib/columnSort';
   import { normalizeTag, setMarkdownTags } from './lib/frontmatter';
   import { comboNav } from './lib/combo';
   import {
@@ -51,6 +53,7 @@
   import Sparkline from './lib/charts/Sparkline.svelte';
   import type { BarDatum, DonutDatum, SparkPoint } from './lib/charts/utils';
   import RuntimeHealth from './lib/RuntimeHealth.svelte';
+  import IzakayaBoard from './lib/IzakayaBoard.svelte';
 
   type Tab = 'search' | 'reader' | 'dashboard' | 'health';
   type EditorTab = { path: string; pinned: boolean };
@@ -81,6 +84,8 @@
 
   let tab = $state<Tab>('search');
   let healthView = $state<'runtime' | 'knowledge'>('runtime');
+  let dashView = $state<'telemetry' | 'izakaya'>('telemetry');
+  let dashQuery = $state('');
   let urlReady = $state(false);
   let query = $state('');
   let kind = $state('');
@@ -272,7 +277,10 @@
     else url.searchParams.set('tab', tab);
     if (tab === 'health' && healthView !== 'knowledge') url.searchParams.set('view', healthView);
     else if (tab === 'health') url.searchParams.set('view', 'knowledge');
+    else if (tab === 'dashboard' && dashView === 'izakaya') url.searchParams.set('view', 'izakaya');
     else url.searchParams.delete('view');
+    if (tab === 'dashboard' && dashQuery.trim()) url.searchParams.set('dq', dashQuery.trim());
+    else url.searchParams.delete('dq');
     const next = `${url.pathname}${url.search}${url.hash}`;
     const cur = `${location.pathname}${location.search}${location.hash}`;
     if (next !== cur) history.replaceState({}, '', url);
@@ -444,6 +452,9 @@
     const restoredTab = parseTab(params.get('tab'));
     const view = params.get('view');
     if (view === 'runtime' || view === 'knowledge') healthView = view;
+    if (view === 'izakaya') dashView = 'izakaya';
+    const dq = params.get('dq');
+    if (dq) dashQuery = dq;
     if (path) {
       await openPath(path, undefined, params.get('anchor') || undefined);
       if (restoredTab && restoredTab !== 'reader') {
@@ -1149,8 +1160,103 @@
   });
   let kindTip = $derived(kindOption(kind).tip);
   let terminalCmd = $derived(dashboard?.terminal_hint || TERMINAL_DASHBOARD_CMD);
+  let dashFiltering = $derived(dashQuery.trim().length > 0);
+  let telemetryTools = $derived(
+    (dashboard?.tools || []).filter((tool) =>
+      matchesQuery(dashQuery, [
+        tool.name,
+        tool.last_ago,
+        tool.calls,
+        tool.avg_ms,
+        tool.saved,
+        tool.inverted ? 'inverted net-negative' : '',
+      ]),
+    ),
+  );
+  let telemetryActivity = $derived(
+    (dashboard?.activity || []).filter((event) =>
+      matchesQuery(dashQuery, [
+        event.tool,
+        event.outcome,
+        event.reason,
+        event.ago,
+        event.elapsed_ms,
+        event.saved,
+      ]),
+    ),
+  );
+  let telemetrySignals = $derived(
+    (dashboard?.health?.signals || []).filter((signal) =>
+      matchesQuery(dashQuery, [signal.kind, signal.label, signal.detail, signal.value]),
+    ),
+  );
+  let activitySort = $state<ColumnSort>({ key: '', dir: 'asc' });
+  let signalSort = $state<ColumnSort>({ key: '', dir: 'asc' });
+  function pressColumn(sort: ColumnSort, key: string, numeric = false) {
+    const next = toggleColumn(sort, key, numeric);
+    sort.key = next.key;
+    sort.dir = next.dir;
+  }
+  let sortedActivity = $derived(
+    sortRows(telemetryActivity, activitySort, (event, key) => {
+      switch (key) {
+        case 'when':
+          return event.ts ?? 0;
+        case 'tool':
+          return event.tool;
+        case 'ms':
+          return event.elapsed_ms;
+        case 'distill':
+          return event.baseline;
+        case 'return':
+          return event.returned;
+        default:
+          return event.outcome;
+      }
+    }),
+  );
+  let sortedSignals = $derived(
+    sortRows(telemetrySignals, signalSort, (signal, key) => {
+      if (key === 'value') {
+        if (typeof signal.value === 'number') return signal.value;
+        const parsed = Number(signal.value);
+        return Number.isFinite(parsed) && String(signal.value).trim() !== ''
+          ? parsed
+          : String(signal.value ?? '');
+      }
+      if (key === 'detail') return signal.detail || '';
+      return signal.label;
+    }),
+  );
+  let telemetryOverview = $derived.by(() => {
+    const base = dashboard?.overview;
+    if (!dashFiltering) return base;
+    let calls = 0;
+    let baseline = 0;
+    let returned = 0;
+    let saved = 0;
+    for (const tool of telemetryTools) {
+      calls += tool.calls || 0;
+      baseline += tool.baseline_tokens || 0;
+      returned += tool.returned_tokens || 0;
+      saved += tool.saved || 0;
+    }
+    const reduction = baseline > 0 ? Math.round((saved * 100) / baseline) : 0;
+    return {
+      calls,
+      calls_fmt: commafyClient(calls),
+      baseline_tokens: baseline,
+      baseline_fmt: commafyClient(baseline),
+      returned_tokens: returned,
+      returned_fmt: commafyClient(returned),
+      saved_tokens: saved,
+      saved_fmt: commafyClient(saved),
+      reduction_pct: reduction,
+      since_label: base?.since_label,
+    };
+  });
   let sortedTools = $derived.by(() => {
-    const tools = [...(dashboard?.tools || [])];
+    const tools = [...telemetryTools];
     const dir = sortDir === 'asc' ? 1 : -1;
     tools.sort((a, b) => {
       const av = toolValue(a, sortKey);
@@ -1164,7 +1270,7 @@
   });
 
   let chartSavedBars = $derived.by((): BarDatum[] =>
-    (dashboard?.tools || []).map((tool) => ({
+    telemetryTools.map((tool) => ({
       label: tool.name,
       value: tool.saved,
       color: tool.inverted ? 'var(--danger)' : 'var(--ok)',
@@ -1179,7 +1285,7 @@
   );
 
   let chartCallBars = $derived.by((): BarDatum[] =>
-    (dashboard?.tools || []).map((tool) => ({
+    telemetryTools.map((tool) => ({
       label: tool.name,
       value: tool.calls,
       color: 'var(--accent)',
@@ -1188,7 +1294,7 @@
   );
 
   let chartOutcomes = $derived.by((): DonutDatum[] => {
-    const tools = dashboard?.tools || [];
+    const tools = telemetryTools;
     let calls = 0;
     let trunc = 0;
     let error = 0;
@@ -1218,7 +1324,7 @@
   });
 
   let chartSparkSaved = $derived.by((): SparkPoint[] =>
-    (dashboard?.activity || [])
+    telemetryActivity
       .filter((event) => typeof event.ts === 'number' && event.ts > 0)
       .map((event) => ({
         ts: event.ts as number,
@@ -1312,7 +1418,7 @@
       <button
         class="icon-btn"
         class:active={tab === 'dashboard'}
-        title="Dashboard — MCP token savings telemetry (GUI). Terminal: cargo run -p wordkeep --features dashboard -- dashboard"
+        title="Dashboard — MCP token savings, or live Izakaya presence. Terminal: cargo run -p wordkeep --features dashboard -- dashboard"
         aria-label="Dashboard"
         onclick={() => setTab('dashboard')}
       >
@@ -2442,7 +2548,7 @@
         <header class="panel-head">
           <h2
             class="section-title"
-            title="Live MCP token-savings telemetry from ~/.cache/wordkeep/savings.json. Same data as the terminal dashboard."
+            title="Dashboard pages: MCP token savings, or live Izakaya presence from the coordination journal."
           >
             <svg viewBox="0 0 24 24" aria-hidden="true"
               ><path
@@ -2454,7 +2560,7 @@
                 stroke-linejoin="round"
               /></svg
             >
-            MCP telemetry
+            {dashView === 'izakaya' ? 'Izakaya' : 'MCP telemetry'}
           </h2>
           <button
             class="icon-btn"
@@ -2481,7 +2587,38 @@
           </button>
         </header>
 
-        {#if dashboardError}
+        <div class="subviews" role="tablist" aria-label="Dashboard pages">
+          <button
+            class="subview-btn"
+            class:active={dashView === 'telemetry'}
+            onclick={() => (dashView = 'telemetry')}>Telemetry</button
+          >
+          <button
+            class="subview-btn"
+            class:active={dashView === 'izakaya'}
+            onclick={() => (dashView = 'izakaya')}>Izakaya</button
+          >
+        </div>
+
+        <label class="dash-filter">
+          <input
+            bind:value={dashQuery}
+            type="search"
+            placeholder={dashView === 'izakaya'
+              ? 'Filter agents, journal, claims, and izakaya calls…'
+              : 'Filter tools, calls, and health signals…'}
+            aria-label={dashView === 'izakaya' ? 'Filter Izakaya data and telemetry' : 'Filter MCP telemetry'}
+            title="Space-separated substrings. Applies to charts and tables on this page. Empty shows everything."
+          />
+        </label>
+
+        {#if dashView === 'izakaya'}
+          <IzakayaBoard
+            tools={dashboard?.tools ?? []}
+            activity={dashboard?.activity ?? []}
+            query={dashQuery}
+          />
+        {:else if dashboardError}
           <p class="muted">Dashboard unavailable: <code>{dashboardError}</code></p>
         {:else if !dashboard}
           <p class="muted">Loading telemetry…</p>
@@ -2504,22 +2641,22 @@
             <div class="cards dash-overview">
               <article class="card" title={METRIC_HELP.calls}>
                 <h3>Calls</h3>
-                <p class="metric"><code>{dashboard.overview?.calls_fmt ?? 0}</code></p>
+                <p class="metric"><code>{telemetryOverview?.calls_fmt ?? 0}</code></p>
               </article>
               <article class="card" title={METRIC_HELP.distilled}>
                 <h3>Distilled</h3>
-                <p class="metric"><code>{dashboard.overview?.baseline_fmt ?? 0}</code></p>
+                <p class="metric"><code>{telemetryOverview?.baseline_fmt ?? 0}</code></p>
               </article>
               <article class="card" title={METRIC_HELP.returned}>
                 <h3>Returned</h3>
-                <p class="metric"><code>{dashboard.overview?.returned_fmt ?? 0}</code></p>
+                <p class="metric"><code>{telemetryOverview?.returned_fmt ?? 0}</code></p>
               </article>
               <article class="card" title={METRIC_HELP.saved}>
                 <h3>Saved</h3>
                 <p class="metric good"
                   ><code
-                    >{dashboard.overview?.saved_fmt ?? 0}
-                    · {dashboard.overview?.reduction_pct ?? 0}%</code
+                    >{telemetryOverview?.saved_fmt ?? 0}
+                    · {telemetryOverview?.reduction_pct ?? 0}%</code
                   ></p
                 >
               </article>
@@ -2612,18 +2749,88 @@
                 <table class="dash-table">
                   <thead>
                     <tr>
-                      <th class="static" title="Time since the call">When</th>
-                      <th class="static" title="MCP tool name">Tool</th>
-                      <th class="static" title="Wall time for the call">Ms</th>
-                      <th class="static" title="Estimated tokens without wordkeep">Distill</th>
-                      <th class="static" title="Tokens actually returned">Return</th>
-                      <th class="static" title="Call outcome (ok / trunc / error / low-yield)"
-                        >Outcome</th
-                      >
+                      <th>
+                        <button
+                          type="button"
+                          class="sort-btn"
+                          title="Press to sort. Press again to reverse."
+                          onclick={() => pressColumn(activitySort, 'when', true)}
+                          >When{activitySort.key === 'when'
+                            ? activitySort.dir === 'asc'
+                              ? ' ↑'
+                              : ' ↓'
+                            : ''}</button
+                        >
+                      </th>
+                      <th>
+                        <button
+                          type="button"
+                          class="sort-btn"
+                          title="Press to sort. Press again to reverse."
+                          onclick={() => pressColumn(activitySort, 'tool')}
+                          >Tool{activitySort.key === 'tool'
+                            ? activitySort.dir === 'asc'
+                              ? ' ↑'
+                              : ' ↓'
+                            : ''}</button
+                        >
+                      </th>
+                      <th>
+                        <button
+                          type="button"
+                          class="sort-btn"
+                          title="Press to sort. Press again to reverse."
+                          onclick={() => pressColumn(activitySort, 'ms', true)}
+                          >Ms{activitySort.key === 'ms'
+                            ? activitySort.dir === 'asc'
+                              ? ' ↑'
+                              : ' ↓'
+                            : ''}</button
+                        >
+                      </th>
+                      <th>
+                        <button
+                          type="button"
+                          class="sort-btn"
+                          title="Press to sort. Press again to reverse."
+                          onclick={() => pressColumn(activitySort, 'distill', true)}
+                          >Distill{activitySort.key === 'distill'
+                            ? activitySort.dir === 'asc'
+                              ? ' ↑'
+                              : ' ↓'
+                            : ''}</button
+                        >
+                      </th>
+                      <th>
+                        <button
+                          type="button"
+                          class="sort-btn"
+                          title="Press to sort. Press again to reverse."
+                          onclick={() => pressColumn(activitySort, 'return', true)}
+                          >Return{activitySort.key === 'return'
+                            ? activitySort.dir === 'asc'
+                              ? ' ↑'
+                              : ' ↓'
+                            : ''}</button
+                        >
+                      </th>
+                      <th>
+                        <button
+                          type="button"
+                          class="sort-btn"
+                          title="Press to sort. Press again to reverse."
+                          onclick={() => pressColumn(activitySort, 'outcome')}
+                          >Outcome{activitySort.key === 'outcome'
+                            ? activitySort.dir === 'asc'
+                              ? ' ↑'
+                              : ' ↓'
+                            : ''}</button
+                        >
+                      </th>
                     </tr>
                   </thead>
                   <tbody>
-                    {#each dashboard.activity || [] as event}
+                    {#each sortedActivity as event}
                       <tr title={activityTitle(event)}>
                         <td class="muted">{event.ago}</td>
                         <td class="tool-name"
@@ -2644,7 +2851,9 @@
                       </tr>
                     {:else}
                       <tr>
-                        <td colspan="6" class="muted">No recent MCP events.</td>
+                        <td colspan="6" class="muted"
+                          >{dashFiltering ? 'No calls match this filter.' : 'No recent MCP events.'}</td
+                        >
                       </tr>
                     {/each}
                   </tbody>
@@ -2668,13 +2877,49 @@
                 <table class="dash-table">
                   <thead>
                     <tr>
-                      <th class="static" title="Signal category">Signal</th>
-                      <th class="static" title="Primary value">Value</th>
-                      <th class="static" title="Related tool or note">Detail</th>
+                      <th>
+                        <button
+                          type="button"
+                          class="sort-btn"
+                          title="Press to sort. Press again to reverse."
+                          onclick={() => pressColumn(signalSort, 'signal')}
+                          >Signal{signalSort.key === 'signal'
+                            ? signalSort.dir === 'asc'
+                              ? ' ↑'
+                              : ' ↓'
+                            : ''}</button
+                        >
+                      </th>
+                      <th>
+                        <button
+                          type="button"
+                          class="sort-btn"
+                          title="Press to sort. Press again to reverse."
+                          onclick={() => pressColumn(signalSort, 'value', true)}
+                          >Value{signalSort.key === 'value'
+                            ? signalSort.dir === 'asc'
+                              ? ' ↑'
+                              : ' ↓'
+                            : ''}</button
+                        >
+                      </th>
+                      <th>
+                        <button
+                          type="button"
+                          class="sort-btn"
+                          title="Press to sort. Press again to reverse."
+                          onclick={() => pressColumn(signalSort, 'detail')}
+                          >Detail{signalSort.key === 'detail'
+                            ? signalSort.dir === 'asc'
+                              ? ' ↑'
+                              : ' ↓'
+                            : ''}</button
+                        >
+                      </th>
                     </tr>
                   </thead>
                   <tbody>
-                    {#each dashboard.health?.signals || [] as signal}
+                    {#each sortedSignals as signal}
                       <tr
                         class={`signal-${signal.kind}`}
                         title={`${signal.label}: ${signal.value ?? '—'}${signal.detail ? ` (${signal.detail})` : ''}`}
@@ -2691,7 +2936,9 @@
                       </tr>
                     {:else}
                       <tr>
-                        <td colspan="3" class="muted">No health signals yet.</td>
+                        <td colspan="3" class="muted"
+                          >{dashFiltering ? 'No health signals match this filter.' : 'No health signals yet.'}</td
+                        >
                       </tr>
                     {/each}
                   </tbody>
@@ -2862,7 +3109,6 @@
             </table>
           </div>
           </CollapsibleSection>
-        {/if}
 
         <footer class="panel-footer muted">
           <div class="cmd-row">
@@ -2934,6 +3180,7 @@
             >Auto-refreshes every 2s while this tab is open.</p
           >
         </footer>
+        {/if}
       </section>
     {:else}
       <div class="health-wrap">
@@ -3164,6 +3411,22 @@
   }
   .subview-btn.active {
     border-color: var(--accent, #6bcf8e);
+  }
+  .dash-filter {
+    display: block;
+    margin: 0 0 0.85rem;
+  }
+  .dash-filter input {
+    width: 100%;
+    border: 1px solid var(--border);
+    background: var(--bg);
+    border-radius: 8px;
+    padding: 0.5rem 0.7rem;
+    min-width: 0;
+  }
+  .dash-filter input:focus {
+    outline: none;
+    border-color: var(--accent);
   }
   .shell.resizing {
     cursor: col-resize;
@@ -4109,83 +4372,13 @@
   .dash-overview .metric code {
     font-size: 0.95em;
   }
-  .metric.good code,
-  .dash-table .good {
+  .metric.good code {
     color: #7dce9a;
-  }
-  .table-wrap {
-    overflow: auto;
-    border: 1px solid var(--border);
-    border-radius: var(--radius);
-    margin-bottom: 1rem;
-  }
-  .dash-table {
-    width: 100%;
-    border-collapse: collapse;
-    font-size: 0.82rem;
-    white-space: nowrap;
-  }
-  .dash-table th,
-  .dash-table td {
-    padding: 0.4rem 0.55rem;
-    border-bottom: 1px solid var(--border);
-    text-align: right;
-  }
-  .dash-table th:first-child,
-  .dash-table td:first-child {
-    text-align: left;
-    position: sticky;
-    left: 0;
-    background: var(--bg-elevated);
-  }
-  .dash-table thead th {
-    color: var(--muted);
-    font-weight: 600;
-    background: rgba(0, 0, 0, 0.18);
-    padding: 0;
-  }
-  .dash-table thead th.static {
-    padding: 0.4rem 0.55rem;
-  }
-  .sort-btn {
-    width: 100%;
-    border: 0;
-    background: transparent;
-    color: inherit;
-    font: inherit;
-    font-weight: 600;
-    padding: 0.4rem 0.55rem;
-    cursor: pointer;
-    text-align: inherit;
-  }
-  .sort-btn:hover {
-    color: var(--accent-strong);
-    background: var(--accent-soft);
-  }
-  .dash-table tr.inverted td {
-    color: #e87b7b;
-  }
-  .dash-table .bar {
-    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-    letter-spacing: 0.02em;
-  }
-  .dash-table .tool-name {
-    text-align: left;
-  }
-  .dash-table .tool-name code {
-    font-size: 0.9em;
   }
   .dash-split {
     display: grid;
     grid-template-columns: 1.4fr 1fr;
     gap: 1rem;
-  }
-  .dash-table tr.signal-ok .signal-value {
-    color: #7dce9a;
-  }
-  .dash-table tr.signal-warn .signal-value,
-  .dash-table tr.signal-danger .signal-value {
-    color: #e87b7b;
   }
   .cmd-row {
     display: flex;

@@ -4,7 +4,7 @@ All tools accept optional `token_budget` (approximate max response tokens) where
 Path-accepting tools use `paths`, optional `profile`, or `.wordkeep/config.json`
 `path_profiles` / `default_paths` (see [configuration.md](configuration.md)).
 
-**Surface:** 40 tools + MCP resources `wordkeep://readme`, `wordkeep://capabilities`.
+**Surface:** 48 tools + MCP resources `wordkeep://readme`, `wordkeep://capabilities`.
 
 ## Navigation
 
@@ -86,6 +86,24 @@ Opt-in temporal composability for agent notes (FIG-2026-005 PoC):
 Conflict policy: recover refuses if on-disk content no longer matches the journaled post-write snapshot (external edit or concurrent writer).
 
 **Spatial coeffects:** write tools notify dependent caches per `wordkeep://capabilities` (`coeffects.rs`). `mas_read` evicts session cache before load.
+
+## Izakaya (presence)
+
+Live agents coordinate through Izakaya, not by overloading MAS rounds.
+Check in before the first edit, update when scope changes, and check out on
+handoff. Long handoff prose still uses `mas_post`; checkout only stores the
+reference. See [designs/izakaya.md](designs/izakaya.md).
+
+| Tool | Purpose |
+| --- | --- |
+| `izakaya_status` | Read-only board: agents, stale leases, advisory overlaps, handoffs |
+| `izakaya_check_in` | Take or resume a lease before live edits |
+| `izakaya_update` | Heartbeat, `live_code` / `suspended`, notes |
+| `izakaya_check_out` | Release claims; optional handoff capsule |
+| `izakaya_record_decision` | Log the visible frontier and chosen batch |
+| `izakaya_record_outcome` | Attach measured metrics / run ids |
+| `izakaya_replay` | Historical supported replay (no promotion) |
+| `izakaya_advise` | Read-only recommendations from a promoted policy |
 
 ## MCP resources
 

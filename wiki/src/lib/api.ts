@@ -315,6 +315,92 @@ export function fetchDashboard() {
   return getJson<DashboardPayload>(`${API_BASE}/dashboard`);
 }
 
+export type IzakayaClaim = { path: string; symbols?: string[]; intent?: string };
+
+export type IzakayaAgent = {
+  agent_id: string;
+  state: string;
+  stale?: boolean;
+  role?: string;
+  task?: string;
+  summary?: string;
+  branch?: string;
+  head?: string;
+  worktree?: string;
+  dirty_count?: number;
+  claims?: IzakayaClaim[];
+  blockers?: string[];
+  checkpoint?: string | null;
+  checkout_reason?: string | null;
+  mas_session?: string | null;
+  revision?: number;
+  checked_in_at?: number;
+  last_seen_at?: number;
+  expires_at?: number;
+};
+
+export type IzakayaHandoff = {
+  id: string;
+  from: string;
+  to: string;
+  status: string;
+  derived_status?: string;
+  summary?: string;
+  mas_session?: string | null;
+  checkpoint?: string | null;
+  created_at?: number;
+  accepted_by?: string | null;
+};
+
+export type IzakayaMessage = {
+  seq: number;
+  from: string;
+  to: string;
+  body: string;
+  acked?: boolean;
+};
+
+export type IzakayaEvent = {
+  seq: number;
+  kind: string;
+  agent_id: string;
+  ts: number;
+  result?: string;
+};
+
+export type IzakayaFinding = { kind: string; detail: string };
+
+export type IzakayaPayload = {
+  available: boolean;
+  empty?: boolean;
+  message?: string;
+  coordination_id?: string;
+  seq?: number;
+  journal_seq?: number;
+  updated_at?: number;
+  now?: number;
+  active_policy?: string | null;
+  malformed?: number;
+  projection_behind?: boolean;
+  counts?: {
+    live_code: number;
+    checked_in: number;
+    suspended: number;
+    checked_out: number;
+    stale: number;
+    handoffs_open: number;
+  };
+  agents?: IzakayaAgent[];
+  handoffs?: IzakayaHandoff[];
+  messages?: IzakayaMessage[];
+  events?: IzakayaEvent[];
+  findings?: IzakayaFinding[];
+};
+
+export function fetchIzakaya() {
+  return getJson<IzakayaPayload>(`${API_BASE}/izakaya`);
+}
+
 export type RuntimeRegion = {
   start?: string;
   end?: string;

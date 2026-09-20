@@ -2,6 +2,7 @@ mod config;
 mod dashboard;
 mod garden;
 mod indexer;
+mod izakaya;
 mod meili;
 mod runtime;
 mod telemetry;

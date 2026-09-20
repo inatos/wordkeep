@@ -20,6 +20,12 @@
     "auto_promote": false,
     "handoff_tokens": 1600
   },
+  "izakaya": {
+    "ttl_secs": 300,
+    "suspend_ttl_secs": 86400,
+    "orphan_secs": 86400,
+    "profiles_dir": ".wordkeep/izakaya/profiles"
+  },
   "wiki": {
     "meili_url": "http://127.0.0.1:7700",
     "index": "wiki_chunks",
