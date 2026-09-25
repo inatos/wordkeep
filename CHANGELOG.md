@@ -14,9 +14,11 @@ Telemetry upgrade pass (token → accuracy → latency). Surface is **51** tools
   same query (no re-emit of earlier rows). Wired for `repo_map`, `outline`
   (batch), `knowledge_search`, `module_map`, `big_functions`, `symbol_refs`,
   `symbol_context`. Prefer continuation over blindly raising `token_budget`.
-- **`notifications/progress`**: when the client passes `_meta.progressToken` on
-  `tools/call`, long walks emit MCP progress ticks (stdio) before the final
-  result. No-op without a token.
+- **`notifications/progress`**: opt-in via `WORDKEEP_MCP_PROGRESS=1`. When the
+  client also passes `_meta.progressToken` on `tools/call`, long walks emit MCP
+  progress ticks (stdio) before the final result. Default **off** — Cursor Shared
+  MCP currently treats unrecognized progress tokens as a transport error and
+  marks the server failed.
 
 ### Fixed (live-soak follow-up)
 

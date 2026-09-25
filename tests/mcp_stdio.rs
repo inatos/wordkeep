@@ -923,6 +923,8 @@ fn paths_escape_root_is_rejected() {
 
 #[test]
 fn progress_token_emits_notification() {
+    // Progress is opt-in (Cursor Shared MCP fatals on unknown progress tokens).
+    std::env::set_var("WORDKEEP_MCP_PROGRESS", "1");
     let mut s = Server::start();
     let _ = s.call(json!({
         "jsonrpc": "2.0",

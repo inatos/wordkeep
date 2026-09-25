@@ -1,8 +1,14 @@
 //! MCP `notifications/progress` helpers for long tool calls.
 //!
-//! When the client passes `_meta.progressToken` on `tools/call`, handlers may
-//! call [`tick`] to emit progress notifications on stdout before the final
-//! result. With no token installed, ticks are no-ops.
+//! When the client passes `_meta.progressToken` on `tools/call` **and**
+//! `WORDKEEP_MCP_PROGRESS=1`, handlers may call [`tick`] to emit progress
+//! notifications on stdout before the final result. Otherwise ticks are
+//! no-ops.
+//!
+//! Progress is **opt-in** because Cursor's Shared MCP client currently treats
+//! `notifications/progress` for an unrecognized token as a transport error and
+//! marks the server failed (`connection:transport_error` → live tool discovery
+//! dead). Hosts that properly register `_meta.progressToken` can enable ticks.
 
 use serde_json::{json, Value};
 use std::cell::RefCell;
@@ -17,6 +23,15 @@ thread_local! {
 /// interleave JSON-RPC lines on stdout.
 static OUT_LOCK: Mutex<()> = Mutex::new(());
 
+/// Whether `notifications/progress` emission is enabled (`WORDKEEP_MCP_PROGRESS=1`).
+pub fn progress_enabled() -> bool {
+    matches!(
+        std::env::var("WORDKEEP_MCP_PROGRESS").ok().as_deref(),
+        Some("1") | Some("true") | Some("TRUE") | Some("yes") | Some("YES") | Some("on")
+            | Some("ON")
+    )
+}
+
 /// Acquire the shared stdout serialization lock (also used by `mcp` result writes).
 pub fn stdout_lock() -> std::sync::MutexGuard<'static, ()> {
     OUT_LOCK.lock().unwrap_or_else(|e| e.into_inner())
@@ -24,6 +39,10 @@ pub fn stdout_lock() -> std::sync::MutexGuard<'static, ()> {
 
 /// Install the progress token for the duration of a `tools/call` handler.
 pub fn install(progress_token: Option<Value>) {
+    if !progress_enabled() {
+        TOKEN.with(|t| *t.borrow_mut() = None);
+        return;
+    }
     TOKEN.with(|t| {
         *t.borrow_mut() = progress_token.filter(|v| !v.is_null());
     });
@@ -36,8 +55,11 @@ pub fn clear() {
     });
 }
 
-/// Emit `notifications/progress` when a token is installed.
+/// Emit `notifications/progress` when a token is installed and progress is enabled.
 pub fn tick(progress: u64, total: Option<u64>, message: &str) {
+    if !progress_enabled() {
+        return;
+    }
     TOKEN.with(|t| {
         let Some(token) = t.borrow().clone() else {
             return;

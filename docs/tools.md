@@ -8,9 +8,11 @@ Path-accepting tools use `paths`, optional `profile`, or `.wordkeep/config.json`
 Re-call the same tool with `continuation` (and the same query args) to fetch the
 next page. Prefer that over raising `token_budget` alone.
 
-**Progress:** hosts that send `_meta.progressToken` on `tools/call` receive
-`notifications/progress` ticks during long walks (status only; the agent still
-sees one final text result).
+**Progress:** opt-in via `WORDKEEP_MCP_PROGRESS=1`. When enabled, hosts that send
+`_meta.progressToken` on `tools/call` receive `notifications/progress` ticks
+during long walks (status only; the agent still sees one final text result).
+Default off — Cursor's Shared MCP client currently fatals on unrecognized
+progress tokens and drops the server connection.
 
 **Surface:** 51 tools + MCP resources `wordkeep://readme`, `wordkeep://capabilities`.
 

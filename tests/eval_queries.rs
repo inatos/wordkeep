@@ -552,6 +552,8 @@ fn eval_continuation_rejects_args_drift() {
 
 #[test]
 fn eval_progress_notifications_on_repo_map() {
+    // Progress is opt-in (Cursor Shared MCP fatals on unknown progress tokens).
+    std::env::set_var("WORDKEEP_MCP_PROGRESS", "1");
     let mut s = Server::start();
     let (notes, resp) = s.call_with_progress(json!({
         "jsonrpc": "2.0",

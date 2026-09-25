@@ -305,12 +305,15 @@ elif [[ "$FORCE" -eq 0 ]] && healthy; then
 fi
 
 if ! command -v docker >/dev/null 2>&1; then
-  echo "[wordkeep:wiki] docker not found; Meilisearch won't start" >&2
-  exit 1
+  echo "[wordkeep:wiki] docker not found; starting without Meilisearch (search degraded)" >&2
+elif ! docker info >/dev/null 2>&1; then
+  echo "[wordkeep:wiki] docker daemon unavailable; starting without Meilisearch (search degraded)" >&2
+else
+  echo "[wordkeep:wiki] ensuring Meilisearch (compose)…"
+  if ! docker compose -f "$WK/docker-compose.wiki.yml" up -d; then
+    echo "[wordkeep:wiki] Meilisearch compose failed; continuing without it (search degraded)" >&2
+  fi
 fi
-
-echo "[wordkeep:wiki] ensuring Meilisearch (compose)…"
-docker compose -f "$WK/docker-compose.wiki.yml" up -d
 
 if ! ensure_ui_dist; then
   exit 1
