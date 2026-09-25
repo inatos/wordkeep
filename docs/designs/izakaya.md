@@ -57,12 +57,14 @@ checked out, and `izakaya.orphan_secs` has elapsed.
 4. Suspend only with a checkpoint when the tree is dirty.
 5. Post the long handoff to MAS first, then `izakaya_check_out` with that reference.
 
-## Replay lab
+## Replay lab (CLI / offline)
 
-`izakaya_record_decision` stores the legal frontier and the batch that was
-actually started, including model/evaluator fingerprints. `izakaya_record_outcome`
-stores measured metrics and may copy numbers from `run_record` metadata. It
-does not execute commands.
+Decision/outcome recording and historical supported replay are **not** MCP tools
+(agents never produced journal entries; zero telemetry calls). The offline lab
+remains for tests and CLI policy work:
+
+- `presence::record_decision` / `record_outcome` (library + unit tests)
+- `wordkeep izakaya policy evaluate|promote|retire`
 
 Replay is **historical supported replay**, not a counterfactual simulator:
 
@@ -92,9 +94,6 @@ work, suspend, check out, or run Git.
 | `izakaya_check_in` | journal |
 | `izakaya_update` | journal |
 | `izakaya_check_out` | journal |
-| `izakaya_record_decision` | journal |
-| `izakaya_record_outcome` | journal |
-| `izakaya_replay` | no |
 | `izakaya_advise` | no |
 
 ## Dashboard

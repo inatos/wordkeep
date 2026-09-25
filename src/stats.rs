@@ -240,8 +240,15 @@ static WORKSPACE_ID: OnceLock<String> = OnceLock::new();
 static WORKSPACE_ROOT: OnceLock<PathBuf> = OnceLock::new();
 
 /// Register all MCP tool names (for never-called insights in `stats`).
+/// Also prunes aggregate keys for tools no longer on the surface and clears
+/// known false net-negative baselines from the old constant-64 era.
 pub fn init_registry(names: Vec<&'static str>) {
     let _ = REGISTRY.set(names);
+    if let Ok(mut s) = cell().lock() {
+        if s.prune_stale_registry() {
+            s.save();
+        }
+    }
 }
 
 /// Bind telemetry events to a workspace (call once from `main`).
@@ -260,6 +267,22 @@ fn workspace_root() -> Option<&'static Path> {
 
 fn registry() -> &'static [&'static str] {
     REGISTRY.get().map(|v| v.as_slice()).unwrap_or(&[])
+}
+
+/// Tools that historically recorded distilled=`64` per call (false net-negatives).
+fn legacy_flat_baseline_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "izakaya_check_in"
+            | "izakaya_check_out"
+            | "izakaya_status"
+            | "izakaya_update"
+            | "izakaya_advise"
+            | "mas_read"
+            | "mas_status"
+            | "session_handoff"
+            | "session_pressure"
+    )
 }
 
 fn cell() -> &'static Mutex<Store> {
@@ -341,6 +364,30 @@ impl Store {
         self.save();
         self.pending_flush = 0;
         self.last_flush = Instant::now();
+    }
+
+    /// Drop tools no longer registered and clear old flat-64 false net-negatives.
+    /// Returns true when the store was mutated.
+    fn prune_stale_registry(&mut self) -> bool {
+        let reg: std::collections::HashSet<&str> = registry().iter().copied().collect();
+        let mut dirty = false;
+        if !reg.is_empty() {
+            let before = self.tools.len();
+            self.tools.retain(|name, _| reg.contains(name.as_str()));
+            if self.tools.len() != before {
+                dirty = true;
+            }
+        }
+        for (name, t) in self.tools.iter_mut() {
+            if !legacy_flat_baseline_tool(name) {
+                continue;
+            }
+            if t.calls > 0 && t.baseline_tokens == t.calls.saturating_mul(64) {
+                t.baseline_tokens = 0;
+                dirty = true;
+            }
+        }
+        dirty
     }
 
     fn from_value(v: &Value) -> Store {
@@ -1481,6 +1528,43 @@ mod tests {
         let o = s2.tools.get("outline").unwrap();
         assert_eq!(o.total_us, 0);
         assert_eq!(o.trunc_count, 0);
+    }
+
+    #[test]
+    fn prune_stale_registry_drops_removed_and_clears_flat64() {
+        let _ = REGISTRY.set(vec!["outline", "repo_map", "izakaya_status"]);
+        let mut s = Store::empty();
+        s.tools.insert(
+            "outline".into(),
+            Tool {
+                calls: 10,
+                baseline_tokens: 5_000,
+                returned_tokens: 100,
+                ..Default::default()
+            },
+        );
+        s.tools.insert(
+            "izakaya_record_decision".into(),
+            Tool {
+                calls: 1,
+                baseline_tokens: 64,
+                returned_tokens: 20,
+                ..Default::default()
+            },
+        );
+        s.tools.insert(
+            "izakaya_status".into(),
+            Tool {
+                calls: 5,
+                baseline_tokens: 320, // 5 * 64
+                returned_tokens: 900,
+                ..Default::default()
+            },
+        );
+        assert!(s.prune_stale_registry());
+        assert!(!s.tools.contains_key("izakaya_record_decision"));
+        assert!(s.tools.contains_key("outline"));
+        assert_eq!(s.tools.get("izakaya_status").unwrap().baseline_tokens, 0);
     }
 
     #[test]

@@ -1,7 +1,7 @@
 {
   "version": 1,
-  "tool_count": 48,
-  "notes": "Effect/coeffect manifest (FIG-2026-005). Wired: knowledge-chunks-cache, mas-session, workspace-cache. config/defects/runs/effect-journal are disk-fresh reads. Izakaya writes only its coordination journal (FIG-2026-006); replay and advise stay read-only.",
+  "tool_count": 51,
+  "notes": "Effect/coeffect manifest (FIG-2026-005). Wired: knowledge-chunks-cache, mas-session, workspace-cache. config/defects/runs/effect-journal are disk-fresh reads. Izakaya writes only its coordination journal (FIG-2026-006); advise stays read-only. Decision/outcome/replay MCP tools were removed (no agent producer path; offline lab remains via CLI policy evaluate). Triage composites (batch_context, perf_triage, test_impact) and index_health are read-only.",
   "tools": {
     "knowledge_upsert": {
       "effects": ["write-notes"],
@@ -45,14 +45,6 @@
       "coeffects": []
     },
     "izakaya_check_out": {
-      "effects": ["write-izakaya-journal"],
-      "coeffects": []
-    },
-    "izakaya_record_decision": {
-      "effects": ["write-izakaya-journal"],
-      "coeffects": []
-    },
-    "izakaya_record_outcome": {
       "effects": ["write-izakaya-journal"],
       "coeffects": []
     }

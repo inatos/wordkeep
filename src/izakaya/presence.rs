@@ -310,6 +310,9 @@ pub fn check_out(root: &Path, args: &Value) -> Result<Value, String> {
     )
 }
 
+/// Offline Dream-RSI journal write (tests + future CLI). Not an MCP tool —
+/// agents never produced decision frontiers; see wordkeep-dead-tool-triage.md.
+#[allow(dead_code)]
 pub fn record_decision(root: &Path, args: &Value) -> Result<Value, String> {
     model::reject_unsafe_payload(args)?;
     let agent_id = agent_id_of(args)?;
@@ -373,6 +376,8 @@ pub fn record_decision(root: &Path, args: &Value) -> Result<Value, String> {
     )
 }
 
+/// Offline Dream-RSI outcome attach (tests + future CLI). Not an MCP tool.
+#[allow(dead_code)]
 pub fn record_outcome(root: &Path, args: &Value) -> Result<Value, String> {
     model::reject_unsafe_payload(args)?;
     let agent_id = agent_id_of(args)?;
@@ -440,6 +445,7 @@ pub fn record_outcome(root: &Path, args: &Value) -> Result<Value, String> {
     )
 }
 
+#[allow(dead_code)] // offline lab helper for record_outcome
 fn btree_map_from(v: Option<&Value>) -> std::collections::BTreeMap<String, f64> {
     let mut out = std::collections::BTreeMap::new();
     let Some(obj) = v.and_then(Value::as_object) else {
@@ -541,6 +547,7 @@ fn render_check_out(proj: &Projection, event: &Event) -> Value {
     })
 }
 
+#[allow(dead_code)] // offline lab render for record_decision
 fn render_decision(_proj: &Projection, event: &Event) -> Value {
     let id = event
         .body
@@ -554,6 +561,7 @@ fn render_decision(_proj: &Projection, event: &Event) -> Value {
     })
 }
 
+#[allow(dead_code)] // offline lab render for record_outcome
 fn render_outcome(_proj: &Projection, event: &Event) -> Value {
     let id = event
         .body
@@ -775,6 +783,7 @@ fn bound_handoff(v: &Value, id: &str) -> Value {
     })
 }
 
+#[allow(dead_code)] // offline lab helper for record_decision
 fn parse_actions(args: &Value, key: &str) -> Result<Vec<Value>, String> {
     let Some(arr) = args.get(key).and_then(Value::as_array) else {
         return Ok(Vec::new());
@@ -822,6 +831,7 @@ fn parse_claims(_root: &Path, args: &Value) -> Result<Vec<Claim>, String> {
     Ok(out)
 }
 
+#[allow(dead_code)] // offline lab helper for record_decision
 fn fingerprints(args: &Value) -> Value {
     let Some(obj) = args.get("fingerprints").and_then(Value::as_object) else {
         return json!({});

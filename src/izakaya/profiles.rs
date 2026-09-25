@@ -17,6 +17,7 @@ pub struct Objective {
 }
 
 #[derive(Clone, Debug)]
+#[allow(dead_code)] // offline lab: run → metric adapters for record_outcome
 pub struct RunAdapter {
     pub tag: String,
     pub metric: String,
@@ -127,6 +128,7 @@ pub fn list_ids(root: &Path) -> Vec<String> {
     ids
 }
 
+#[allow(dead_code)] // offline lab: used by record_outcome
 pub fn apply_run_adapters(
     profile: &Profile,
     run: &crate::runs::Run,
@@ -304,6 +306,7 @@ pub fn reject_executable(v: &Value) -> Result<(), String> {
     }
 }
 
+#[allow(dead_code)] // offline lab helper for apply_run_adapters
 fn first_number(text: &str) -> Option<f64> {
     let bytes = text.as_bytes();
     let mut i = 0;

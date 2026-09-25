@@ -38,8 +38,6 @@ impl Server {
     pub fn run(&self) -> io::Result<()> {
         let stdin = io::stdin();
         let mut reader = stdin.lock();
-        let stdout = io::stdout();
-        let mut out = stdout.lock();
         let mut line = String::new();
 
         loop {
@@ -74,16 +72,15 @@ impl Server {
                         "jsonrpc": "2.0",
                         "method": "notifications/tools/list_changed"
                     });
-                    let s = serde_json::to_string(&note).unwrap_or_else(|_| "{}".to_string());
-                    out.write_all(s.as_bytes())?;
-                    out.write_all(b"\n")?;
-                    out.flush()?;
+                    write_stdout_line(&note)?;
                 }
                 continue;
             }
 
             let id = req.get("id").cloned().unwrap_or(Value::Null);
 
+            // Do not hold the stdout lock across tools/call: progress ticks
+            // flush notifications mid-handler.
             let response = match method {
                 "initialize" => self.handle_initialize(&params, id),
                 "tools/list" => self.handle_list(id),
@@ -94,10 +91,7 @@ impl Server {
                 other => err_response(id, -32601, &format!("method not found: {other}")),
             };
 
-            let s = serde_json::to_string(&response).unwrap_or_else(|_| "{}".to_string());
-            out.write_all(s.as_bytes())?;
-            out.write_all(b"\n")?;
-            out.flush()?;
+            write_stdout_line(&response)?;
         }
         Ok(())
     }
@@ -146,7 +140,9 @@ impl Server {
             .cloned()
             .unwrap_or_else(|| json!({}));
 
-        match self.tools.iter().find(|t| t.name == name) {
+        // Progress notifications may flush to stdout during the handler.
+        crate::progress::install(crate::progress::token_from_call_params(params));
+        let response = match self.tools.iter().find(|t| t.name == name) {
             Some(tool) => match (tool.handler)(&args) {
                 // Tool-level failures are reported via `isError`, not a JSON-RPC error.
                 Ok(text) => ok_result(
@@ -159,7 +155,9 @@ impl Server {
                 ),
             },
             None => err_response(id, -32602, &format!("unknown tool: {name}")),
-        }
+        };
+        crate::progress::clear();
+        response
     }
 
     fn handle_resources_list(&self, id: Value) -> Value {
@@ -216,6 +214,18 @@ fn ok_result(id: Value, result: Value) -> Value {
 
 fn err_response(id: Value, code: i64, message: &str) -> Value {
     json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } })
+}
+
+fn write_stdout_line(msg: &Value) -> io::Result<()> {
+    // Share the lock with progress::tick so notification and result lines
+    // never interleave mid-JSON.
+    let _guard = crate::progress::stdout_lock();
+    let mut out = io::stdout().lock();
+    let s = serde_json::to_string(msg).unwrap_or_else(|_| "{}".to_string());
+    out.write_all(s.as_bytes())?;
+    out.write_all(b"\n")?;
+    out.flush()?;
+    Ok(())
 }
 
 #[cfg(test)]

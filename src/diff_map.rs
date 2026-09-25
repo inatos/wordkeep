@@ -17,7 +17,7 @@ use std::process::Command;
 use tree_sitter::Parser;
 
 use crate::lang::Lang;
-use crate::{cache, call_graph, stats, symbol_def};
+use crate::{cache, call_graph, progress, stats, symbol_def};
 
 /// How a changed function differs at the diffed revision.
 #[derive(Clone, Copy, PartialEq)]
@@ -68,8 +68,9 @@ pub fn build(root: &Path, args: &Value) -> Result<String, String> {
         .and_then(Value::as_u64)
         .unwrap_or(1200) as usize;
 
-    let diff = match git_diff(root, &gitref, &paths, 0) {
-        Ok(d) => d,
+    progress::tick(0, None, "diff_map: git diff");
+    let (per_file, baseline_bytes) = match collect_changed_detail(root, &gitref, &paths) {
+        Ok(v) => v,
         // Git missing / not a repo / bad ref: a graceful message, not an error,
         // so the tool never surfaces as a protocol failure.
         Err(msg) => {
@@ -78,68 +79,6 @@ pub fn build(root: &Path, args: &Value) -> Result<String, String> {
             return Ok(out);
         }
     };
-
-    // Diff paths are repo-top-relative; resolve files against the repo top, but
-    // display them relative to our root when possible.
-    let top = repo_top(root).unwrap_or_else(|| root.to_path_buf());
-    let changed = parse_diff(&diff);
-
-    let mut parser = Parser::new();
-    let mut per_file: Vec<(String, Vec<ChangedSym>)> = Vec::new();
-    let mut baseline_bytes = 0u64;
-    for (rel_top, lines) in &changed {
-        let abs = top.join(rel_top);
-        let Some(lang) = Lang::from_path(&abs) else {
-            continue;
-        };
-        let Ok(meta) = std::fs::metadata(&abs) else {
-            continue;
-        };
-        baseline_bytes += meta.len();
-        let mt = cache::mtime_ns(&meta);
-        let spans = symbol_def::function_spans(&mut parser, lang, &abs, mt);
-        // Old-side signatures (keyed by trailing segment) so we can tell an
-        // ABI-breaking signature change from a body-only edit. If the ref's blob
-        // can't be read (e.g. the file is new), signature status stays Unknown.
-        let old_src = git_show(root, &gitref, rel_top);
-        if let Some(s) = &old_src {
-            baseline_bytes += s.len() as u64;
-        }
-        let old_sigs: Option<BTreeMap<String, BTreeSet<String>>> = old_src.map(|s| {
-            let mut m: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-            for sp in symbol_def::function_spans_from_str(lang, &s) {
-                m.entry(seg(&sp.name).to_string())
-                    .or_default()
-                    .insert(sp.signature);
-            }
-            m
-        });
-        let rel_disp = abs
-            .strip_prefix(root)
-            .map(|p| p.to_string_lossy().replace('\\', "/"))
-            .unwrap_or_else(|_| rel_top.clone());
-        let mut hits: Vec<ChangedSym> = Vec::new();
-        for s in &spans {
-            if lines.range(s.start..=s.end).next().is_some() {
-                let change = match &old_sigs {
-                    None => Change::Unknown,
-                    Some(map) => match map.get(seg(&s.name)) {
-                        None => Change::New,
-                        Some(set) if set.contains(&s.signature) => Change::Body,
-                        Some(_) => Change::Signature,
-                    },
-                };
-                hits.push(ChangedSym {
-                    name: s.name.clone(),
-                    line: s.start,
-                    change,
-                });
-            }
-        }
-        if !hits.is_empty() {
-            per_file.push((rel_disp, hits));
-        }
-    }
 
     // One whole-tree adjacency (warm-cached) answers every caller lookup —
     // previously each changed symbol triggered a separate full-tree `one_hop`.
@@ -251,6 +190,94 @@ fn render(
         (out.len() / 4) as u64,
     );
     out
+}
+
+/// Changed functions vs `gitref` under `paths`: `(rel_disp, name, start_line)`.
+/// Used by `test_impact` without re-running the full caller analysis.
+pub(crate) fn changed_functions(
+    root: &Path,
+    gitref: &str,
+    paths: &[String],
+) -> Result<Vec<(String, String, usize)>, String> {
+    let (per_file, _) = collect_changed_detail(root, gitref, paths)?;
+    let mut out = Vec::new();
+    for (rel, syms) in per_file {
+        for s in syms {
+            out.push((rel.clone(), s.name, s.line));
+        }
+    }
+    Ok(out)
+}
+
+/// Collect per-file changed symbols (with change tags) vs `gitref`.
+fn collect_changed_detail(
+    root: &Path,
+    gitref: &str,
+    paths: &[String],
+) -> Result<(Vec<(String, Vec<ChangedSym>)>, u64), String> {
+    let diff = git_diff(root, gitref, paths, 0)?;
+    // Diff paths are repo-top-relative; resolve files against the repo top, but
+    // display them relative to our root when possible.
+    let top = repo_top(root).unwrap_or_else(|| root.to_path_buf());
+    let changed = parse_diff(&diff);
+
+    let mut parser = Parser::new();
+    let mut per_file: Vec<(String, Vec<ChangedSym>)> = Vec::new();
+    let mut baseline_bytes = 0u64;
+    for (rel_top, lines) in &changed {
+        let abs = top.join(rel_top);
+        let Some(lang) = Lang::from_path(&abs) else {
+            continue;
+        };
+        let Ok(meta) = std::fs::metadata(&abs) else {
+            continue;
+        };
+        baseline_bytes += meta.len();
+        let mt = cache::mtime_ns(&meta);
+        let spans = symbol_def::function_spans(&mut parser, lang, &abs, mt);
+        // Old-side signatures (keyed by trailing segment) so we can tell an
+        // ABI-breaking signature change from a body-only edit. If the ref's blob
+        // can't be read (e.g. the file is new), signature status stays Unknown.
+        let old_src = git_show(root, gitref, rel_top);
+        if let Some(s) = &old_src {
+            baseline_bytes += s.len() as u64;
+        }
+        let old_sigs: Option<BTreeMap<String, BTreeSet<String>>> = old_src.map(|s| {
+            let mut m: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+            for sp in symbol_def::function_spans_from_str(lang, &s) {
+                m.entry(seg(&sp.name).to_string())
+                    .or_default()
+                    .insert(sp.signature);
+            }
+            m
+        });
+        let rel_disp = abs
+            .strip_prefix(root)
+            .map(|p| p.to_string_lossy().replace('\\', "/"))
+            .unwrap_or_else(|_| rel_top.clone());
+        let mut hits: Vec<ChangedSym> = Vec::new();
+        for s in &spans {
+            if lines.range(s.start..=s.end).next().is_some() {
+                let change = match &old_sigs {
+                    None => Change::Unknown,
+                    Some(map) => match map.get(seg(&s.name)) {
+                        None => Change::New,
+                        Some(set) if set.contains(&s.signature) => Change::Body,
+                        Some(_) => Change::Signature,
+                    },
+                };
+                hits.push(ChangedSym {
+                    name: s.name.clone(),
+                    line: s.start,
+                    change,
+                });
+            }
+        }
+        if !hits.is_empty() {
+            per_file.push((rel_disp, hits));
+        }
+    }
+    Ok((per_file, baseline_bytes))
 }
 
 /// `git -C <root> diff --unified=N <ref> -- <paths…>`, captured as text. The ref

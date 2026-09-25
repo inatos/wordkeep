@@ -646,6 +646,13 @@ pub fn read(root: &Path, args: &Value) -> Result<String, String> {
         .iter()
         .map(|e| estimate_tokens(&entry_text(e)) as u64)
         .sum();
+    // Prefer on-disk session size (raw re-read baseline) so full-board reads
+    // with headers do not falsely flip net-negative vs a tiny entry-sum.
+    let session_file_tokens = session_path(root, &session)
+        .ok()
+        .and_then(|p| std::fs::metadata(p).ok().map(|m| m.len() / 4))
+        .unwrap_or(0);
+    let baseline = distilled.max(session_file_tokens).max(64);
     let mut out = format!(
         "mas_read - session {session}, round {}/{}, status {}, {} match(es)\n",
         s.round,
@@ -669,7 +676,7 @@ pub fn read(root: &Path, args: &Value) -> Result<String, String> {
     if shown == 0 {
         out.push_str("\n(no matching entries)\n");
     }
-    stats::record("mas_read", distilled, estimate_tokens(&out) as u64);
+    stats::record("mas_read", baseline, estimate_tokens(&out) as u64);
     Ok(out)
 }
 
@@ -897,6 +904,66 @@ fn format_handoff_prompt(root: &Path, s: &Session, extra_result: Option<&str>) -
     out
 }
 
+/// Compact paste-ready handoff for `session_pressure` autopilot. Does **not**
+/// write files or mark handoff — call [`session_handoff`] to persist.
+pub(crate) fn draft_autopilot_handoff(
+    root: &Path,
+    session: Option<&str>,
+    max_tokens: usize,
+) -> String {
+    let draft = if let Some(sid) = session.filter(|s| !s.is_empty()) {
+        match load_session(root, sid) {
+            Ok(Some(s)) => format_handoff_prompt(root, &s, None),
+            _ => compact_pressure_handoff(root, Some(sid)),
+        }
+    } else {
+        compact_pressure_handoff(root, None)
+    };
+    truncate_to_tokens(&draft, max_tokens.max(64))
+}
+
+fn compact_pressure_handoff(root: &Path, session: Option<&str>) -> String {
+    let defects = defects::unresolved(root);
+    let recent_runs = runs::recent(root, 5);
+    let mut out = String::from("# Next-session prime (Wordkeep autopilot draft)\n\n");
+    out.push_str(&format!(
+        "Workspace: {}\n",
+        workspace::workspace_id(root)
+    ));
+    if let Some(s) = session {
+        out.push_str(&format!("Session hint: {s}\n"));
+    }
+    out.push_str(
+        "\nNOTE: draft only — call `session_handoff` to persist / reset pressure.\n\n",
+    );
+    out.push_str("## Priority defects (unresolved)\n\n");
+    if defects.is_empty() {
+        out.push_str("(none)\n\n");
+    } else {
+        for d in defects.iter().take(8) {
+            out.push_str(&format!("- [{}] {} — {}\n", d.status, d.id, d.summary));
+        }
+        out.push('\n');
+    }
+    out.push_str("## Recent gate runs\n\n");
+    if recent_runs.is_empty() {
+        out.push_str("(none recorded)\n\n");
+    } else {
+        for r in &recent_runs {
+            out.push_str(&format!("- [{}] {} — {}\n", r.status, r.id, r.command));
+        }
+        out.push('\n');
+    }
+    out.push_str(
+        "## Suggested first tools\n\n\
+         1. `defect_list`\n\
+         2. `session_pressure`\n\
+         3. `run_history`\n\
+         4. `knowledge_search` for the active subsystem\n",
+    );
+    out
+}
+
 /// Finalize a session and optionally promote the result to `.wordkeep/notes/`.
 pub fn finalize(root: &Path, args: &Value) -> Result<String, String> {
     let session = required_str(args, "session")?;
@@ -1070,9 +1137,17 @@ pub fn session_handoff(root: &Path, args: &Value) -> Result<String, String> {
         .ok()
         .and_then(|p| std::fs::metadata(p).ok().map(|m| m.len() / 4))
         .unwrap_or(0);
+    // Prompt digests defects + recent runs; count those stores in the baseline
+    // so the composite handoff does not look net-negative vs session-only.
+    let defects_tokens = std::fs::metadata(root.join(".wordkeep/defects.json"))
+        .map(|m| m.len() / 4)
+        .unwrap_or(0);
+    let runs_tokens = std::fs::metadata(workspace::workspace_file(root, "runs.json"))
+        .map(|m| m.len() / 4)
+        .unwrap_or(0);
     stats::record(
         "session_handoff",
-        session_file_tokens.max(64),
+        (session_file_tokens + defects_tokens + runs_tokens).max(64),
         estimate_tokens(&out) as u64,
     );
     Ok(out)

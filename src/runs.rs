@@ -342,6 +342,8 @@ pub fn recent(root: &Path, limit: usize) -> Vec<Run> {
 }
 
 /// Look up one recorded run by id. Metadata only; never executes the command.
+/// Retained for offline Izakaya outcome adapters (tests / future CLI).
+#[allow(dead_code)]
 pub fn get(root: &Path, id: &str) -> Option<Run> {
     load_all(root)
         .unwrap_or_default()

@@ -63,5 +63,5 @@ if [[ -n "${NEWEST_SRC:-}" && "$NEWEST_SRC" -gt "$BIN_MTIME" ]]; then
 fi
 
 echo "[wordkeep:mcp] using $BIN" >&2
-echo "[wordkeep:mcp] surface: 48 tools, 2 resources (wordkeep://readme, wordkeep://capabilities)" >&2
+echo "[wordkeep:mcp] surface: 51 tools, 2 resources (wordkeep://readme, wordkeep://capabilities)" >&2
 exec "$BIN" "$@"

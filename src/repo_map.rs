@@ -4,9 +4,12 @@
 //! enums, and function signatures (free + member), returned in source order,
 //! across C/C++, GLSL, Rust, Python, and TypeScript/TSX/Svelte; Daslang via a
 //! line scanner (or its vendored grammar under `--features daslang`).
-//! Token-budgeted so an agent can see the shape of a directory without reading
-//! whole files. The per-file extractor is shared with `outline` (single file,
-//! with line numbers).
+//!
+//! Progressive by default (`mode: auto`): bare walks return files-first (path +
+//! symbol count); pass `expand` or `mode: "symbols"` (also auto when `pattern`
+//! is set) for the full per-file signature dump. Token-budgeted so an agent can
+//! see the shape of a directory without reading whole files. The per-file
+//! extractor is shared with `outline` (single file, with line numbers).
 
 use serde_json::Value;
 use std::collections::HashSet;
@@ -15,17 +18,71 @@ use std::sync::{Mutex, OnceLock};
 use tree_sitter::{Node, Parser};
 
 use crate::cache::{self, DiskMap};
+use crate::continuation::{self, KIND_FILE_SKIP};
 use crate::lang::Lang;
-use crate::{stats, walk};
+use crate::{progress, stats, walk};
 
 const PER_FILE_CAP: usize = 40;
+
+/// Output density: files-first (paths + counts) vs full per-file symbol dumps.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MapMode {
+    Files,
+    Symbols,
+}
 
 /// Symbol cache keyed by absolute path; the stored mtime invalidates the entry
 /// when the file changes. Backed by a JSON file under the shared cache dir, so it
 /// is warm in-process *and* survives a cold spawn over a large tree.
 static SYMBOL_CACHE: OnceLock<Mutex<DiskMap>> = OnceLock::new();
 
+fn normalize_rel(path: &str) -> String {
+    path.replace('\\', "/")
+        .trim_start_matches("./")
+        .to_string()
+}
+
+fn resolve_mode(args: &Value, pattern: &Option<String>) -> MapMode {
+    match args.get("mode").and_then(Value::as_str).unwrap_or("auto") {
+        "files" => MapMode::Files,
+        "symbols" => MapMode::Symbols,
+        // auto: pattern → symbols (targeted drill-down); bare walk → files-first
+        _ if pattern.is_some() => MapMode::Symbols,
+        _ => MapMode::Files,
+    }
+}
+
+fn expand_set(args: &Value) -> HashSet<String> {
+    args.get("expand")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(normalize_rel))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn format_symbol_block(rel: &str, symbols: &[String]) -> String {
+    let mut block = format!("\n{rel}\n");
+    for (i, s) in symbols.iter().enumerate() {
+        if i == PER_FILE_CAP {
+            block.push_str(&format!("  … (+{} more)\n", symbols.len() - PER_FILE_CAP));
+            break;
+        }
+        block.push_str(&format!("  {s}\n"));
+    }
+    block
+}
+
 pub fn build(root: &Path, args: &Value) -> Result<String, String> {
+    const FP_KEYS: &[&str] = &[
+        "paths",
+        "profile",
+        "mode",
+        "expand",
+        "pattern",
+    ];
     let paths = crate::config::paths_from_args(root, args)?;
     let budget = args
         .get("token_budget")
@@ -35,6 +92,10 @@ pub fn build(root: &Path, args: &Value) -> Result<String, String> {
         .get("pattern")
         .and_then(Value::as_str)
         .map(str::to_lowercase);
+    let mode = resolve_mode(args, &pattern);
+    let expand = expand_set(args);
+    let args_fp = continuation::args_fingerprint(args, FP_KEYS);
+    let resume_at = continuation::resume_offset(args, "repo_map", FP_KEYS, KIND_FILE_SKIP)?;
 
     // The grammar is selected per file inside `extract`, so the shared parser
     // starts language-less and is retargeted as the walk crosses languages.
@@ -46,8 +107,12 @@ pub fn build(root: &Path, args: &Value) -> Result<String, String> {
     let mut skipped_files = 0usize;
     let mut truncated = false;
     let mut scanned_bytes = 0u64;
+    let mut any_expanded = false;
+    let mut walk_index = 0u64;
+    let mut resume_offset_out = 0u64;
 
     let prune = walk::prune_set(root);
+    progress::tick(0, None, "repo_map: scanning");
     for p in &paths {
         let base = root.join(p);
         for entry in walk::files(&base, &prune) {
@@ -55,11 +120,12 @@ pub fn build(root: &Path, args: &Value) -> Result<String, String> {
             let Some(lang) = Lang::from_path(path) else {
                 continue;
             };
-            let rel = path
-                .strip_prefix(root)
-                .unwrap_or(path)
-                .to_string_lossy()
-                .replace('\\', "/");
+            let rel = normalize_rel(
+                &path
+                    .strip_prefix(root)
+                    .unwrap_or(path)
+                    .to_string_lossy(),
+            );
             if let Some(pat) = &pattern {
                 if !rel.to_lowercase().contains(pat) {
                     continue;
@@ -72,26 +138,48 @@ pub fn build(root: &Path, args: &Value) -> Result<String, String> {
                 continue;
             }
 
-            let mut block = format!("\n{rel}\n");
-            for (i, s) in symbols.iter().enumerate() {
-                if i == PER_FILE_CAP {
-                    block.push_str(&format!("  … (+{} more)\n", symbols.len() - PER_FILE_CAP));
-                    break;
-                }
-                block.push_str(&format!("  {s}\n"));
+            // Matching file slot in walk order (empty-symbol files already skipped).
+            if walk_index < resume_at {
+                walk_index += 1;
+                continue;
             }
+
+            let expand_this = expand.contains(&rel);
+            let dump_symbols = mode == MapMode::Symbols || expand_this;
+            if expand_this {
+                any_expanded = true;
+            }
+
+            let block = if dump_symbols {
+                format_symbol_block(&rel, &symbols)
+            } else {
+                format!("\n{rel}  ({} symbols)\n", symbols.len())
+            };
 
             let block_tokens = block.len() / 4; // rough chars-per-token estimate
             if used_tokens + block_tokens > budget && files > 0 {
                 truncated = true;
+                resume_offset_out = walk_index;
                 skipped_files += 1;
+                // Count remaining matching files for the footer, without emitting.
+                walk_index += 1;
+                continue;
+            }
+            if truncated {
+                skipped_files += 1;
+                walk_index += 1;
                 continue;
             }
             used_tokens += block_tokens;
             files += 1;
+            walk_index += 1;
             body.push_str(&block);
+            if files % 32 == 0 {
+                progress::tick(files as u64, None, &format!("repo_map: {files} files"));
+            }
         }
     }
+    progress::tick(files as u64, Some(files as u64 + skipped_files as u64), "repo_map: done");
 
     // Persist any newly extracted symbols so the next cold spawn is warm too.
     if let Some(c) = SYMBOL_CACHE.get() {
@@ -100,18 +188,47 @@ pub fn build(root: &Path, args: &Value) -> Result<String, String> {
         }
     }
 
-    if body.is_empty() {
+    if body.is_empty() && !truncated {
         stats::record("repo_map", scanned_bytes / 4, 0);
         return Ok(format!("repo_map: no source symbols found under {paths:?}"));
     }
-    let note = if truncated {
-        format!(" (truncated by token_budget; +{skipped_files} file(s) omitted - narrow paths or raise token_budget)")
+    let mode_label = match mode {
+        MapMode::Files => "files",
+        MapMode::Symbols => "symbols",
+    };
+    let page_note = if resume_at > 0 {
+        format!(" [continuation from file #{resume_at}]")
     } else {
         String::new()
     };
-    let out = format!(
-        "repo_map - {files} file(s), ~{used_tokens} tokens{note}\nroots: {paths:?}\n{body}"
+    let note = if truncated {
+        format!(" (truncated by token_budget; +{skipped_files} file(s) omitted)")
+    } else {
+        String::new()
+    };
+    let mut header = format!(
+        "repo_map - {files} file(s), ~{used_tokens} tokens [{mode_label} mode]{page_note}{note}\nroots: {paths:?}"
     );
+    if let Some(pat) = &pattern {
+        header.push_str(&format!("\npattern: {pat}"));
+    }
+    if mode == MapMode::Files && !any_expanded {
+        body.push_str(
+            "\nhint: pass expand:[\"path/to/file\"] or mode:\"symbols\" + pattern to see signatures\n",
+        );
+    }
+
+    let mut out = format!("{header}\n{body}");
+    if truncated {
+        continuation::append_footer(
+            &mut out,
+            "repo_map",
+            args_fp,
+            resume_offset_out,
+            KIND_FILE_SKIP,
+            &format!("+{skipped_files} file(s) omitted"),
+        );
+    }
     stats::record("repo_map", scanned_bytes / 4, (out.len() / 4) as u64);
     Ok(out)
 }
@@ -763,5 +880,78 @@ int Transform_area(const Transform& t) { return 0; }
         let out = squeeze(&long);
         assert!(out.chars().count() <= 110);
         assert!(out.ends_with('…'));
+    }
+
+    fn fixture_tree(name: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "cbtest_repomap_{name}_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("src/alpha.cpp"),
+            "namespace a { struct Alpha {}; int f() { return 0; } }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("src/beta.cpp"),
+            "namespace b { struct Beta {}; void g() {} }\n",
+        )
+        .unwrap();
+        root
+    }
+
+    #[test]
+    fn files_mode_lists_counts_without_signatures() {
+        let root = fixture_tree("files");
+        let out = build(
+            &root,
+            &serde_json::json!({ "paths": ["src"], "mode": "files" }),
+        )
+        .unwrap();
+        assert!(out.contains("[files mode]"), "{out}");
+        assert!(out.contains("src/alpha.cpp  ("), "{out}");
+        assert!(out.contains("symbols)"), "{out}");
+        assert!(!out.contains("namespace a"), "{out}");
+        assert!(!out.contains("struct Alpha"), "{out}");
+        assert!(out.contains("hint:"), "{out}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn expand_dumps_symbols_for_named_files() {
+        let root = fixture_tree("expand");
+        let out = build(
+            &root,
+            &serde_json::json!({
+                "paths": ["src"],
+                "mode": "files",
+                "expand": ["src/alpha.cpp"]
+            }),
+        )
+        .unwrap();
+        assert!(out.contains("[files mode]"), "{out}");
+        assert!(out.contains("namespace a"), "{out}");
+        assert!(out.contains("struct Alpha"), "{out}");
+        // beta stays count-only
+        assert!(out.contains("src/beta.cpp  ("), "{out}");
+        assert!(!out.contains("namespace b"), "{out}");
+        assert!(!out.contains("hint:"), "{out}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn auto_mode_uses_symbols_when_pattern_set() {
+        let root = fixture_tree("auto");
+        let out = build(
+            &root,
+            &serde_json::json!({ "paths": ["src"], "pattern": "alpha" }),
+        )
+        .unwrap();
+        assert!(out.contains("[symbols mode]"), "{out}");
+        assert!(out.contains("namespace a"), "{out}");
+        assert!(!out.contains("src/beta.cpp"), "{out}");
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

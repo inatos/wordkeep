@@ -876,6 +876,18 @@ pub fn read(root: &Path) -> Result<Snapshot, String> {
     load_locked(&dir, &id)
 }
 
+/// Estimated tokens an agent would spend re-reading the on-disk journal + projection.
+pub fn distill_baseline_tokens(root: &Path) -> u64 {
+    let dir = group_dir(root);
+    let events = std::fs::metadata(events_path(&dir))
+        .map(|m| m.len())
+        .unwrap_or(0);
+    let projection = std::fs::metadata(projection_path(&dir))
+        .map(|m| m.len())
+        .unwrap_or(0);
+    (events + projection) / 4
+}
+
 fn load_locked(dir: &Path, coordination_id: &str) -> Result<Snapshot, String> {
     let events = load_events(dir)?;
     let rebuilt = fold(&events, coordination_id);

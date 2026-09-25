@@ -8,6 +8,7 @@
 //!   * repo_map         - structural map of the source tree (types, namespaces, signatures)
 //!   * outline          - single-file table of contents with line numbers
 //!   * symbol_refs      - find where a symbol is defined, called, and referenced
+//!   * symbol_resolve   - normalize + locate a symbol with fuzzy / profile hints
 //!   * call_graph       - one hop of callers/callees for a function, to scope a refactor
 //!   * call_path        - the shortest call chain between two functions (depth-bounded BFS)
 //!   * doc_comment      - a symbol's leading doc comment + signature, no body
@@ -22,7 +23,11 @@
 //!   * include_graph    - one hop of #include includers/includees for a header
 //!   * type_layout      - fields of a struct/class, flagging non-POD members
 //!   * test_map         - which tests reference a symbol, to pick the narrowest run
+//!   * batch_context    - condensed symbol_context for many symbols under one budget
+//!   * perf_triage      - Tracy hitch profile + hotspot context/tests bundle
+//!   * test_impact      - rank tests by how many git-changed symbols they hit
 //!   * knowledge_search - BM25 retrieval over docs/, designs, and .cursor rules
+//!   * knowledge_answer - extractive synthesis + citations from the same BM25 pipeline
 //!   * knowledge_upsert - write/update a markdown section for knowledge_search
 //!   * trace_summary    - condense a Tracy CSV export into the hottest zones (or diff two)
 //!   * trace_profile    - hitch workflow: max-sorted zones + diff_map + index_stale
@@ -31,6 +36,7 @@
 //!   * locality_hotspots - sampled PMC/ETW/perf address hotspots (when available)
 //!   * integration_hooks - curated cross-subsystem call sites + optional call_path
 //!   * index_stale      - detect when on-disk indexes lag git changes
+//!   * index_health     - path_profiles coverage gaps + proactive stale check
 //!   * stats            - how many tokens wordkeep has saved vs reading raw material
 //!   * mas_post         - append compact state to a recursive-MAS session blackboard
 //!   * mas_read         - read token-budgeted blackboard entries for subagent handoff
@@ -66,6 +72,7 @@ mod call_path;
 mod coeffects;
 mod commit_scope;
 mod config;
+mod continuation;
 #[cfg(feature = "dashboard")]
 mod dashboard;
 mod dead_code;
@@ -85,6 +92,7 @@ mod mcp;
 mod module_map;
 mod outline;
 mod profile_upsert;
+mod progress;
 mod repo_map;
 mod runs;
 mod runtime;
@@ -94,9 +102,11 @@ mod symbol_context;
 mod symbol_def;
 mod symbol_diff;
 mod symbol_refs;
+mod symbol_resolve;
 mod test_map;
 mod trace;
 mod trace_profile;
+mod triage;
 mod type_layout;
 mod undocumented;
 mod usage_examples;
@@ -199,6 +209,7 @@ fn main() {
     let root_map = root.clone();
     let root_outline = root.clone();
     let root_refs = root.clone();
+    let root_resolve = root.clone();
     let root_cg = root.clone();
     let root_callpath = root.clone();
     let root_doc = root.clone();
@@ -213,7 +224,11 @@ fn main() {
     let root_inc = root.clone();
     let root_layout = root.clone();
     let root_tests = root.clone();
+    let root_batch_context = root.clone();
+    let root_perf_triage = root.clone();
+    let root_test_impact = root.clone();
     let root_kb = root.clone();
+    let root_kb_answer = root.clone();
     let root_kb_upsert = root.clone();
     let root_trace = root.clone();
     let root_trace_profile = root.clone();
@@ -222,6 +237,7 @@ fn main() {
     let root_locality_hotspots = root.clone();
     let root_hooks = root.clone();
     let root_stale = root.clone();
+    let root_index_health = root.clone();
     let root_mas_post = root.clone();
     let root_mas_read = root.clone();
     let root_mas_status = root.clone();
@@ -241,9 +257,10 @@ fn main() {
         mcp::Tool {
             name: "repo_map",
             description: "Token-budgeted STRUCTURAL map of the source tree (C/C++, GLSL, Rust, \
-                          Python, Daslang, and C#): top-level namespaces, types, and function signatures \
-                          per file. Call this INSTEAD of reading whole files when you need to \
-                          locate code or understand layout cheaply.",
+                          Python, Daslang, and C#). Default mode auto is files-first (paths + symbol \
+                          counts); pass expand or mode:\"symbols\" for signatures. On truncate, re-call \
+                          with continuation to page. Call this INSTEAD of reading whole files when you \
+                          need to locate code or understand layout cheaply.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -252,20 +269,26 @@ fn main() {
                     "profile": { "type": "string",
                                  "description": "Named path_profiles entry from .wordkeep/config.json (ignored when paths is set)." },
                     "pattern": { "type": "string",
-                                 "description": "Case-insensitive substring filter on file path." },
+                                 "description": "Case-insensitive substring filter on file path. With mode auto, also selects symbols mode." },
+                    "mode": { "type": "string", "enum": ["auto", "files", "symbols"],
+                              "description": "auto (default): files-first unless pattern is set; files = paths+counts; symbols = full signatures." },
+                    "expand": { "type": "array", "items": { "type": "string" },
+                                "description": "Relative file paths to fully expand with symbols even in files mode." },
                     "token_budget": { "type": "integer",
-                                      "description": "Approx max tokens to return. Default 8000." }
+                                      "description": "Approx max tokens to return. Default 8000." },
+                    "continuation": continuation::schema_prop()
                 }
             }),
             handler: Box::new(move |args| repo_map::build(&root_map, args)),
         },
         mcp::Tool {
             name: "outline",
-            description: "Token-budgeted TABLE OF CONTENTS for a SINGLE file: its top-level \
-                          namespaces, types, and function signatures, each with a line number, \
-                          in source order. Use it to jump straight to a definition (read just \
-                          that line range) instead of reading the whole file. Covers C/C++, GLSL, \
-                          Rust, Python, TypeScript/TSX/Svelte, C#, and Daslang.",
+            description: "Token-budgeted TABLE OF CONTENTS for a SINGLE file (or a small files[] \
+                          batch under one budget): top-level namespaces, types, and function \
+                          signatures, each with a line number, in source order. Use it to jump \
+                          straight to a definition (read just that line range) instead of reading \
+                          the whole file. Covers C/C++, GLSL, Rust, Python, TypeScript/TSX/Svelte, \
+                          C#, and Daslang. Accepts basename or profile/paths when resolving.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -273,8 +296,15 @@ fn main() {
                               "description": "Path (relative to root) of the file to outline. Alias: path." },
                     "path": { "type": "string",
                               "description": "Alias for file; same meaning." },
+                    "files": { "type": "array", "items": { "type": "string" },
+                               "description": "Batch: outline several files under one shared token_budget." },
+                    "paths": { "type": "array", "items": { "type": "string" },
+                               "description": "Search roots for basename resolution (with profile)." },
+                    "profile": { "type": "string",
+                                 "description": "Named path_profiles entry for basename resolution." },
                     "token_budget": { "type": "integer",
-                                      "description": "Approx max tokens to return. Default 2400." }
+                                      "description": "Approx max tokens to return. Default 2400." },
+                    "continuation": continuation::schema_prop()
                 }
             }),
             handler: Box::new(move |args| outline::build(&root_outline, args)),
@@ -285,8 +315,8 @@ fn main() {
                           across the tree (C/C++, GLSL, Rust, Python, C#, TypeScript/TSX/Svelte). Uses \
                           tree-sitter to classify each exact-name occurrence, so it ignores comments, \
                           strings, and substring collisions. The first call warms a per-file memo; \
-                          later calls for any symbol skip re-parsing. Use to trace a function/type \
-                          before changing it.",
+                          later calls for any symbol skip re-parsing. On truncate, re-call with \
+                          continuation to page. Use to trace a function/type before changing it.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -298,11 +328,34 @@ fn main() {
                               "description": "Restrict to definitions, calls, or plain refs. Default \"all\"." },
                     "max": { "type": "integer", "description": "Max occurrences to list. Default 60." },
                     "token_budget": { "type": "integer",
-                                      "description": "Approx max tokens to return. Default 1200." }
+                                      "description": "Approx max tokens to return. Default 1200." },
+                    "continuation": continuation::schema_prop()
                 },
                 "required": ["symbol"]
             }),
             handler: Box::new(move |args| symbol_refs::find(&root_refs, args)),
+        },
+        mcp::Tool {
+            name: "symbol_resolve",
+            description: "Normalize a messy symbol name (::Foo, ns::Bar<T>) and locate its \
+                          definition; on miss, scan other path_profiles and return ranked \
+                          suggestions / did-you-mean. Prefer this when symbol_refs or \
+                          symbol_context return not-found, or before guessing a profile.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "symbol": { "type": "string",
+                                "description": "Symbol name (qualified, templated, or bare)." },
+                    "paths": { "type": "array", "items": { "type": "string" },
+                               "description": "Subdirs to search. Default: profile / default_paths / src." },
+                    "profile": { "type": "string",
+                                 "description": "Named path_profiles entry (ignored when paths is set)." },
+                    "max": { "type": "integer",
+                             "description": "Max suggestions to list on miss. Default 8." }
+                },
+                "required": ["symbol"]
+            }),
+            handler: Box::new(move |args| symbol_resolve::resolve(&root_resolve, args)),
         },
         mcp::Tool {
             name: "call_graph",
@@ -389,7 +442,8 @@ fn main() {
                                "description": "Subdirs (relative to root) to search. Default: .wordkeep/config.json default_paths, else src only." },
                     "max": { "type": "integer", "description": "Max callers/callees to list. Default 40." },
                     "token_budget": { "type": "integer",
-                                      "description": "Approx max tokens to return. Default 1600." }
+                                      "description": "Approx max tokens to return. Default 1600." },
+                    "continuation": continuation::schema_prop()
                 },
                 "required": ["symbol"]
             }),
@@ -482,7 +536,8 @@ fn main() {
                     "min_lines": { "type": "integer",
                                    "description": "Minimum line span to include. Default 1." },
                     "token_budget": { "type": "integer",
-                                      "description": "Approx max tokens to return. Default 1200." }
+                                      "description": "Approx max tokens to return. Default 1200." },
+                    "continuation": continuation::schema_prop()
                 }
             }),
             handler: Box::new(move |args| big_functions::build(&root_big, args)),
@@ -537,7 +592,8 @@ fn main() {
                     "focus": { "type": "string",
                                "description": "Show only modules matching this prefix or coupled to one that does. Default \"\" (all)." },
                     "token_budget": { "type": "integer",
-                                      "description": "Approx max tokens to return. Default 1200." }
+                                      "description": "Approx max tokens to return. Default 1200." },
+                    "continuation": continuation::schema_prop()
                 }
             }),
             handler: Box::new(move |args| module_map::build(&root_modmap, args)),
@@ -632,10 +688,82 @@ fn main() {
             handler: Box::new(move |args| test_map::build(&root_tests, args)),
         },
         mcp::Tool {
+            name: "batch_context",
+            description: "Condensed symbol_context for many symbols under one shared token budget. \
+                          Builds call_graph adjacency once, then emits per-symbol sections \
+                          (signature/body + callers/callees). Truncates later symbols when over budget.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "symbols": { "type": "array", "items": { "type": "string" },
+                                 "description": "Symbol names to gather context for." },
+                    "paths": { "type": "array", "items": { "type": "string" },
+                               "description": "Subdirs to search. Default: profile / default_paths / src." },
+                    "profile": { "type": "string",
+                                 "description": "Named path_profiles entry (ignored when paths is set)." },
+                    "include": { "type": "array", "items": { "type": "string" },
+                                 "description": "Sections: \"context\" and/or \"refs\" (default both)." },
+                    "token_budget": { "type": "integer",
+                                      "description": "Approx max tokens for the whole batch. Default 4000." }
+                },
+                "required": ["symbols"]
+            }),
+            handler: Box::new(move |args| triage::batch_context(&root_batch_context, args)),
+        },
+        mcp::Tool {
+            name: "perf_triage",
+            description: "Tracy hitch workflow plus hotspot code/tests: runs trace_profile, extracts \
+                          top zone names, then appends condensed symbol_context + test_map for up to \
+                          3 hotspots (or pass \"symbol\" to override). Optionally hints memory_diff / \
+                          locality_hotspots when a runtime snapshot exists.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "file": { "type": "string",
+                              "description": "Trace file (.csv or .tracy). Default: newest in dir." },
+                    "baseline": { "type": "string",
+                                  "description": "Optional second capture for regression diff." },
+                    "dir": { "type": "string", "description": "Trace directory relative to root. Default \"debug\"." },
+                    "git_ref": { "type": "string",
+                                 "description": "Git ref for diff_map and index_stale. Default \"HEAD\"." },
+                    "paths": { "type": "array", "items": { "type": "string" },
+                               "description": "Subdirs for symbol lookup / diff_map." },
+                    "symbol": { "type": "string",
+                                "description": "Override hotspot extraction; use this symbol for context/tests." },
+                    "top": { "type": "integer", "description": "Zone rows in trace section. Default 18." },
+                    "diff_max": { "type": "integer", "description": "Max changed symbols in diff_map section. Default 25." },
+                    "token_budget": { "type": "integer",
+                                      "description": "Approx max tokens for the whole bundle. Default 4000." }
+                }
+            }),
+            handler: Box::new(move |args| triage::perf_triage(&root_perf_triage, args)),
+        },
+        mcp::Tool {
+            name: "test_impact",
+            description: "From a git diff, list changed symbols and rank test files by how many of \
+                          those symbols they reference. Prints a suggested ctest filter via \
+                          test_command / Catch2 tags.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "ref": { "type": "string",
+                             "description": "Git revision to diff against. Default \"HEAD\"." },
+                    "paths": { "type": "array", "items": { "type": "string" },
+                               "description": "Subdirs to scope the diff. Default: profile / default_paths." },
+                    "max": { "type": "integer",
+                             "description": "Max changed symbols / test files to list. Default 40." },
+                    "token_budget": { "type": "integer",
+                                      "description": "Approx max tokens to return. Default 2400." }
+                }
+            }),
+            handler: Box::new(move |args| triage::test_impact(&root_test_impact, args)),
+        },
+        mcp::Tool {
             name: "knowledge_search",
             description: "BM25 retrieval over project markdown (docs/, designs, .cursor rules, README). \
                           Returns the top-k most relevant chunks for a query instead of always-loading \
-                          every rule. Use to recall conventions, pitfalls, and design decisions.",
+                          every rule. On truncate, re-call with continuation to page. Use to recall \
+                          conventions, pitfalls, and design decisions.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -649,11 +777,38 @@ fn main() {
                     "token_budget": { "type": "integer",
                                       "description": "Approx max tokens to return. Default 1200." },
                     "semantic": { "type": "boolean",
-                                  "description": "Rerank BM25 hits with embeddings (only when built with --features embeddings). Default true." }
+                                  "description": "Rerank BM25 hits with embeddings (only when built with --features embeddings). Default true." },
+                    "continuation": continuation::schema_prop()
                 },
                 "required": ["query"]
             }),
             handler: Box::new(move |args| knowledge::search(&root_kb, args)),
+        },
+        mcp::Tool {
+            name: "knowledge_answer",
+            description: "Extractive synthesis from BM25 knowledge hits (no LLM): a short answer \
+                          built from top snippets plus numbered citations. Same index as \
+                          knowledge_search; use when you need a compact answer rather than raw chunks.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string",
+                               "description": "Natural-language or keyword query." },
+                    "k": { "type": "integer", "description": "Candidate chunks before citation cap. Default max_citations." },
+                    "max_citations": { "type": "integer",
+                                       "description": "Citations to include. Default 5." },
+                    "roots": { "type": "array", "items": { "type": "string" },
+                               "description": "Doc roots to search. Default default_doc_roots or .cursor/rules, docs, .github, README.md." },
+                    "include_defects": { "type": "boolean",
+                                         "description": "Boost unresolved .wordkeep/defects.json into results. Default true." },
+                    "token_budget": { "type": "integer",
+                                      "description": "Approx max tokens for the whole answer+citations output. Default 1200." },
+                    "semantic": { "type": "boolean",
+                                  "description": "Rerank BM25 hits with embeddings (only when built with --features embeddings). Default true." }
+                },
+                "required": ["query"]
+            }),
+            handler: Box::new(move |args| knowledge::answer(&root_kb_answer, args)),
         },
         mcp::Tool {
             name: "knowledge_upsert",
@@ -763,7 +918,10 @@ fn main() {
             name: "memory_diff",
             description: "Compare two Runtime Health snapshots by capture id. Reports signed \
                           RSS/VA/Flecs/Jolt deltas plus pool occupancy and mapping-kind changes; \
-                          does not call VA gaps allocator fragmentation.",
+                          does not call VA gaps allocator fragmentation. Produce captures via \
+                          wiki Health → Runtime → Capture (or Betwixt `.wordkeep/runtime/latest.json` \
+                          for live). Soft-route after Tracy hitch hunts: capture before/after, \
+                          then memory_diff(base, current).",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -781,7 +939,9 @@ fn main() {
             name: "locality_hotspots",
             description: "Return token-budgeted PMC/ETW/perf address hotspots from a Runtime \
                           Health snapshot. If samples are absent, explicitly reports unavailable; \
-                          it never infers cache locality from virtual-address adjacency.",
+                          it never infers cache locality from virtual-address adjacency. Enable \
+                          PMC/ETW/perf sampling in wiki Health → Runtime before Capture; otherwise \
+                          use runtime_snapshot / memory_diff for census-only.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -799,8 +959,9 @@ fn main() {
         mcp::Tool {
             name: "integration_hooks",
             description: "Search curated cross-subsystem call sites from .wordkeep/integration-hooks.md \
-                          (cross-subsystem wiring). Faster than discovering cross-file chains \
-                          by hand. Optional from/to runs call_path to verify or explore ad-hoc chains.",
+                          (cross-subsystem wiring). Query uses AND first, then OR/scored fallback; \
+                          empty results include a ## heading vocabulary hint. Optional from/to runs \
+                          call_path to verify or explore ad-hoc chains.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -830,6 +991,23 @@ fn main() {
                 }
             }),
             handler: Box::new(move |args| index_stale::check(&root_stale, args)),
+        },
+        mcp::Tool {
+            name: "index_health",
+            description: "Profile coverage health: list path_profiles (and which roots exist on disk), \
+                          sample web/ and tools/ sources outside all profiles, suggest profile names \
+                          for git changes outside coverage, and report proactive index staleness. \
+                          Also available as index_stale with mode:\"health\".",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "ref": { "type": "string",
+                             "description": "Git revision for change/stale checks. Default \"HEAD\"." },
+                    "mode": { "type": "string",
+                              "description": "Optional; \"health\" is implied for this tool." }
+                }
+            }),
+            handler: Box::new(move |args| index_stale::health(&root_index_health, args)),
         },
         mcp::Tool {
             name: "stats",
@@ -1017,15 +1195,25 @@ fn main() {
         },
         mcp::Tool {
             name: "defect_list",
-            description: "List defects (default: unresolved). Ordered eyeball_fail → open → gated → done.",
+            description: "List defects (default: digest of unresolved). Digest summarizes counts by \
+                          status/subsystem and shows top entries. Pass digest:false or format:\"full\" \
+                          for the detailed list. Ordered eyeball_fail → open → gated → done.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
+                    "digest": { "type": "boolean",
+                                "description": "Digest summary (default true). false = full list." },
+                    "format": { "type": "string", "enum": ["digest", "full"],
+                                "description": "Output format; overrides digest when set. Default digest." },
+                    "max": { "type": "integer",
+                             "description": "Max rows in digest top list. Default 10." },
                     "include_done": { "type": "boolean", "description": "Include done defects. Default false." },
                     "status": { "type": "string" },
                     "subsystem": { "type": "string" },
                     "tag": { "type": "string" },
-                    "query": { "type": "string" }
+                    "query": { "type": "string" },
+                    "token_budget": { "type": "integer",
+                                      "description": "Approx max tokens to return (clips output)." }
                 }
             }),
             handler: Box::new(move |args| defects::list(&root_defect_list, args)),
@@ -1104,6 +1292,7 @@ fn main() {
             name: "commit_scope",
             description: "Read-only: group git status --porcelain paths by configured commit_scopes \
                           and warn about secrets, generated dirs, binaries, and large files. \
+                          Skips commit_ignore prefixes (default .cache/, target/, node_modules/). \
                           Never stages or commits.",
             input_schema: json!({
                 "type": "object",

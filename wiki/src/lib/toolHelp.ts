@@ -1,42 +1,72 @@
 /** Short help strings for wiki menuing + MCP telemetry UI. */
 
 export const TOOL_HELP: Record<string, string> = {
-  repo_map: 'Namespaces, types, and signatures across a path tree.',
-  outline: 'Symbol TOC for one file with line numbers.',
-  symbol_refs: 'Definitions, calls, and references for a symbol.',
+  // Navigation / symbols
+  repo_map:
+    'Files-first (or symbols) map of a path tree; pages via continuation when truncated.',
+  outline: 'Symbol TOC with line numbers for one file or a small files[] batch (pages via continuation).',
+  symbol_resolve:
+    'Normalize a messy name and locate it; fuzzy/profile did-you-mean on miss.',
+  symbol_refs: 'Definitions, calls, and references for a symbol (pages via continuation).',
   call_graph: 'One hop of callers and callees.',
   call_path: 'Shortest call chain between two symbols.',
   include_graph: 'One hop of #include includers/includees.',
   type_layout: 'Struct/class fields and non-POD flags.',
   doc_comment: 'Leading doc comment plus signature.',
-  symbol_context: 'Body + callers/callees + layout in one pass.',
+  symbol_context: 'Body + callers/callees + layout; pages callers via continuation.',
+  batch_context: 'Condensed symbol_context for many symbols under one budget.',
   usage_examples: 'Call sites with surrounding context.',
+
+  // Change analysis
   symbol_diff: 'How one symbol changed vs a git ref.',
   diff_map: 'Symbols changed in a diff plus immediate callers.',
-  module_map: 'Cross-module call coupling map.',
+  module_map: 'Cross-module call coupling map (pages via continuation).',
   dead_code: 'Symbols with zero callers/refs.',
-  big_functions: 'Largest functions by line span.',
+  big_functions: 'Largest functions by line span (pages via continuation).',
   undocumented: 'Exported symbols missing doc comments.',
   test_map: 'Test files that reference a symbol.',
-  commit_scope: 'Dirty-path groups for a reviewable commit.',
-  knowledge_search: 'BM25 search over docs/rules/notes.',
+  test_impact: 'Changed symbols × ranked test files from a git diff.',
+  commit_scope: 'Dirty-path groups for a reviewable commit (read-only).',
+  profile_upsert: 'Propose or persist a path_profiles entry in config.',
+
+  // Knowledge
+  knowledge_search: 'BM25 search over docs/rules/notes (pages via continuation).',
+  knowledge_answer: 'Extractive answer + citations from the same BM25 index.',
   knowledge_upsert: 'Write or update a markdown knowledge section.',
+
+  // Perf / runtime
   trace_summary: 'Hottest Tracy zones (or vs a baseline).',
   trace_profile: 'Hitch workflow: trace + diff_map + index_stale.',
-  integration_hooks: 'Curated cross-subsystem wiring + optional call_path.',
+  perf_triage: 'Tracy profile + hotspot context + tests in one bundle.',
+  runtime_snapshot: 'Latest Runtime Memory Health census (or a capture id).',
+  memory_diff: 'Signed deltas between two Runtime Health captures.',
+  locality_hotspots: 'Sampled PMC/ETW/perf address hotspots (or unavailable).',
+  integration_hooks: 'Curated cross-subsystem wiring (AND then OR match).',
   index_stale: 'Whether disk indexes may lag git or miss coverage.',
-  stats: 'Estimated context avoided / token displacement.',
-  run_record: 'Metadata-only gate/run write.',
+  index_health: 'Path-profile coverage gaps + proactive stale signal.',
+  stats: 'Estimated context avoided / token displacement telemetry.',
+
+  // Continuity / defects / runs
+  run_record: 'Metadata-only gate/run write (never executes commands).',
   run_history: 'Recent runs; flags missing logs/artifacts.',
   artifact_index: 'Artifact metadata index (no image grading).',
-  session_pressure: 'Heuristic context-pressure level.',
+  session_pressure:
+    'Heuristic context-pressure level; autopilot handoff draft when high.',
   defect_upsert: 'Create or update a structured defect.',
-  defect_list: 'Unresolved defects (eyeball_fail first).',
+  defect_list: 'Defect digest by default (counts + top); full list on demand.',
   mas_post: 'Append a compact multi-agent session entry.',
   mas_read: 'Read MAS entries (filter by recipient/role/round).',
   mas_status: 'MAS round bookkeeping and convergence hint.',
   mas_finalize: 'Close a MAS session; optional promote + handoff.',
   session_handoff: 'Paste-ready next-session prime.',
+
+  // Izakaya presence
+  izakaya_status: 'Who holds live work leases and advisory claims.',
+  izakaya_check_in:
+    'Take or resume a lease before the first live edit; claims are advisory.',
+  izakaya_update: 'Heartbeat, move state, or change claims on an open lease.',
+  izakaya_check_out: 'Release a lease; optional handoff capsule for the next agent.',
+  izakaya_advise: 'Read promoted advice (does not assign or check out).',
 };
 
 export function toolHelp(name: string): string {

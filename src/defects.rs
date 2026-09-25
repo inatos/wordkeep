@@ -241,6 +241,18 @@ pub fn list(root: &Path, args: &Value) -> Result<String, String> {
     let tag = optional_str(args, "tag");
     let query = optional_str(args, "query").unwrap_or_default();
 
+    // Digest-first: digest defaults true; format "full"|"digest" overrides; digest:false → full.
+    let digest = resolve_digest_mode(args);
+    let max = args
+        .get("max")
+        .and_then(Value::as_u64)
+        .unwrap_or(if digest { 10 } else { u64::MAX })
+        .max(1) as usize;
+    let budget = args
+        .get("token_budget")
+        .and_then(Value::as_u64)
+        .map(|b| b as usize);
+
     let mut defects = load_all(root)?;
     defects.retain(|d| {
         if let Some(s) = &status_filter {
@@ -276,8 +288,101 @@ pub fn list(root: &Path, args: &Value) -> Result<String, String> {
             .then_with(|| a.id.cmp(&b.id))
     });
 
+    let mut out = if digest {
+        format_digest(&defects, max)
+    } else {
+        format_full(&defects)
+    };
+
+    if let Some(budget) = budget {
+        let max_chars = budget.saturating_mul(4);
+        if out.len() > max_chars {
+            out.truncate(max_chars);
+            out.push_str("\n… (truncated by token_budget)\n");
+        }
+    }
+
+    // Distill = on-disk store size (raw JSON), not a per-row guess — the list
+    // output often exceeds a tiny synthetic baseline and falsely flipped net-negative.
+    let store_tokens = std::fs::metadata(store_path(root))
+        .map(|m| m.len() / 4)
+        .unwrap_or(0) as u64;
+    stats::record("defect_list", store_tokens.max(64), (out.len() / 4) as u64);
+    Ok(out)
+}
+
+fn resolve_digest_mode(args: &Value) -> bool {
+    if let Some(fmt) = args.get("format").and_then(Value::as_str) {
+        match fmt.trim().to_ascii_lowercase().as_str() {
+            "full" => return false,
+            "digest" => return true,
+            _ => {}
+        }
+    }
+    args.get("digest")
+        .and_then(Value::as_bool)
+        .unwrap_or(true)
+}
+
+fn format_digest(defects: &[Defect], max: usize) -> String {
+    let mut open = 0usize;
+    let mut eyeball_fail = 0usize;
+    let mut gated = 0usize;
+    let mut done = 0usize;
+    let mut by_sub: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    for d in defects {
+        match d.status.as_str() {
+            "open" => open += 1,
+            "eyeball_fail" => eyeball_fail += 1,
+            "gated" => gated += 1,
+            "done" => done += 1,
+            _ => {}
+        }
+        let key = if d.subsystem.is_empty() {
+            "unspecified".to_string()
+        } else {
+            d.subsystem.clone()
+        };
+        *by_sub.entry(key).or_insert(0) += 1;
+    }
+
+    let mut out = format!(
+        "defect_list - digest: {} total (open={} eyeball_fail={} gated={} done={})\n",
+        defects.len(),
+        open,
+        eyeball_fail,
+        gated,
+        done
+    );
+    if by_sub.is_empty() {
+        out.push_str("by subsystem: (none)\n");
+    } else {
+        let parts: Vec<String> = by_sub
+            .iter()
+            .map(|(k, n)| format!("{k}={n}"))
+            .collect();
+        out.push_str(&format!("by subsystem: {}\n", parts.join(", ")));
+    }
+    out.push_str("top:\n");
+    if defects.is_empty() {
+        out.push_str("  (no matching defects)\n");
+    } else {
+        for d in defects.iter().take(max) {
+            out.push_str(&format!("  [{}] {} — {}\n", d.status, d.id, d.summary));
+        }
+        if defects.len() > max {
+            out.push_str(&format!("  … ({} more)\n", defects.len() - max));
+        }
+    }
+    out.push_str(
+        "hint: pass digest:false (or format:\"full\") for full list; filter with status/subsystem/tag/query\n",
+    );
+    out
+}
+
+fn format_full(defects: &[Defect]) -> String {
     let mut out = format!("defect_list - {} defect(s)\n", defects.len());
-    for d in &defects {
+    for d in defects {
         out.push_str(&format!(
             "\n[{}] {} — {}\n  subsystem: {}\n  summary: {}\n",
             d.status, d.id, d.updated, d.subsystem, d.summary
@@ -301,13 +406,7 @@ pub fn list(root: &Path, args: &Value) -> Result<String, String> {
     if defects.is_empty() {
         out.push_str("\n(no matching defects)\n");
     }
-    // Distill = on-disk store size (raw JSON), not a per-row guess — the list
-    // output often exceeds a tiny synthetic baseline and falsely flipped net-negative.
-    let store_tokens = std::fs::metadata(store_path(root))
-        .map(|m| m.len() / 4)
-        .unwrap_or(0) as u64;
-    stats::record("defect_list", store_tokens.max(64), (out.len() / 4) as u64);
-    Ok(out)
+    out
 }
 
 /// Unresolved defects for handoff / pressure / knowledge boost.
@@ -371,7 +470,14 @@ mod tests {
     use std::fs;
 
     fn tmp() -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("wk_def_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "wk_def_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(dir.join(".wordkeep")).unwrap();
         dir
@@ -400,12 +506,48 @@ mod tests {
             &json!({"summary":"fixed","status":"done","subsystem":"kkbp"}),
         )
         .unwrap();
-        let out = list(&root, &json!({})).unwrap();
+        let out = list(&root, &json!({"digest": false})).unwrap();
         let eyeball = out.find("eyeball_fail").unwrap();
         let open = out.find("[open]").unwrap();
         let gated = out.find("[gated]").unwrap();
         assert!(eyeball < open && open < gated);
         assert!(!out.contains("[done]"));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn list_digest_default() {
+        let root = tmp();
+        upsert(
+            &root,
+            &json!({"summary":"cloak axis","status":"open","subsystem":"kkbp"}),
+        )
+        .unwrap();
+        upsert(
+            &root,
+            &json!({"summary":"gate ok","status":"gated","subsystem":"render"}),
+        )
+        .unwrap();
+        upsert(
+            &root,
+            &json!({"summary":"eyeball bad","status":"eyeball_fail","subsystem":"kkbp"}),
+        )
+        .unwrap();
+        let digest = list(&root, &json!({})).unwrap();
+        assert!(digest.contains("defect_list - digest:"), "{digest}");
+        assert!(digest.contains("open=1"), "{digest}");
+        assert!(digest.contains("eyeball_fail=1"), "{digest}");
+        assert!(digest.contains("gated=1"), "{digest}");
+        assert!(digest.contains("by subsystem:"), "{digest}");
+        assert!(digest.contains("kkbp=2"), "{digest}");
+        assert!(digest.contains("render=1"), "{digest}");
+        assert!(digest.contains("top:"), "{digest}");
+        assert!(digest.contains("[eyeball_fail]"), "{digest}");
+        assert!(digest.contains("hint: pass digest:false"), "{digest}");
+        // Full mode still available.
+        let full = list(&root, &json!({"format": "full"})).unwrap();
+        assert!(full.contains("defect_list - 3 defect(s)"), "{full}");
+        assert!(full.contains("subsystem:"), "{full}");
         let _ = fs::remove_dir_all(&root);
     }
 

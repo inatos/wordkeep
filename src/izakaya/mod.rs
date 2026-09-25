@@ -159,46 +159,6 @@ pub fn mcp_tools(root: PathBuf) -> Vec<mcp::Tool> {
             "format":{"type":"string"},
             "token_budget":{"type":"integer"}
         },"required":["agent_id","lease_id"]})),
-        tool(&root, "izakaya_record_decision", "Record the frontier that was actually visible: legal_actions, selected batch, policy/profile fingerprints, and budget. Required before replay can treat history as supported.", json!({"type":"object","properties":{
-            "agent_id":{"type":"string"},
-            "lease_id":{"type":"string"},
-            "episode_id":{"type":"string"},
-            "decision_id":{"type":"string"},
-            "legal_actions":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"kind":{"type":"string"},"overlapping":{"type":"boolean"}},"additionalProperties":true}},
-            "selected":{"type":"array","items":{"type":"string"}},
-            "profile":{"type":"string"},
-            "policy_id":{"type":"string"},
-            "fingerprints":{"type":"object","additionalProperties":true},
-            "budget":{"type":"integer"},
-            "workers":{"type":"integer"},
-            "task":{"type":"string"},
-            "observation_hash":{"type":"string"},
-            "idempotency_key":{"type":"string"},
-            "format":{"type":"string"},
-            "token_budget":{"type":"integer"}
-        },"required":["agent_id","lease_id","legal_actions","selected"]})),
-        tool(&root, "izakaya_record_outcome", "Attach measured metrics to a recorded action. Links run_record ids. Does not execute commands. Suspended/unknown results should set censored:true.", json!({"type":"object","properties":{
-            "agent_id":{"type":"string"},
-            "lease_id":{"type":"string"},
-            "decision_id":{"type":"string"},
-            "action":{"type":"string"},
-            "metrics":{"type":"object","additionalProperties":true},
-            "censored":{"type":"boolean"},
-            "run_ids":{"type":"array","items":{"type":"string"}},
-            "artifacts":{"type":"array","items":{"type":"string"}},
-            "profile":{"type":"string"},
-            "fingerprints":{"type":"object","additionalProperties":true},
-            "idempotency_key":{"type":"string"},
-            "format":{"type":"string"},
-            "token_budget":{"type":"integer"}
-        },"required":["agent_id","lease_id","decision_id","action"]})),
-        tool(&root, "izakaya_replay", "Evaluate a declarative exploration policy by historical supported replay. Reports support, censoring, holdout gates, and Pareto axes. Does not promote and does not invent outcomes for unrecorded actions.", json!({"type":"object","properties":{
-            "policy":{"type":"object","description":"Declarative spec. Omit for the incumbent.","additionalProperties":true},
-            "incumbent":{"type":"boolean"},
-            "profile":{"type":"string"},
-            "format":{"type":"string"},
-            "token_budget":{"type":"integer"}
-        }})),
         tool(&root, "izakaya_advise", "Apply the promoted advisory policy to current presence and return recommendations. Read-only: cannot assign, suspend, check out, or run git.", json!({"type":"object","properties":{
             "format":{"type":"string"},
             "token_budget":{"type":"integer"}
@@ -222,25 +182,6 @@ fn dispatch(name: &str, root: &Path, args: &Value) -> Result<String, String> {
         "izakaya_check_in" => presence::check_in(root, args)?,
         "izakaya_update" => presence::update(root, args)?,
         "izakaya_check_out" => presence::check_out(root, args)?,
-        "izakaya_record_decision" => presence::record_decision(root, args)?,
-        "izakaya_record_outcome" => presence::record_outcome(root, args)?,
-        "izakaya_replay" => {
-            let profile = args
-                .get("profile")
-                .and_then(Value::as_str)
-                .unwrap_or("coordination");
-            let spec = if args
-                .get("incumbent")
-                .and_then(Value::as_bool)
-                .unwrap_or(false)
-                || args.get("policy").is_none()
-            {
-                replay::incumbent_spec()
-            } else {
-                args.get("policy").cloned().unwrap_or(Value::Null)
-            };
-            replay::evaluate(root, &spec, profile)?
-        }
         "izakaya_advise" => policy::advise(root, args)?,
         other => return Err(format!("unknown izakaya tool {other}")),
     };
@@ -267,7 +208,10 @@ fn dispatch(name: &str, root: &Path, args: &Value) -> Result<String, String> {
         text.truncate(end);
         text.push_str("\n…(truncated)\n");
     }
-    crate::stats::record(name, 64, (text.len() / 4) as u64);
+    // Distilled baseline = on-disk journal + projection (what an agent would re-read),
+    // not a fixed 64 — that falsely flagged every presence call as net-negative.
+    let baseline = store::distill_baseline_tokens(root).max(64);
+    crate::stats::record(name, baseline, (text.len() / 4) as u64);
     Ok(text)
 }
 

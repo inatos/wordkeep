@@ -7,7 +7,7 @@
 use serde_json::{json, Value};
 use std::path::Path;
 
-use crate::{diff_map, index_stale, stats, trace};
+use crate::{diff_map, index_stale, progress, stats, trace};
 
 pub fn build(root: &Path, args: &Value) -> Result<String, String> {
     let budget = args
@@ -16,6 +16,7 @@ pub fn build(root: &Path, args: &Value) -> Result<String, String> {
         .unwrap_or(2400) as usize;
     let per_section = budget / 3;
 
+    progress::tick(0, Some(3), "trace_profile: summary");
     let mut trace_args = args.clone();
     if trace_args.get("sort_by").is_none() {
         trace_args["sort_by"] = json!("max");

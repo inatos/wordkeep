@@ -30,7 +30,13 @@ pub fn memory_diff(root: &Path, args: &Value) -> Result<String, String> {
     let base = args
         .get("base")
         .and_then(Value::as_str)
-        .ok_or_else(|| "base is required (capture id)".to_string())?;
+        .ok_or_else(|| {
+            format!(
+                "base is required (capture id digits). Produce captures via wiki Health → Runtime \
+                 (Capture), then pass the numeric id. Available: {}",
+                available_captures_hint(root)
+            )
+        })?;
     let current = args
         .get("current")
         .and_then(Value::as_str)
@@ -63,7 +69,10 @@ fn valid_capture_id(id: &str) -> bool {
 
 fn load_snapshot(root: &Path, id: &str) -> Result<Value, String> {
     if !valid_capture_id(id) {
-        return Err("capture id must be `live` or digits".into());
+        return Err(format!(
+            "capture id must be `live` or digits; got `{id}`. Available: {}",
+            available_captures_hint(root)
+        ));
     }
     if id == "live" {
         let merged = runtime_dir(root).join("latest.json");
@@ -75,11 +84,59 @@ fn load_snapshot(root: &Path, id: &str) -> Result<Value, String> {
             return read_json(&cooperative);
         }
         return Err(
-            "no runtime snapshot; open Health → Runtime or run Betwixt from the workspace root"
+            "no runtime snapshot. Produce one via: (1) wiki Health → Runtime while Betwixt runs, \
+             or (2) run Betwixt from the workspace root (writes `.wordkeep/runtime/latest.json`). \
+             Then call runtime_snapshot / memory_diff / locality_hotspots. Soft-route: after a \
+             Tracy hitch hunt, compare two wiki Capture ids with memory_diff."
                 .into(),
         );
     }
-    read_last_jsonl(&runtime_dir(root).join(format!("capture-{id}.jsonl")))
+    let path = runtime_dir(root).join(format!("capture-{id}.jsonl"));
+    if !path.is_file() {
+        return Err(format!(
+            "no capture `{id}` at {}. Produce numbered captures via wiki Health → Runtime → \
+             Capture (writes capture-<id>.jsonl). Available: {}. Soft-route: use capture=`live` \
+             for the merged census, or runtime_snapshot first to confirm a snapshot exists.",
+            path.display(),
+            available_captures_hint(root)
+        ));
+    }
+    read_last_jsonl(&path)
+}
+
+fn available_captures_hint(root: &Path) -> String {
+    let mut ids = list_capture_ids(root);
+    let live = runtime_dir(root).join("latest.json").is_file()
+        || root.join(".wordkeep/runtime/latest.json").is_file();
+    if live {
+        ids.insert(0, "live".into());
+    }
+    if ids.is_empty() {
+        "(none — open wiki Health → Runtime or run Betwixt)".into()
+    } else {
+        ids.join(", ")
+    }
+}
+
+fn list_capture_ids(root: &Path) -> Vec<String> {
+    let Ok(entries) = fs::read_dir(runtime_dir(root)) else {
+        return Vec::new();
+    };
+    let mut ids: Vec<String> = entries
+        .filter_map(|e| e.ok())
+        .filter_map(|e| {
+            let name = e.file_name().into_string().ok()?;
+            let id = name.strip_prefix("capture-")?.strip_suffix(".jsonl")?;
+            if valid_capture_id(id) && id != "live" {
+                Some(id.to_string())
+            } else {
+                None
+            }
+        })
+        .collect();
+    ids.sort();
+    ids.dedup();
+    ids
 }
 
 fn read_json(path: &Path) -> Result<Value, String> {
@@ -237,13 +294,17 @@ fn render_diff(base_id: &str, base: &Value, current_id: &str, current: &Value) -
 fn render_locality(id: &str, value: &Value, top: usize, min_samples: u64) -> String {
     let Some(locality) = value.get("locality") else {
         return format!(
-            "locality_hotspots - {id}\nquality=unavailable\nNo PMC/ETW/perf address samples are present; VA adjacency is not treated as cache locality.\n"
+            "locality_hotspots - {id}\nquality=unavailable\nNo PMC/ETW/perf address samples are present; \
+             VA adjacency is not treated as cache locality.\n\
+             Soft-route: enable sampling in wiki Health → Runtime (PMC/ETW/perf) before Capture, \
+             or use runtime_snapshot / memory_diff for RSS/VA/pool census without locality.\n"
         );
     };
     let quality = text(locality, "/quality");
     let Some(hotspots) = locality.get("hotspots").and_then(Value::as_array) else {
         return format!(
-            "locality_hotspots - {id}\nquality={quality}\nNo attributed hotspot records.\n"
+            "locality_hotspots - {id}\nquality={quality}\nNo attributed hotspot records.\n\
+             Soft-route: re-capture with locality sampling enabled in wiki Health → Runtime.\n"
         );
     };
     let mut rows: Vec<_> = hotspots
@@ -473,5 +534,27 @@ mod tests {
         let out = render_locality("live", &json!({"regions": []}), 8, 1);
         assert!(out.contains("quality=unavailable"));
         assert!(out.contains("VA adjacency is not treated as cache locality"));
+        assert!(out.contains("Soft-route"));
+    }
+
+    #[test]
+    fn missing_capture_lists_available_and_soft_route() {
+        let dir = std::env::temp_dir().join(format!(
+            "wk_runtime_miss_{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join(".wordkeep/runtime")).unwrap();
+        fs::write(
+            dir.join(".wordkeep/runtime/latest.json"),
+            br#"{"schema_version":1,"source":"test"}"#,
+        )
+        .unwrap();
+        // Point workspace runtime at empty cache dir so numbered capture misses.
+        let err = load_snapshot(&dir, "999").unwrap_err();
+        assert!(err.contains("no capture `999`"), "{err}");
+        assert!(err.contains("Health → Runtime"), "{err}");
+        assert!(err.contains("Available:"), "{err}");
+        let _ = fs::remove_dir_all(&dir);
     }
 }

@@ -257,6 +257,13 @@ pub fn advisory_findings(agents: &[AgentView<'_>], now: u64) -> Vec<Finding> {
                 }
             }
             if !a.base_oid.is_empty() && !b.base_oid.is_empty() && a.base_oid != b.base_oid {
+                let a_stale = is_stale(a.state, a.expires_at, now);
+                let b_stale = is_stale(b.state, b.expires_at, now);
+                // Skip both-stale pairs: O(n²) historical noise that bloated
+                // check_in/status payloads and falsely flipped net-negative stats.
+                if a_stale && b_stale {
+                    continue;
+                }
                 out.push(Finding {
                     kind: "base_divergence".into(),
                     agents: vec![a.agent_id.to_string(), b.agent_id.to_string()],
@@ -264,7 +271,7 @@ pub fn advisory_findings(agents: &[AgentView<'_>], now: u64) -> Vec<Finding> {
                         "{} base {} != {} base {}",
                         a.agent_id, a.base_oid, b.agent_id, b.base_oid
                     ),
-                    stale,
+                    stale: a_stale || b_stale,
                 });
             }
         }
@@ -356,6 +363,51 @@ mod tests {
         let found = advisory_findings(&agents, 10);
         assert!(found.iter().any(|f| f.kind == "drift"));
         assert!(found.iter().all(|f| f.kind != "blocked"));
+    }
+
+    #[test]
+    fn findings_skip_both_stale_base_divergence() {
+        let claims: Vec<Claim> = Vec::new();
+        let dirty: Vec<String> = Vec::new();
+        let agents = vec![
+            AgentView {
+                agent_id: "a",
+                state: AgentState::CheckedIn,
+                expires_at: 1,
+                base_oid: "aaa",
+                claims: &claims,
+                dirty_paths: &dirty,
+            },
+            AgentView {
+                agent_id: "b",
+                state: AgentState::CheckedIn,
+                expires_at: 1,
+                base_oid: "bbb",
+                claims: &claims,
+                dirty_paths: &dirty,
+            },
+            AgentView {
+                agent_id: "c",
+                state: AgentState::LiveCode,
+                expires_at: 100,
+                base_oid: "ccc",
+                claims: &claims,
+                dirty_paths: &dirty,
+            },
+        ];
+        let found = advisory_findings(&agents, 50);
+        assert!(
+            !found
+                .iter()
+                .any(|f| f.kind == "base_divergence" && f.detail.contains("a base") && f.detail.contains("b base")),
+            "both-stale pair should be omitted: {found:?}"
+        );
+        assert!(
+            found
+                .iter()
+                .any(|f| f.kind == "base_divergence" && f.detail.contains("c base")),
+            "live vs stale divergence should remain: {found:?}"
+        );
     }
 
     #[test]

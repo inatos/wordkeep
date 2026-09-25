@@ -8,11 +8,21 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use crate::call_graph::{self, seg};
-use crate::stats;
+use crate::continuation::{self, KIND_MODULE_SKIP};
+use crate::{progress, stats};
 
 const SAMPLE_CAP: usize = 4;
 
 pub fn build(root: &Path, args: &Value) -> Result<String, String> {
+    const FP_KEYS: &[&str] = &[
+        "paths",
+        "profile",
+        "depth",
+        "max",
+        "samples",
+        "min_edge",
+        "focus",
+    ];
     let paths = crate::config::paths_from_args(root, args)?;
     let depth = args
         .get("depth")
@@ -35,7 +45,11 @@ pub fn build(root: &Path, args: &Value) -> Result<String, String> {
         .get("token_budget")
         .and_then(Value::as_u64)
         .unwrap_or(1200) as usize;
+    let args_fp = continuation::args_fingerprint(args, FP_KEYS);
+    let resume_at =
+        continuation::resume_offset(args, "module_map", FP_KEYS, KIND_MODULE_SKIP)? as usize;
 
+    progress::tick(0, None, "module_map: adjacency");
     let adj = call_graph::adjacency(root, &paths);
 
     let mut sym_count: BTreeMap<String, usize> = BTreeMap::new();
@@ -82,7 +96,10 @@ pub fn build(root: &Path, args: &Value) -> Result<String, String> {
         sample_cap,
         max,
         budget,
+        args_fp,
+        resume_at,
     });
+    progress::tick(visible.len() as u64, Some(visible.len() as u64), "module_map: done");
     stats::record("module_map", adj.scanned_bytes / 4, (out.len() / 4) as u64);
     Ok(out)
 }
@@ -194,6 +211,8 @@ struct RenderCtx<'a> {
     sample_cap: usize,
     max: usize,
     budget: usize,
+    args_fp: u64,
+    resume_at: usize,
 }
 
 fn render(ctx: &RenderCtx<'_>) -> String {
@@ -207,6 +226,8 @@ fn render(ctx: &RenderCtx<'_>) -> String {
     let sample_cap = ctx.sample_cap;
     let max = ctx.max;
     let budget = ctx.budget;
+    let args_fp = ctx.args_fp;
+    let resume_at = ctx.resume_at;
     let depth_note = depth
         .map(|d| format!("depth {d}"))
         .unwrap_or_else(|| "full dir".to_string());
@@ -217,9 +238,13 @@ fn render(ctx: &RenderCtx<'_>) -> String {
     };
     let mod_count = visible.len();
     let mut out = format!(
-        "module_map - {mod_count} module(s), {} cross-module edge(s)  (roots {paths:?}, {depth_note}{focus_note})\n\n",
+        "module_map - {mod_count} module(s), {} cross-module edge(s)  (roots {paths:?}, {depth_note}{focus_note})",
         cross.len()
     );
+    if resume_at > 0 {
+        out.push_str(&format!(" [continuation from module #{resume_at}]"));
+    }
+    out.push_str("\n\n");
 
     if visible.is_empty() {
         out.push_str("(no modules match focus)\n");
@@ -239,8 +264,13 @@ fn render(ctx: &RenderCtx<'_>) -> String {
         total_b.cmp(&total_a).then_with(|| a.0.cmp(b.0))
     });
 
+    let mut truncated_at: Option<usize> = None;
+    let mut shown = 0usize;
     for (idx, (mod_name, count)) in modules.into_iter().enumerate() {
-        if idx >= max {
+        if idx < resume_at {
+            continue;
+        }
+        if shown >= max {
             out.push_str(&format!(
                 "… (+{} more modules; raise \"max\")\n",
                 mod_count - idx
@@ -250,12 +280,13 @@ fn render(ctx: &RenderCtx<'_>) -> String {
         let out_n = edge_sum(by_from.get(mod_name));
         let in_n = edge_sum(by_to.get(mod_name));
         let block = format!("{mod_name}/  ({count} symbols, {out_n} out / {in_n} in)\n");
-        if out.len() / 4 + block.len() / 4 > budget && idx > 0 {
-            out.push_str("… (truncated by token_budget)\n");
+        if out.len() / 4 + block.len() / 4 > budget && shown > 0 {
+            truncated_at = Some(idx);
             break;
         }
         out.push_str(&block);
 
+        let mut edge_truncated = false;
         if let Some(edges) = by_from.get(mod_name) {
             if edges.is_empty() {
                 out.push_str("  (no outgoing cross-module calls)\n");
@@ -263,8 +294,8 @@ fn render(ctx: &RenderCtx<'_>) -> String {
                 for (to, n) in edges.iter().take(8) {
                     let line = format!("  → {to}/  ({n} call edge(s))\n");
                     if out.len() / 4 + line.len() / 4 > budget {
-                        out.push_str("… (truncated by token_budget)\n");
-                        return out;
+                        edge_truncated = true;
+                        break;
                     }
                     out.push_str(&line);
                     if sample_cap > 0 {
@@ -273,15 +304,15 @@ fn render(ctx: &RenderCtx<'_>) -> String {
                             if !eg.is_empty() {
                                 let sample_line = format!("      e.g. {eg}\n");
                                 if out.len() / 4 + sample_line.len() / 4 > budget {
-                                    out.push_str("… (truncated by token_budget)\n");
-                                    return out;
+                                    edge_truncated = true;
+                                    break;
                                 }
                                 out.push_str(&sample_line);
                             }
                         }
                     }
                 }
-                if edges.len() > 8 {
+                if !edge_truncated && edges.len() > 8 {
                     out.push_str(&format!(
                         "  … (+{} more outgoing targets)\n",
                         edges.len() - 8
@@ -292,24 +323,41 @@ fn render(ctx: &RenderCtx<'_>) -> String {
             out.push_str("  (no outgoing cross-module calls)\n");
         }
 
-        if let Some(edges) = by_to.get(mod_name) {
-            for (from, n) in edges.iter().take(8) {
-                let line = format!("  ← {from}/  ({n} call edge(s) in)\n");
-                if out.len() / 4 + line.len() / 4 > budget {
-                    out.push_str("… (truncated by token_budget)\n");
-                    return out;
+        if !edge_truncated {
+            if let Some(edges) = by_to.get(mod_name) {
+                for (from, n) in edges.iter().take(8) {
+                    let line = format!("  ← {from}/  ({n} call edge(s) in)\n");
+                    if out.len() / 4 + line.len() / 4 > budget {
+                        edge_truncated = true;
+                        break;
+                    }
+                    out.push_str(&line);
                 }
-                out.push_str(&line);
-            }
-            if edges.len() > 8 {
-                out.push_str(&format!(
-                    "  … (+{} more incoming sources)\n",
-                    edges.len() - 8
-                ));
+                if !edge_truncated && edges.len() > 8 {
+                    out.push_str(&format!(
+                        "  … (+{} more incoming sources)\n",
+                        edges.len() - 8
+                    ));
+                }
             }
         }
 
         out.push('\n');
+        shown += 1;
+        if edge_truncated {
+            truncated_at = Some(idx + 1);
+            break;
+        }
+    }
+    if let Some(idx) = truncated_at {
+        continuation::append_footer(
+            &mut out,
+            "module_map",
+            args_fp,
+            idx as u64,
+            KIND_MODULE_SKIP,
+            &format!("+{} more modules", mod_count.saturating_sub(idx)),
+        );
     }
     out
 }

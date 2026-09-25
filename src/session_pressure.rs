@@ -162,15 +162,42 @@ pub fn report(root: &Path, args: &Value) -> Result<String, String> {
         }
     }
     match level {
-        "high" | "critical" => out.push_str(
-            "advice: call session_handoff (or mas_finalize with promote) before continuing.\n",
-        ),
+        "high" | "critical" => {
+            let draft = mas::draft_autopilot_handoff(root, session, 800);
+            out.push_str("\nautopilot_draft:\n");
+            for line in draft.lines() {
+                out.push_str("  ");
+                out.push_str(line);
+                out.push('\n');
+            }
+            out.push_str(
+                "advice: call session_handoff to persist, or paste draft into next session\n",
+            );
+        }
         "medium" => out
             .push_str("advice: consider session_handoff soon if more exploratory work remains.\n"),
         _ => out.push_str("advice: continue; pressure is within normal bounds.\n"),
     }
-    stats::record("session_pressure", 128, (out.len() / 4) as u64);
+    stats::record(
+        "session_pressure",
+        pressure_baseline(root).max(64),
+        (out.len() / 4) as u64,
+    );
     Ok(out)
+}
+
+/// Distilled baseline: events log + defects/runs stores that the report digests.
+fn pressure_baseline(root: &Path) -> u64 {
+    let events = std::fs::metadata(workspace::workspace_file(root, "events.jsonl"))
+        .map(|m| m.len() / 4)
+        .unwrap_or(0);
+    let defects = std::fs::metadata(root.join(".wordkeep/defects.json"))
+        .map(|m| m.len() / 4)
+        .unwrap_or(0);
+    let runs = std::fs::metadata(workspace::workspace_file(root, "runs.json"))
+        .map(|m| m.len() / 4)
+        .unwrap_or(0);
+    events + defects + runs
 }
 
 #[cfg(test)]
@@ -185,6 +212,76 @@ mod tests {
         assert_eq!(level_from_score(4), "medium");
         assert_eq!(level_from_score(7), "high");
         assert_eq!(level_from_score(12), "critical");
+    }
+
+    #[test]
+    fn high_pressure_appends_autopilot_draft() {
+        let _guard = crate::cache::test_env_lock();
+        let pid = std::process::id();
+        let cache_home = std::env::temp_dir().join(format!("wk_pressure_auto_{pid}"));
+        let root = std::env::temp_dir().join(format!("wk_pressure_auto_root_{pid}"));
+        let _ = std::fs::remove_dir_all(&cache_home);
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join(".wordkeep")).unwrap();
+        std::env::set_var("XDG_CACHE_HOME", &cache_home);
+
+        // Eyeball defect (+3) plus many events (+3) → high.
+        std::fs::write(
+            root.join(".wordkeep/defects.json"),
+            json!({
+                "version": 1,
+                "defects": [{
+                    "id": "eyeball-test",
+                    "summary": "visual fail",
+                    "status": "eyeball_fail",
+                    "subsystem": "test",
+                    "acceptance": []
+                }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let dir = workspace::ensure_workspace_dir(&root).unwrap();
+        let wid = workspace::workspace_id(&root);
+        let mut f = std::fs::File::create(dir.join("events.jsonl")).unwrap();
+        for i in 1..=90u64 {
+            writeln!(
+                f,
+                "{}",
+                json!({
+                    "ts": i,
+                    "tool": "outline",
+                    "baseline": 1,
+                    "returned": 1,
+                    "elapsed_us": 100,
+                    "outcome": "ok",
+                    "workspace_id": wid,
+                    "bytes_read": 0,
+                    "cache_hits": 0,
+                    "cache_misses": 0,
+                    "wordkeep_version": "0.2.0",
+                })
+            )
+            .unwrap();
+        }
+        drop(f);
+
+        let out = report(&root, &json!({})).unwrap();
+        assert!(out.contains("level=high") || out.contains("level=critical"), "{out}");
+        assert!(out.contains("autopilot_draft:"), "{out}");
+        assert!(
+            out.contains("call session_handoff to persist"),
+            "{out}"
+        );
+        // Must not have auto-written the handoff marker.
+        assert!(
+            !workspace::workspace_file(&root, HANDOFF_MARKER).is_file(),
+            "autopilot must not write last_handoff.json"
+        );
+
+        let _ = std::fs::remove_dir_all(&cache_home);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

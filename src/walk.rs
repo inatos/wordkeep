@@ -11,7 +11,7 @@ use std::collections::HashSet;
 use std::path::Path;
 use walkdir::{DirEntry, WalkDir};
 
-const BUILTIN_PRUNE: [&str; 10] = [
+const BUILTIN_PRUNE: [&str; 12] = [
     ".git",
     "build",
     "vendor",
@@ -22,6 +22,8 @@ const BUILTIN_PRUNE: [&str; 10] = [
     "obj",
     "publish",
     ".wineprefix",
+    "pacman-overlay",
+    "__pycache__",
 ];
 
 /// Directory basenames to skip while walking `root`.
@@ -90,6 +92,10 @@ mod tests {
         assert!(set.contains("build"));
         assert!(set.contains("vendor"));
         assert!(set.contains("target"));
+        assert!(set.contains(".cache"));
+        assert!(set.contains("node_modules"));
+        assert!(set.contains("pacman-overlay"));
+        assert!(set.contains("__pycache__"));
         // simple dir rules from .gitignore
         assert!(set.contains("out"));
         assert!(set.contains("logs"));

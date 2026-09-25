@@ -151,21 +151,25 @@ CLI: `wordkeep run-record …` records gate metadata without executing commands.
 
 ## What you get
 
-48 MCP tools + 2 MCP resources (`wordkeep://readme`, `wordkeep://capabilities`), including:
+51 MCP tools + 2 MCP resources (`wordkeep://readme`, `wordkeep://capabilities`), including:
 
 | Tool | Use when you need |
 | --- | --- |
-| `repo_map` | Structure of a source tree |
-| `outline` | Symbols and line numbers in one file |
+| `repo_map` | Structure of a source tree (files-first by default; `expand` / `mode:"symbols"`) |
+| `outline` | Symbols and line numbers in one file (or `files[]` batch) |
+| `symbol_resolve` | Fuzzy locate + profile hint before guessing paths |
 | `symbol_refs` | Where a symbol is defined, called, referenced |
 | `call_graph` / `call_path` | Caller/callee blast radius or shortest chain |
-| `symbol_context` | Body + one hop of graph + layout in one call |
+| `symbol_context` / `batch_context` | Body + one hop of graph + layout (one or many symbols) |
 | `knowledge_search` | Relevant docs/rules (and boosted open defects) |
+| `knowledge_answer` | Extractive answer + citations from the same index |
 | `session_handoff` | Paste-ready next-session prime |
-| `defect_list` / `run_history` | Unresolved blockers and recent gate evidence |
-| `session_pressure` | Heuristic context-pressure signal |
+| `defect_list` / `run_history` | Unresolved blockers (digest by default) and recent gate evidence |
+| `session_pressure` | Heuristic context-pressure signal (+ autopilot draft when high) |
 | `profile_upsert` | Propose/apply a new `path_profiles` entry in `.wordkeep/config.json` |
-| `test_map` | Narrowest tests after a change |
+| `test_map` / `test_impact` | Narrowest tests after a change / after a diff |
+| `perf_triage` | Tracy profile + hotspot context + tests in one call |
+| `index_health` | Profile coverage gaps and stale-index signal |
 | `runtime_snapshot` / `memory_diff` | Runtime memory census or signed capture deltas |
 | `locality_hotspots` | Sampled PMC/ETW/perf hotspots, or explicit unavailable |
 | `stats` | Measured token displacement per tool |
@@ -201,6 +205,7 @@ Token-savings telemetry is available two ways:
 ```sh
 cargo test
 cargo test --test mcp_stdio      # full MCP protocol harness
+cargo test --test eval_queries   # golden-query outcome + token-cap harness
 cargo test --test external_repo  # isolated consumer repo
 ```
 

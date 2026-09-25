@@ -30,11 +30,41 @@ case "${WIKI_AUTO_REBUILD:-1}" in
   0|false|FALSE|no|NO|off|OFF) AUTO_REBUILD=0 ;;
 esac
 FORCE=0
-if [[ "${1:-}" == "--restart" || "${1:-}" == "-f" ]]; then
+if [[ "${1:-}" == "--restart" || "${1:-}" == "-f" || "${1:-}" == "--force" ]]; then
   FORCE=1
 fi
 # Set when ensure_wiki_bin actually ran cargo build.
 REBUILT_BIN=0
+
+# Dashboard reads $XDG_CACHE_HOME/wordkeep/savings.json (same file MCP writes).
+# Live tests / eval harnesses often export XDG_CACHE_HOME to a temp dir; if the
+# wiki inherits that, the GUI shows "No savings.json yet" while ~/.cache still
+# has real telemetry. Prefer an explicit WORDKEEP_WIKI_CACHE_HOME, otherwise
+# drop test/live-test overrides so serve sees the user cache.
+sanitize_cache_home() {
+  if [[ -n "${WORDKEEP_WIKI_CACHE_HOME:-}" ]]; then
+    export XDG_CACHE_HOME="$WORDKEEP_WIKI_CACHE_HOME"
+    return 0
+  fi
+  local xdg="${XDG_CACHE_HOME:-}"
+  [[ -z "$xdg" ]] && return 0
+  case "$xdg" in
+    *cache-live-test*|*eval*|*tmp*|*TMP*|"$WK"/.cache*)
+      echo "[wordkeep:wiki] ignoring test XDG_CACHE_HOME=$xdg (dashboard needs user savings.json)"
+      unset XDG_CACHE_HOME
+      ;;
+  esac
+  # If override still has no savings but the default user cache does, drop it.
+  if [[ -n "${XDG_CACHE_HOME:-}" ]]; then
+    local override_savings="$XDG_CACHE_HOME/wordkeep/savings.json"
+    local user_savings="${HOME:-}/.cache/wordkeep/savings.json"
+    if [[ ! -f "$override_savings" && -f "$user_savings" ]]; then
+      echo "[wordkeep:wiki] XDG_CACHE_HOME=$XDG_CACHE_HOME has no savings.json; using ~/.cache"
+      unset XDG_CACHE_HOME
+    fi
+  fi
+}
+sanitize_cache_home
 
 mkdir -p "$STATE_DIR"
 
@@ -138,7 +168,13 @@ ui_up() {
 
 dashboard_ok() {
   # /api/dashboard is required for the GUI telemetry tab; older binaries 404 it.
-  [[ "$(http_code /api/dashboard)" == "200" ]]
+  # Also reject the "No savings.json" stub caused by a poisoned XDG_CACHE_HOME.
+  local body code
+  body="$(curl -s --max-time 1 -w '\n%{http_code}' "http://${BIND}/api/dashboard" 2>/dev/null || true)"
+  code="$(printf '%s\n' "$body" | tail -n1)"
+  body="$(printf '%s\n' "$body" | sed '$d')"
+  [[ "$code" == "200" ]] || return 1
+  [[ "$body" != *'"available":false'* && "$body" != *'"available": false'* ]]
 }
 
 runtime_ok() {
@@ -170,6 +206,13 @@ ui_has_izakaya_view() {
     && grep -q 'dash-table' "$WK/wiki/dist"/assets/*.js 2>/dev/null
 }
 
+ui_has_tool_help() {
+  # TOOL_HELP hover copy for every MCP tool (see wiki/src/lib/toolHelp.ts).
+  # Bump the unique phrase when hover strings change and dist must rebuild.
+  grep -q 'Take or resume a lease before the first live edit' "$WK/wiki/dist"/assets/*.js 2>/dev/null \
+    && grep -q 'pages via continuation when truncated' "$WK/wiki/dist"/assets/*.js 2>/dev/null
+}
+
 ui_has_local_base() {
   # Local host serve must use Vite base `/` (lab Docker sets /lab/wordkeep/ui/).
   local index="$WK/wiki/dist/index.html"
@@ -188,7 +231,7 @@ rebuild_ui_dist() {
 }
 
 ensure_ui_dist() {
-  if ui_has_runtime_view && ui_has_local_base && ui_has_izakaya_view; then
+  if ui_has_runtime_view && ui_has_local_base && ui_has_izakaya_view && ui_has_tool_help; then
     return 0
   fi
   if ! ui_has_local_base && [[ -f "$WK/wiki/dist/index.html" ]]; then
@@ -197,13 +240,15 @@ ensure_ui_dist() {
     echo "[wordkeep:wiki] wiki/dist is stale (no Runtime Health UI)"
   elif ! ui_has_izakaya_view; then
     echo "[wordkeep:wiki] wiki/dist is stale (no Izakaya dashboard page)"
+  elif ! ui_has_tool_help; then
+    echo "[wordkeep:wiki] wiki/dist is stale (TOOL_HELP hover strings missing)"
   fi
   rebuild_ui_dist || return 1
-  ui_has_runtime_view && ui_has_local_base && ui_has_izakaya_view
+  ui_has_runtime_view && ui_has_local_base && ui_has_izakaya_view && ui_has_tool_help
 }
 
 healthy() {
-  ui_up && dashboard_ok && izakaya_ok && runtime_ok && runtime_attach_ok && ui_has_runtime_view && ui_has_izakaya_view && ui_has_local_base
+  ui_up && dashboard_ok && izakaya_ok && runtime_ok && runtime_attach_ok && ui_has_runtime_view && ui_has_izakaya_view && ui_has_tool_help && ui_has_local_base
 }
 
 alive_pid() {

@@ -3,12 +3,21 @@
 //! Groups dirty paths by configured `commit_scopes` prefixes and warns about
 //! dirty submodules, secrets, generated dirs, binaries, and large files.
 //! Never stages or commits.
+//!
+//! Skips configured `commit_ignore` path prefixes (default `.cache/`, `target/`,
+//! `node_modules/`) and caches porcelain results for 2s so bursty agents do not
+//! re-run `git status` on huge dirty trees.
 
 use serde_json::Value;
-use std::path::Path;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
-use crate::{config, stats};
+use crate::{config, progress, stats};
+
+const PORCELAIN_TTL: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Debug)]
 struct Dirty {
@@ -17,7 +26,38 @@ struct Dirty {
     size: Option<u64>,
 }
 
-fn git_porcelain(root: &Path) -> Result<Vec<Dirty>, String> {
+struct PorcelainCacheEntry {
+    at: Instant,
+    dirty: Vec<Dirty>,
+}
+
+/// Short-TTL porcelain cache keyed by absolute root path.
+static PORCELAIN_CACHE: OnceLock<Mutex<HashMap<PathBuf, PorcelainCacheEntry>>> = OnceLock::new();
+
+/// True when `path` matches any configured ignore prefix (normalized `/`).
+pub(crate) fn path_matches_ignore(path: &str, prefixes: &[String]) -> bool {
+    let p = path.replace('\\', "/");
+    for pref in prefixes {
+        let pref = pref.replace('\\', "/");
+        let trimmed = pref.trim_end_matches('/');
+        if trimmed.is_empty() {
+            continue;
+        }
+        if p == trimmed || p.starts_with(&format!("{trimmed}/")) {
+            return true;
+        }
+    }
+    false
+}
+
+fn filter_ignored(dirty: Vec<Dirty>, ignore: &[String]) -> Vec<Dirty> {
+    dirty
+        .into_iter()
+        .filter(|d| !path_matches_ignore(&d.path, ignore))
+        .collect()
+}
+
+fn git_porcelain_uncached(root: &Path) -> Result<Vec<Dirty>, String> {
     let out = Command::new("git")
         .args(["status", "--porcelain", "-uall"])
         .current_dir(root)
@@ -50,6 +90,32 @@ fn git_porcelain(root: &Path) -> Result<Vec<Dirty>, String> {
         dirty.push(Dirty { status, path, size });
     }
     Ok(dirty)
+}
+
+fn git_porcelain(root: &Path, ignore: &[String]) -> Result<Vec<Dirty>, String> {
+    let key = root.to_path_buf();
+    let cell = PORCELAIN_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(store) = cell.lock() {
+        if let Some(entry) = store.get(&key) {
+            if entry.at.elapsed() < PORCELAIN_TTL {
+                return Ok(filter_ignored(entry.dirty.clone(), ignore));
+            }
+        }
+    }
+
+    let raw = git_porcelain_uncached(root)?;
+
+    if let Ok(mut store) = cell.lock() {
+        store.insert(
+            key,
+            PorcelainCacheEntry {
+                at: Instant::now(),
+                dirty: raw.clone(),
+            },
+        );
+    }
+
+    Ok(filter_ignored(raw, ignore))
 }
 
 fn looks_secret(path: &str) -> bool {
@@ -117,7 +183,9 @@ pub fn propose(root: &Path, args: &Value) -> Result<String, String> {
         .and_then(Value::as_u64)
         .unwrap_or_else(|| config::large_file_bytes(root));
 
-    let dirty = match git_porcelain(root) {
+    progress::tick(0, None, "commit_scope: porcelain");
+    let ignore = config::commit_ignore(root);
+    let dirty = match git_porcelain(root, &ignore) {
         Ok(d) => d,
         Err(e) => {
             return Ok(format!(
@@ -192,6 +260,9 @@ pub fn propose(root: &Path, args: &Value) -> Result<String, String> {
         "commit_scope - {} dirty path(s) (read-only; never stages/commits)\n",
         dirty.len()
     );
+    if !ignore.is_empty() {
+        out.push_str(&format!("ignored prefixes: {ignore:?}\n"));
+    }
     if dirty.is_empty() {
         out.push_str("\nWorking tree clean.\n");
         stats::record("commit_scope", 16, (out.len() / 4) as u64);
@@ -266,5 +337,48 @@ mod tests {
         assert!(looks_secret(".env.local"));
         assert!(looks_binary("shot.png"));
         assert!(looks_generated("target/release/foo"));
+    }
+
+    #[test]
+    fn ignore_filters_cache_and_target_prefixes() {
+        let ignore = vec![
+            ".cache/".into(),
+            "target/".into(),
+            "node_modules/".into(),
+        ];
+        assert!(path_matches_ignore(".cache/foo.bin", &ignore));
+        assert!(path_matches_ignore("target/debug/bar", &ignore));
+        assert!(path_matches_ignore("node_modules/pkg/index.js", &ignore));
+        assert!(path_matches_ignore(".cache", &ignore));
+        assert!(!path_matches_ignore("src/main.rs", &ignore));
+        assert!(!path_matches_ignore("docs/.cache_notes.md", &ignore));
+
+        let dirty = vec![
+            Dirty {
+                status: "??".into(),
+                path: ".cache/x".into(),
+                size: None,
+            },
+            Dirty {
+                status: " M".into(),
+                path: "src/a.rs".into(),
+                size: Some(10),
+            },
+            Dirty {
+                status: "??".into(),
+                path: "target/release/wordkeep".into(),
+                size: None,
+            },
+        ];
+        let kept = filter_ignored(dirty, &ignore);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].path, "src/a.rs");
+    }
+
+    #[test]
+    fn ignore_respects_trailing_slash_variants() {
+        let ignore = vec!["pacman-overlay".into()];
+        assert!(path_matches_ignore("pacman-overlay/pkg", &ignore));
+        assert!(!path_matches_ignore("src/pacman-overlay.rs", &ignore));
     }
 }

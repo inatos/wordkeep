@@ -226,6 +226,19 @@ pub fn large_file_bytes(root: &Path) -> u64 {
         .unwrap_or(5 * 1024 * 1024)
 }
 
+/// Path prefixes `commit_scope` drops from porcelain (default `.cache/`, `target/`,
+/// `node_modules/` when the key is absent). An explicit empty array disables filtering.
+pub fn commit_ignore(root: &Path) -> Vec<String> {
+    match load_config(root) {
+        Some(cfg) if cfg.get("commit_ignore").is_some() => string_vec(&cfg, "commit_ignore"),
+        _ => vec![
+            ".cache/".into(),
+            "target/".into(),
+            "node_modules/".into(),
+        ],
+    }
+}
+
 /// Whether mas_finalize should auto-promote when `promote` is omitted.
 pub fn mas_auto_promote(root: &Path) -> bool {
     load_config(root)
@@ -369,6 +382,9 @@ pub fn symbol_required_err() -> String {
 /// Resolve a user-supplied file path against the workspace root and search paths.
 /// Accepts repo-relative paths (`pkg/lib/Foo.cs`) or a unique basename
 /// (`ModelLoader.cs`) searched under configured roots / profiles.
+/// Convenience wrapper around [`resolve_file_with_args`] with empty args.
+/// Kept for callers/tests that do not need profile/paths overrides.
+#[allow(dead_code)]
 pub fn resolve_file(root: &Path, file: &str) -> Result<PathBuf, String> {
     resolve_file_with_args(root, file, &serde_json::json!({}))
 }
@@ -433,7 +449,7 @@ pub fn list_profile_names(root: &Path) -> Vec<String> {
 
 /// Collect paths whose basename equals `name`, searching each `bases` entry under `root`.
 /// Pass `bases: [""]` to walk the whole repo (still pruned). Results are deduped.
-fn basename_matches(
+pub fn basename_matches(
     root: &Path,
     name: &str,
     prune: &HashSet<String>,
@@ -628,6 +644,28 @@ mod tests {
         )
         .unwrap();
         assert_eq!(test_filter_hint(&dir, "unit"), "ctest -R \"[unit]\"");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn commit_ignore_defaults_and_override() {
+        let dir = tmp("cignore");
+        let _ = fs::remove_file(dir.join(".wordkeep/config.json"));
+        let defaults = commit_ignore(&dir);
+        assert!(defaults.iter().any(|p| p.starts_with(".cache")));
+        assert!(defaults.iter().any(|p| p.starts_with("target")));
+        assert!(defaults.iter().any(|p| p.starts_with("node_modules")));
+
+        fs::write(
+            dir.join(".wordkeep/config.json"),
+            r#"{"commit_ignore":["pacman-overlay/"]}"#,
+        )
+        .unwrap();
+        let custom = commit_ignore(&dir);
+        assert_eq!(custom, vec!["pacman-overlay/".to_string()]);
+
+        fs::write(dir.join(".wordkeep/config.json"), r#"{"commit_ignore":[]}"#).unwrap();
+        assert!(commit_ignore(&dir).is_empty());
         let _ = fs::remove_dir_all(&dir);
     }
 }

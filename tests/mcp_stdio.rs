@@ -115,10 +115,16 @@ impl Server {
         self.stdin.write_all(line.as_bytes()).unwrap();
         self.stdin.write_all(b"\n").unwrap();
         self.stdin.flush().unwrap();
-        let mut resp = String::new();
-        let n = self.stdout.read_line(&mut resp).expect("read response");
-        assert!(n > 0, "server closed stdout without responding");
-        serde_json::from_str(&resp).unwrap_or_else(|e| panic!("bad response {resp:?}: {e}"))
+        loop {
+            let mut resp = String::new();
+            let n = self.stdout.read_line(&mut resp).expect("read response");
+            assert!(n > 0, "server closed stdout without responding");
+            let v: Value =
+                serde_json::from_str(&resp).unwrap_or_else(|e| panic!("bad response {resp:?}: {e}"));
+            if v.get("id").is_some() {
+                return v;
+            }
+        }
     }
 
     fn tool_text(&mut self, name: &str, args: Value) -> String {
@@ -183,6 +189,7 @@ fn lists_all_tools() {
         "repo_map",
         "outline",
         "symbol_refs",
+        "symbol_resolve",
         "call_graph",
         "call_path",
         "doc_comment",
@@ -197,7 +204,11 @@ fn lists_all_tools() {
         "include_graph",
         "type_layout",
         "test_map",
+        "batch_context",
+        "perf_triage",
+        "test_impact",
         "knowledge_search",
+        "knowledge_answer",
         "knowledge_upsert",
         "trace_summary",
         "trace_profile",
@@ -206,6 +217,7 @@ fn lists_all_tools() {
         "locality_hotspots",
         "integration_hooks",
         "index_stale",
+        "index_health",
         "stats",
         "mas_post",
         "mas_read",
@@ -224,17 +236,26 @@ fn lists_all_tools() {
         "izakaya_check_in",
         "izakaya_update",
         "izakaya_check_out",
-        "izakaya_record_decision",
-        "izakaya_record_outcome",
-        "izakaya_replay",
         "izakaya_advise",
     ] {
         assert!(names.contains(&n), "missing tool {n}: {names:?}");
     }
+    assert!(
+        !names.contains(&"izakaya_record_decision"),
+        "replay-lab MCP tools were removed: {names:?}"
+    );
+    assert!(
+        !names.contains(&"izakaya_record_outcome"),
+        "replay-lab MCP tools were removed: {names:?}"
+    );
+    assert!(
+        !names.contains(&"izakaya_replay"),
+        "replay-lab MCP tools were removed: {names:?}"
+    );
     assert_eq!(
         names.len(),
-        48,
-        "expected 48 tools, got {}: {names:?}",
+        51,
+        "expected 51 tools, got {}: {names:?}",
         names.len()
     );
 }
@@ -301,7 +322,7 @@ fn resources_list_and_read_readme() {
         "params": { "uri": "wordkeep://capabilities" }
     }));
     let caps_text = caps["result"]["contents"][0]["text"].as_str().unwrap_or("");
-    assert!(caps_text.contains("\"tool_count\": 48"), "{caps}");
+    assert!(caps_text.contains("\"tool_count\": 51"), "{caps}");
     assert!(caps_text.contains("knowledge_upsert"), "{caps}");
 }
 
@@ -361,7 +382,10 @@ fn continuity_tools_smoke() {
 #[test]
 fn repo_map_maps_fixture_source() {
     let mut s = Server::start();
-    let out = s.tool_text("repo_map", json!({ "paths": ["src"] }));
+    let out = s.tool_text(
+        "repo_map",
+        json!({ "paths": ["src"], "mode": "symbols" }),
+    );
     assert!(out.contains("sample.cpp"), "{out}");
     assert!(out.contains("namespace demo"), "{out}");
     assert!(out.contains("struct Widget"), "{out}");
@@ -895,6 +919,49 @@ fn paths_escape_root_is_rejected() {
     let mut s = Server::start();
     let err = s.tool_error("repo_map", json!({ "paths": ["../outside"] }));
     assert!(err.contains("..") || err.contains("relative"), "{err}");
+}
+
+#[test]
+fn progress_token_emits_notification() {
+    let mut s = Server::start();
+    let _ = s.call(json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": { "protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": { "name": "t", "version": "0" } }
+    }));
+    let line = serde_json::to_string(&json!({
+        "jsonrpc": "2.0",
+        "id": 42,
+        "method": "tools/call",
+        "params": {
+            "name": "repo_map",
+            "arguments": { "mode": "files", "token_budget": 800 },
+            "_meta": { "progressToken": "stdio-progress" }
+        }
+    }))
+    .unwrap();
+    s.stdin.write_all(line.as_bytes()).unwrap();
+    s.stdin.write_all(b"\n").unwrap();
+    s.stdin.flush().unwrap();
+    let mut saw_progress = false;
+    let mut saw_result = false;
+    for _ in 0..32 {
+        let mut resp = String::new();
+        let n = s.stdout.read_line(&mut resp).expect("read");
+        assert!(n > 0);
+        let v: Value = serde_json::from_str(&resp).expect("json");
+        if v.get("method").and_then(Value::as_str) == Some("notifications/progress") {
+            assert_eq!(v["params"]["progressToken"], json!("stdio-progress"));
+            saw_progress = true;
+        }
+        if v.get("id") == Some(&json!(42)) {
+            saw_result = true;
+            break;
+        }
+    }
+    assert!(saw_progress, "expected notifications/progress before result");
+    assert!(saw_result, "expected tools/call result");
 }
 
 #[test]

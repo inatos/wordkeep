@@ -5,15 +5,80 @@ All notable changes to wordkeep are documented here. The project follows
 
 ## [Unreleased]
 
+Telemetry upgrade pass (token → accuracy → latency). Surface is **51** tools.
+
+### Added (progressive MCP)
+
+- **Continuation tokens**: when a tool truncates on `token_budget`, it appends
+  `continuation: <opaque>` — re-call with that arg to fetch the next page of the
+  same query (no re-emit of earlier rows). Wired for `repo_map`, `outline`
+  (batch), `knowledge_search`, `module_map`, `big_functions`, `symbol_refs`,
+  `symbol_context`. Prefer continuation over blindly raising `token_budget`.
+- **`notifications/progress`**: when the client passes `_meta.progressToken` on
+  `tools/call`, long walks emit MCP progress ticks (stdio) before the final
+  result. No-op without a token.
+
+### Fixed (live-soak follow-up)
+
+- **Fuzzy did-you-mean**: reject short/non-ident leaves; length-ratio + prefix/overlap
+  gates so typos no longer suggest `Ve`/`E`/`Ol`.
+- **`symbol_resolve` cold path**: DiskMap cache for def names; skip cross-profile
+  locate when `paths`/`profile` is explicit (warm miss ~5ms).
+- **`index_health` cold path**: `git ls-files` sampling, tracked-only git diff,
+  5s TTL cache (cold ~0.4s, warm ~0ms on this tree).
+- **Stats baselines**: `session_pressure` / `index_health` use store sizes; on
+  `init_registry`, prune removed tools from `savings.json` and clear legacy
+  flat-64 false net-negatives.
+
+### Added
+
+- **`symbol_resolve`**: normalize + fuzzy locate + cross-profile did-you-mean.
+- **`knowledge_answer`**: extractive synthesis + citations from the shared BM25
+  pipeline (no LLM).
+- **`batch_context`**: multi-symbol edit context under one budget.
+- **`perf_triage`**: `trace_profile` → hotspot `symbol_context` → `test_map` bundle.
+- **`test_impact`**: changed symbols × test refs for the narrowest suite.
+- **`index_health`**: profile coverage gaps + stale-index signal.
+- **`repo_map` progressive**: files-first default (`mode`/`expand`); symbols on demand.
+- **`outline` `files[]`**: batch TOC under one budget.
+- **`integration_hooks` OR fallback**: AND first; if empty, rank by token hit
+  count; vocabulary hint of `##` headings when still empty.
+- **`defect_list` digest-first**: default compact summary (`digest:true` /
+  `format:"digest"`); pass `digest:false` or `format:"full"` for the detailed list.
+- **`session_pressure` autopilot draft** when high/critical (no auto-write).
+- **Eval harness**: `cargo test --test eval_queries` (golden outcomes + token caps).
+- **`commit_ignore`** config (default `.cache/`, `target/`, `node_modules/`) +
+  short-TTL porcelain cache for `commit_scope`.
+
+### Removed
+
+- MCP tools `izakaya_record_decision`, `izakaya_record_outcome`, `izakaya_replay`
+  (never called in telemetry; no agent producer path). Offline replay lab remains
+  via library + `wordkeep izakaya policy …`.
+
+### Fixed
+
+- **Izakaya stats baseline**: presence tools recorded distilled=`64` while returning
+  journal digests — false net-negative. Baseline is now on-disk journal +
+  projection size (same pattern as `defect_list` / `run_history`).
+- **`mas_read` / `session_handoff` baselines**: use session file size (and for
+  handoff, defects + runs stores) so composite digests are not net-negative.
+- **Advisory noise**: skip both-stale `base_divergence` pairs (O(n²) historical
+  noise that truncated useful check_in/status lines).
+- **`memory_diff` / `locality_hotspots` discoverability**: clearer errors listing
+  available captures and soft-route hints (wiki Health → Runtime Capture;
+  Betwixt `.wordkeep/runtime/latest.json`). Soft-routed from `perf_triage`.
+- **Arg repair**: `type_layout` / `test_map` normalize qualified/templated names;
+  symbol tools append did-you-mean on not-found.
+
 ### Added
 
 - **Izakaya** — local agent presence for linked Git worktrees: append-only
   journal, advisory path/symbol claims, two-phase handoffs, and a read-only
-  Dream-RSI-style replay lab. New tools: `izakaya_status`, `izakaya_check_in`,
-  `izakaya_update`, `izakaya_check_out`, `izakaya_record_decision`,
-  `izakaya_record_outcome`, `izakaya_replay`, `izakaya_advise`. CLI:
-  `wordkeep izakaya policy list|evaluate|promote|retire`. Promotion only
-  activates advice; it does not assign work or mutate Git. Surface is 48 tools.
+  Dream-RSI-style replay lab (CLI/offline). MCP tools: `izakaya_status`,
+  `izakaya_check_in`, `izakaya_update`, `izakaya_check_out`, `izakaya_advise`.
+  CLI: `wordkeep izakaya policy list|evaluate|promote|retire`. Promotion only
+  activates advice; it does not assign work or mutate Git.
 
 ## [0.4.2] - 2026-08-22
 

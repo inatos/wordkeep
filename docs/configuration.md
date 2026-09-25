@@ -22,6 +22,7 @@ Lives at the **root of the repository you analyze** (the `--root` path).
     "engine": ["src/", "docs/"],
     "kkbp": ["tools/kkbp/"]
   },
+  "commit_ignore": [".cache/", "target/", "node_modules/"],
   "large_file_bytes": 5242880,
   "mas": {
     "auto_promote": false,
@@ -47,6 +48,7 @@ Lives at the **root of the repository you analyze** (the `--root` path).
 | `artifact_roots` | Roots scanned by `artifact_index` (evidence only; often gitignored). |
 | `knowledge_write_roots` | Extra allowlisted write prefixes for `knowledge_upsert` (plus built-ins + root `README.md`). |
 | `commit_scopes` | Named path-prefix groups for `commit_scope`. |
+| `commit_ignore` | Path prefixes dropped from `commit_scope` porcelain (default `.cache/`, `target/`, `node_modules/` when absent). |
 | `large_file_bytes` | Large-file warning threshold for `commit_scope` (default 5 MiB). |
 | `mas.auto_promote` | Default `promote` for `mas_finalize` / `session_handoff` when omitted. |
 | `mas.handoff_tokens` | Token cap for `kind: "handoff"` MAS entries (default 1600). |

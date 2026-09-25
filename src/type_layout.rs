@@ -29,13 +29,23 @@ struct Layout {
 }
 
 pub fn build(root: &Path, args: &Value) -> Result<String, String> {
-    let ty = args
+    let raw = args
         .get("type")
         .and_then(Value::as_str)
         .unwrap_or("")
         .trim();
+    if raw.is_empty() {
+        return Err(
+            "type is required (struct/class/union NAME). Optional: paths, profile, token_budget."
+                .into(),
+        );
+    }
+    let ty = crate::symbol_resolve::normalize_symbol(raw);
     if ty.is_empty() {
-        return Err("type is required".into());
+        return Err(
+            "type is required (struct/class/union NAME). Optional: paths, profile, token_budget."
+                .into(),
+        );
     }
     let paths = crate::config::paths_from_args(root, args)?;
     let budget = args
@@ -43,9 +53,17 @@ pub fn build(root: &Path, args: &Value) -> Result<String, String> {
         .and_then(Value::as_u64)
         .unwrap_or(1200) as usize;
 
-    let (block, scanned_bytes) = layout_block(root, ty, &paths, budget);
+    let (block, scanned_bytes) = layout_block(root, &ty, &paths, budget);
     let out = block.unwrap_or_else(|| {
-        format!("type_layout - \"{ty}\": no struct/class/union with that name under {paths:?}")
+        let mut msg = format!(
+            "type_layout - \"{raw}\" → \"{ty}\": no struct/class/union with that name under {paths:?}"
+        );
+        let sugg = crate::symbol_resolve::suggestions(root, &ty, &paths, 5);
+        if !sugg.is_empty() {
+            msg.push_str(&format!("\nsuggestions: {}", sugg.join(", ")));
+        }
+        msg.push_str(&crate::symbol_resolve::did_you_mean_hint(root, &ty, &paths));
+        msg
     });
     stats::record("type_layout", scanned_bytes / 4, (out.len() / 4) as u64);
     Ok(out)

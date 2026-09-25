@@ -21,8 +21,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use tree_sitter::{Node, Parser};
 
+use crate::continuation::{self, KIND_HIT_SKIP};
 use crate::lang::Lang;
-use crate::{cache, stats, walk};
+use crate::{cache, progress, stats, walk};
 
 // Leaf name nodes plus `A::b` (qualified) so scope-qualified queries resolve too.
 const NAME_KINDS_CPP: [&str; 5] = [
@@ -83,8 +84,14 @@ pub fn find(root: &Path, args: &Value) -> Result<String, String> {
         .get("token_budget")
         .and_then(Value::as_u64)
         .unwrap_or(1200) as usize;
+    const FP_KEYS: &[&str] = &["symbol", "paths", "profile", "kind", "max"];
+    let args_fp = continuation::args_fingerprint(args, FP_KEYS);
+    let resume_at =
+        continuation::resume_offset(args, "symbol_refs", FP_KEYS, KIND_HIT_SKIP)? as usize;
     // Fast path: when only definitions are wanted, drop calls/refs while filtering.
     let defs_only = kind == "def";
+
+    progress::tick(0, None, "symbol_refs: scanning");
 
     let want = |r: Role| match kind.as_str() {
         "def" => r == Role::Def,
@@ -206,12 +213,16 @@ pub fn find(root: &Path, args: &Value) -> Result<String, String> {
     }
 
     let mut out = if defs_only {
-        format!("symbol_refs - \"{symbol}\": {nd} def across {files_scanned} file(s) (definition-only)\n")
+        format!("symbol_refs - \"{symbol}\": {nd} def across {files_scanned} file(s) (definition-only)")
     } else {
         format!(
-            "symbol_refs - \"{symbol}\": {nd} def, {nc} call, {nr} ref across {files_scanned} file(s)\n"
+            "symbol_refs - \"{symbol}\": {nd} def, {nc} call, {nr} ref across {files_scanned} file(s)"
         )
     };
+    if resume_at > 0 {
+        out.push_str(&format!(" [continuation from hit #{resume_at}]"));
+    }
+    out.push('\n');
     if kind != "all" && !defs_only {
         out.push_str(&format!("filter: {kind}\n"));
     }
@@ -219,8 +230,14 @@ pub fn find(root: &Path, args: &Value) -> Result<String, String> {
 
     let mut used = out.len() / 4;
     let mut shown = 0usize;
+    let mut hit_index = 0usize;
+    let mut truncated_at: Option<usize> = None;
     let mut last_role: Option<Role> = None;
     for h in hits.iter().filter(|h| want(h.role)) {
+        if hit_index < resume_at {
+            hit_index += 1;
+            continue;
+        }
         if shown >= max {
             out.push_str("… (more hits; raise \"max\")\n");
             break;
@@ -232,17 +249,30 @@ pub fn find(root: &Path, args: &Value) -> Result<String, String> {
         let line = format!("  {}:{}  {}\n", h.rel, h.line, h.text);
         let lt = line.len() / 4;
         if used + lt > budget && shown > 0 {
-            out.push_str("… (truncated by token_budget)\n");
+            truncated_at = Some(hit_index);
             break;
         }
         used += lt;
         shown += 1;
+        hit_index += 1;
         out.push_str(&line);
     }
 
-    if shown == 0 {
+    if shown == 0 && resume_at == 0 {
         out.push_str("(no matching occurrences)\n");
+        out.push_str(&crate::symbol_resolve::did_you_mean_hint(root, symbol, &paths));
     }
+    if let Some(idx) = truncated_at {
+        continuation::append_footer(
+            &mut out,
+            "symbol_refs",
+            args_fp,
+            idx as u64,
+            KIND_HIT_SKIP,
+            "more hits",
+        );
+    }
+    progress::tick(shown as u64, None, "symbol_refs: done");
     stats::record("symbol_refs", scanned_bytes / 4, (out.len() / 4) as u64);
     Ok(out)
 }

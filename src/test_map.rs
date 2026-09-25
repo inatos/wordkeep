@@ -12,13 +12,23 @@ use crate::stats;
 use crate::symbol_refs;
 
 pub fn build(root: &Path, args: &Value) -> Result<String, String> {
-    let symbol = args
+    let raw = args
         .get("symbol")
         .and_then(Value::as_str)
         .unwrap_or("")
         .trim();
+    if raw.is_empty() {
+        return Err(
+            "symbol is required (function/type NAME). Optional: paths, tags, max, token_budget."
+                .into(),
+        );
+    }
+    let symbol = crate::symbol_resolve::normalize_symbol(raw);
     if symbol.is_empty() {
-        return Err("symbol is required".into());
+        return Err(
+            "symbol is required (function/type NAME). Optional: paths, tags, max, token_budget."
+                .into(),
+        );
     }
     let paths = crate::config::paths_from_args_or(root, args, &["tests"])?;
     let max = args.get("max").and_then(Value::as_u64).unwrap_or(40).max(1) as usize;
@@ -43,7 +53,7 @@ pub fn build(root: &Path, args: &Value) -> Result<String, String> {
         })
         .unwrap_or_default();
 
-    let (per, scanned_bytes) = symbol_refs::refs_by_file(root, symbol, &paths);
+    let (per, scanned_bytes) = symbol_refs::refs_by_file(root, &symbol, &paths);
     let baseline = scanned_bytes / 4;
 
     let mut out = format!("test_map - \"{symbol}\"  (roots {paths:?})");
@@ -63,6 +73,7 @@ pub fn build(root: &Path, args: &Value) -> Result<String, String> {
                 "\n(no test files with tags {tag_filter:?} reference \"{symbol}\")\n"
             ));
             out.push_str("Run with fewer tags or omit \"tags\" to broaden.\n");
+            out.push_str(&crate::symbol_resolve::did_you_mean_hint(root, &symbol, &paths));
             stats::record("test_map", baseline, (out.len() / 4) as u64);
             return Ok(out);
         }
@@ -70,6 +81,7 @@ pub fn build(root: &Path, args: &Value) -> Result<String, String> {
 
     if filtered.is_empty() {
         out.push_str("\n(no test file references this symbol - it may be untested)\n");
+        out.push_str(&crate::symbol_resolve::did_you_mean_hint(root, &symbol, &paths));
         stats::record("test_map", baseline, (out.len() / 4) as u64);
         return Ok(out);
     }

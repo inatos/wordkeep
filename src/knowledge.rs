@@ -1,9 +1,10 @@
-//! knowledge_search - BM25 lexical retrieval over project markdown.
+//! knowledge_search / knowledge_answer - BM25 lexical retrieval over project markdown.
 //!
 //! Indexes `.md` / `.mdc` files (chunked by heading), then ranks chunks for a query
 //! with Okapi BM25. Zero dependencies, fully deterministic, no model download - a
 //! strong offline baseline. With `--features embeddings`, the BM25 head is reranked
 //! by a small local embedding model (see embed.rs); BM25 stays the fallback.
+//! `knowledge_answer` builds an extractive synthesis + citations from the same pipeline.
 
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -12,7 +13,8 @@ use std::sync::{Mutex, OnceLock};
 use wordkeep_knowledge::chunk_bodies;
 
 use crate::cache::{self, DiskMap};
-use crate::{coeffects, config, defects, effect_journal, mas, stats, walk};
+use crate::continuation::{self, KIND_HIT_SKIP};
+use crate::{coeffects, config, defects, effect_journal, mas, progress, stats, walk};
 
 #[cfg(feature = "embeddings")]
 mod embed;
@@ -66,20 +68,35 @@ impl Clone for Chunk {
     }
 }
 
-pub fn search(root: &Path, args: &Value) -> Result<String, String> {
+/// One BM25 (optionally semantically reranked) hit with path/heading/body.
+struct ScoredHit {
+    score: f64,
+    path: String,
+    heading: String,
+    body: String,
+}
+
+/// Shared retrieval result for `search` and `answer`.
+struct Retrieval {
+    query: String,
+    q_terms: Vec<String>,
+    hits: Vec<ScoredHit>,
+    indexed_bytes: u64,
+    /// True when the index (docs + optional defects) had zero chunks.
+    empty_index: bool,
+}
+
+/// Index + BM25 (+ optional embedding rerank). Shared by `search` and `answer`.
+fn retrieve(root: &Path, args: &Value) -> Result<Retrieval, String> {
     let query = args
         .get("query")
         .and_then(Value::as_str)
         .unwrap_or("")
-        .trim();
+        .trim()
+        .to_string();
     if query.is_empty() {
         return Err("query is required".into());
     }
-    let k = args.get("k").and_then(Value::as_u64).unwrap_or(5).max(1) as usize;
-    let budget = args
-        .get("token_budget")
-        .and_then(Value::as_u64)
-        .unwrap_or(1200) as usize;
     let roots = config::doc_roots_from_args(root, args)?;
     let include_defects = args
         .get("include_defects")
@@ -110,9 +127,20 @@ pub fn search(root: &Path, args: &Value) -> Result<String, String> {
             });
         }
     }
+
+    let q_terms = tokenize(&query);
+    if q_terms.is_empty() {
+        return Err("query has no searchable terms".into());
+    }
+
     if chunks.is_empty() {
-        stats::record("knowledge_search", indexed_bytes / 4, 0);
-        return Ok("knowledge_search: no documents indexed".into());
+        return Ok(Retrieval {
+            query,
+            q_terms,
+            hits: Vec::new(),
+            indexed_bytes,
+            empty_index: true,
+        });
     }
 
     let n = chunks.len() as f64;
@@ -122,11 +150,6 @@ pub fn search(root: &Path, args: &Value) -> Result<String, String> {
         for term in c.tf.keys() {
             *df.entry(term.as_str()).or_insert(0) += 1;
         }
-    }
-
-    let q_terms = tokenize(query);
-    if q_terms.is_empty() {
-        return Err("query has no searchable terms".into());
     }
 
     let mut scored: Vec<(f64, usize)> = Vec::new();
@@ -149,10 +172,6 @@ pub fn search(root: &Path, args: &Value) -> Result<String, String> {
             scored.push((score, i));
         }
     }
-    if scored.is_empty() {
-        stats::record("knowledge_search", indexed_bytes / 4, 0);
-        return Ok(format!("knowledge_search: no matches for {query:?}"));
-    }
     scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
 
     // Optional semantic rerank of the BM25 head (opt-in `embeddings` feature).
@@ -162,7 +181,7 @@ pub fn search(root: &Path, args: &Value) -> Result<String, String> {
         .and_then(Value::as_bool)
         .unwrap_or(true)
     {
-        match embed::rerank(query, &chunks, scored.clone()) {
+        match embed::rerank(&query, &chunks, scored.clone()) {
             Ok(reranked) => reranked,
             Err(e) => {
                 eprintln!("[wordkeep] semantic rerank unavailable, using BM25: {e}");
@@ -173,39 +192,229 @@ pub fn search(root: &Path, args: &Value) -> Result<String, String> {
         scored
     };
 
-    let shown = k.min(scored.len());
-    let mut out = format!(
-        "knowledge_search - query {:?}, top {} of {} matches\n",
+    let hits = scored
+        .into_iter()
+        .map(|(score, idx)| {
+            let c = &chunks[idx];
+            ScoredHit {
+                score,
+                path: c.path.clone(),
+                heading: c.heading.clone(),
+                body: c.body.clone(),
+            }
+        })
+        .collect();
+
+    Ok(Retrieval {
         query,
-        shown,
-        scored.len()
+        q_terms,
+        hits,
+        indexed_bytes,
+        empty_index: false,
+    })
+}
+
+pub fn search(root: &Path, args: &Value) -> Result<String, String> {
+    const FP_KEYS: &[&str] = &["query", "k", "roots", "include_defects", "semantic"];
+    let k = args.get("k").and_then(Value::as_u64).unwrap_or(5).max(1) as usize;
+    let budget = args
+        .get("token_budget")
+        .and_then(Value::as_u64)
+        .unwrap_or(1200) as usize;
+    let args_fp = continuation::args_fingerprint(args, FP_KEYS);
+    let resume_at = continuation::resume_offset(args, "knowledge_search", FP_KEYS, KIND_HIT_SKIP)?
+        as usize;
+
+    progress::tick(0, None, "knowledge_search: retrieve");
+    let retrieval = retrieve(root, args)?;
+    if retrieval.hits.is_empty() {
+        stats::record("knowledge_search", retrieval.indexed_bytes / 4, 0);
+        if retrieval.empty_index {
+            return Ok("knowledge_search: no documents indexed".into());
+        }
+        return Ok(format!(
+            "knowledge_search: no matches for {:?}",
+            retrieval.query
+        ));
+    }
+
+    let end = k.min(retrieval.hits.len());
+    let start = resume_at.min(end);
+    let mut out = format!(
+        "knowledge_search - query {:?}, top {} of {} matches",
+        retrieval.query, end, retrieval.hits.len()
     );
+    if resume_at > 0 {
+        out.push_str(&format!(" [continuation from hit #{resume_at}]"));
+    }
+    out.push('\n');
     let mut used = out.len() / 4;
-    for (rank, (score, idx)) in scored.iter().take(k).enumerate() {
-        let c = &chunks[*idx];
-        let snippet = snippet_for(&c.body, &q_terms, 280);
+    let mut truncated_at: Option<usize> = None;
+    let mut shown = 0usize;
+    for rank in start..end {
+        let hit = &retrieval.hits[rank];
+        let snippet = snippet_for(&hit.body, &retrieval.q_terms, 280);
         let block = format!(
             "\n[{}] {} - {}  (score {:.2})\n{}\n",
             rank + 1,
-            c.path,
-            c.heading,
-            score,
+            hit.path,
+            hit.heading,
+            hit.score,
             snippet
         );
         let block_tokens = block.len() / 4;
-        if used + block_tokens > budget && rank > 0 {
-            out.push_str("\n… (further matches omitted by token_budget)\n");
+        if used + block_tokens > budget && shown > 0 {
+            truncated_at = Some(rank);
             break;
         }
         used += block_tokens;
+        shown += 1;
         out.push_str(&block);
     }
+    if let Some(rank) = truncated_at {
+        let omitted = end.saturating_sub(rank);
+        continuation::append_footer(
+            &mut out,
+            "knowledge_search",
+            args_fp,
+            rank as u64,
+            KIND_HIT_SKIP,
+            &format!("+{omitted} further matches"),
+        );
+    }
+    progress::tick(shown as u64, Some(end as u64), "knowledge_search: done");
     stats::record(
         "knowledge_search",
-        indexed_bytes / 4,
+        retrieval.indexed_bytes / 4,
         (out.len() / 4) as u64,
     );
     Ok(out)
+}
+
+/// Extractive synthesis from top BM25 hits (no LLM) — concatenated snippets + citations.
+pub fn answer(root: &Path, args: &Value) -> Result<String, String> {
+    let max_citations = args
+        .get("max_citations")
+        .and_then(Value::as_u64)
+        .unwrap_or(5)
+        .max(1) as usize;
+    let k = args
+        .get("k")
+        .and_then(Value::as_u64)
+        .unwrap_or(max_citations as u64)
+        .max(1) as usize;
+    let budget = args
+        .get("token_budget")
+        .and_then(Value::as_u64)
+        .unwrap_or(1200) as usize;
+
+    let retrieval = retrieve(root, args)?;
+    if retrieval.hits.is_empty() {
+        stats::record("knowledge_answer", retrieval.indexed_bytes / 4, 0);
+        return Ok(format!(
+            "knowledge_answer - query {:?}\nanswer: (no matching documents)\ncitations:\n",
+            retrieval.query
+        ));
+    }
+
+    let cite_n = max_citations.min(k).min(retrieval.hits.len());
+    let hits = &retrieval.hits[..cite_n];
+
+    let mut answer_parts: Vec<String> = Vec::new();
+    for hit in hits {
+        let snip = snippet_for(&hit.body, &retrieval.q_terms, 220);
+        let cleaned = cleanup_snippet(&snip);
+        if cleaned.is_empty() {
+            continue;
+        }
+        // Prefer sentence-like fragments; ensure trailing punctuation for synthesis.
+        let mut s = cleaned;
+        if !s.ends_with('.') && !s.ends_with('!') && !s.ends_with('?') {
+            s.push('.');
+        }
+        answer_parts.push(s);
+        if answer_parts.len() >= 5 {
+            break;
+        }
+    }
+    if answer_parts.len() < 2 && hits.len() > answer_parts.len() {
+        // Pad with heading-context if we only got one fragment.
+        for hit in hits.iter().skip(answer_parts.len()) {
+            let extra = cleanup_snippet(&snippet_for(&hit.body, &retrieval.q_terms, 160));
+            if extra.is_empty() {
+                continue;
+            }
+            let mut s = extra;
+            if !s.ends_with('.') && !s.ends_with('!') && !s.ends_with('?') {
+                s.push('.');
+            }
+            answer_parts.push(s);
+            if answer_parts.len() >= 2 {
+                break;
+            }
+        }
+    }
+    let answer_text = if answer_parts.is_empty() {
+        "(no usable snippets)".to_string()
+    } else {
+        answer_parts.join(" ")
+    };
+
+    let mut out = format!(
+        "knowledge_answer - query {:?}\nanswer: {}\ncitations:\n",
+        retrieval.query, answer_text
+    );
+    for (rank, hit) in hits.iter().enumerate() {
+        let snippet = snippet_for(&hit.body, &retrieval.q_terms, 200);
+        let block = format!(
+            "  [{}] {} - {} (score {:.2})\n      {}\n",
+            rank + 1,
+            hit.path,
+            hit.heading,
+            hit.score,
+            cleanup_snippet(&snippet)
+        );
+        if out.len() / 4 + block.len() / 4 > budget && rank > 0 {
+            out.push_str("  … (further citations omitted by token_budget)\n");
+            break;
+        }
+        out.push_str(&block);
+    }
+
+    // Clip whole output to token_budget (chars ≈ tokens * 4).
+    let max_chars = budget.saturating_mul(4);
+    if out.len() > max_chars {
+        out.truncate(max_chars);
+        out.push_str("\n… (truncated by token_budget)\n");
+    }
+
+    stats::record(
+        "knowledge_answer",
+        retrieval.indexed_bytes / 4,
+        (out.len() / 4) as u64,
+    );
+    Ok(out)
+}
+
+/// Light cleanup for extractive synthesis: collapse whitespace, strip fence noise.
+fn cleanup_snippet(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut prev_space = true;
+    for ch in s.chars() {
+        if ch.is_whitespace() {
+            if !prev_space {
+                out.push(' ');
+                prev_space = true;
+            }
+        } else {
+            out.push(ch);
+            prev_space = false;
+        }
+    }
+    out.trim()
+        .trim_matches(|c| c == '`' || c == '*' || c == '#' || c == '|')
+        .trim()
+        .to_string()
 }
 
 /// Write or update a markdown section so the next `knowledge_search` can retrieve it.
@@ -761,6 +970,45 @@ mod tests {
         let audio = out.find("audio.md");
         // Physics doc must appear and rank ahead of any audio match.
         assert!(audio.map_or(true, |a| phys < a), "{out}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn answer_synthesizes_from_top_hits() {
+        let dir = std::env::temp_dir().join(format!("cbtest_kb_ans_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let docs = dir.join("docs");
+        std::fs::create_dir_all(&docs).unwrap();
+        std::fs::write(
+            docs.join("phys.md"),
+            "# Physics\nThe physics step runs PhysicsStep each tick with fixed dt.\n",
+        )
+        .unwrap();
+        std::fs::write(
+            docs.join("net.md"),
+            "# Netcode\nRollback compares same-binary runs for determinism.\n",
+        )
+        .unwrap();
+        let out = answer(
+            &dir,
+            &json!({
+                "query": "physics step",
+                "roots": ["docs"],
+                "max_citations": 3,
+                "include_defects": false
+            }),
+        )
+        .unwrap();
+        assert!(out.starts_with("knowledge_answer - query"), "{out}");
+        assert!(out.contains("answer:"), "{out}");
+        assert!(out.contains("citations:"), "{out}");
+        assert!(out.contains("phys.md"), "{out}");
+        assert!(out.contains("[1]"), "{out}");
+        // Physics should cite ahead of unrelated netcode.
+        let phys = out.find("phys.md").unwrap();
+        if let Some(net) = out.find("net.md") {
+            assert!(phys < net, "{out}");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
