@@ -692,14 +692,25 @@ pub fn finish(tool: &str, elapsed_us: u64, result: &Result<String, String>) {
     }
     let saved = meta.baseline.saturating_sub(meta.returned);
     let elapsed_ms = elapsed_us / 1000;
-    eprintln!(
-        "[wordkeep] {tool}: ~{} tok returned vs ~{} distilled \
-         (avoided ~{saved}, {}%, {elapsed_ms}ms, {})",
-        meta.returned,
-        meta.baseline,
-        pct_precise(saved, meta.baseline),
-        outcome.as_str(),
-    );
+    // Cursor (and other MCP hosts) surface every stderr line as "[error]". Successful
+    // per-call telemetry therefore looks like failures. Only emit for non-ok outcomes
+    // unless WORDKEEP_STDERR_TELEMETRY=1|all|true.
+    let verbose = std::env::var_os("WORDKEEP_STDERR_TELEMETRY").is_some_and(|v| {
+        v == "1"
+            || v.eq_ignore_ascii_case("all")
+            || v.eq_ignore_ascii_case("true")
+            || v.eq_ignore_ascii_case("yes")
+    });
+    if verbose || !matches!(outcome, Outcome::Ok) {
+        eprintln!(
+            "[wordkeep] {tool}: ~{} tok returned vs ~{} distilled \
+             (avoided ~{saved}, {}%, {elapsed_ms}ms, {})",
+            meta.returned,
+            meta.baseline,
+            pct_precise(saved, meta.baseline),
+            outcome.as_str(),
+        );
+    }
 }
 
 /// Short first-line detail for non-ok outcomes (error message, not-found hint, etc.).

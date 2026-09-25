@@ -109,7 +109,8 @@ pub(crate) fn build() -> Result<Value, String> {
                 "outcome": outcome,
                 "reason": reason,
                 "baseline_fmt": commafy(baseline),
-                "returned_fmt": commafy(returned)
+                "returned_fmt": commafy(returned),
+                "saved_fmt": commafy(baseline.saturating_sub(returned))
             }))
         })
         .collect();

@@ -131,6 +131,7 @@ export type DashboardActivity = {
   reason?: string | null;
   baseline_fmt?: string;
   returned_fmt?: string;
+  saved_fmt?: string;
 };
 
 export type DashboardSignal = {

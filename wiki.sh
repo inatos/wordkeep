@@ -201,9 +201,11 @@ ui_has_runtime_view() {
 }
 
 ui_has_izakaya_view() {
+  # Bump a unique phrase when IzakayaBoard layout/sort/CSS changes need a dist rebuild.
   grep -q 'Izakaya board' "$WK/wiki/dist"/assets/*.js 2>/dev/null \
     && grep -q 'Izakaya charts' "$WK/wiki/dist"/assets/*.js 2>/dev/null \
-    && grep -q 'dash-table' "$WK/wiki/dist"/assets/*.js 2>/dev/null
+    && grep -q 'dash-table' "$WK/wiki/dist"/assets/*.js 2>/dev/null \
+    && grep -q 'active-first' "$WK/wiki/dist"/assets/*.js 2>/dev/null
 }
 
 ui_has_tool_help() {

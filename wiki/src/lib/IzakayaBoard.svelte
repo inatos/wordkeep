@@ -222,14 +222,40 @@
     sort.dir = next.dir;
   }
 
+  /** Lower = more active/relevant. Used for default Agents order and State column. */
+  function agentRelevance(agent: NonNullable<IzakayaPayload['agents']>[number]): number {
+    if (agent.stale) return 3;
+    switch (agent.state) {
+      case 'live_code':
+        return 0;
+      case 'checked_in':
+        return 1;
+      case 'suspended':
+        return 2;
+      case 'checked_out':
+        return 4;
+      default:
+        return 5;
+    }
+  }
+
   const sortedFindings = $derived(
     sortRows(viewFindings, findingSort, (row, key) => (key === 'kind' ? row.kind : row.detail)),
   );
-  const sortedAgents = $derived(
-    sortRows(viewAgents, agentSort, (agent, key) => {
+  const sortedAgents = $derived.by(() => {
+    if (!agentSort.key) {
+      return [...viewAgents].sort((a, b) => {
+        const byRank = agentRelevance(a) - agentRelevance(b);
+        if (byRank !== 0) return byRank;
+        const bySeen = (b.last_seen_at ?? 0) - (a.last_seen_at ?? 0);
+        if (bySeen !== 0) return bySeen;
+        return a.agent_id.localeCompare(b.agent_id);
+      });
+    }
+    return sortRows(viewAgents, agentSort, (agent, key) => {
       switch (key) {
         case 'state':
-          return agent.stale ? 'stale' : agent.state;
+          return agentRelevance(agent);
         case 'task':
           return agent.task || '';
         case 'claims':
@@ -243,8 +269,8 @@
         default:
           return agent.agent_id;
       }
-    }),
-  );
+    });
+  });
   const sortedClaims = $derived(
     sortRows(claimRows, claimSort, (row, key) => row[key as keyof typeof row]),
   );
@@ -531,31 +557,83 @@
       <p class="muted">{board.message}</p>
     {/if}
 
-    {#if viewFindings.length}
-      <CollapsibleSection id="izakaya-advisory" titleAttr="Advisory findings from the coordination board">
-        {#snippet heading()}Advisory{/snippet}
+    <CollapsibleSection id="izakaya-calls" titleAttr="izakaya_* calls recorded in savings telemetry">
+      {#snippet heading()}MCP calls{/snippet}
+      {#if !izakayaTools.length}
+        <p class="muted">{filtering ? 'No izakaya_* calls match this filter.' : 'No izakaya_* calls in savings telemetry yet.'}</p>
+      {:else}
         <div class="table-wrap">
           <table class="dash-table">
             <thead>
               <tr>
-                {@render col(findingSort, 'Kind', 'kind')}
-                {@render col(findingSort, 'Detail', 'detail')}
+                {@render col(toolSort, 'Tool', 'tool')}
+                {@render col(toolSort, 'Calls', 'calls', true)}
+                {@render col(toolSort, 'Avg', 'avg', true)}
+                {@render col(toolSort, 'Errors', 'errors', true)}
+                {@render col(toolSort, 'Trunc', 'trunc', true)}
+                {@render col(toolSort, 'Saved', 'saved', true)}
+                {@render col(toolSort, 'Last', 'last', true)}
               </tr>
             </thead>
             <tbody>
-              {#each sortedFindings as finding}
+              {#each sortedTools as tool}
                 <tr>
-                  <td class="tool-name"><code>{finding.kind}</code></td>
-                  <td class="text">{finding.detail}</td>
+                  <td class="tool-name"><code>{tool.name}</code></td>
+                  <td class="num">{tool.calls_fmt ?? tool.calls}</td>
+                  <td class="num">{tool.avg_ms}ms</td>
+                  <td class="num">{tool.error_count}</td>
+                  <td class="num">{tool.trunc_count}</td>
+                  <td class="num good">{tool.saved_fmt ?? tool.saved}</td>
+                  <td class="muted">{tool.last_ago || '—'}</td>
                 </tr>
               {/each}
             </tbody>
           </table>
         </div>
-      </CollapsibleSection>
-    {/if}
+      {/if}
+    </CollapsibleSection>
 
-    <CollapsibleSection id="izakaya-agents" titleAttr="Agents in this coordination group">
+    <CollapsibleSection id="izakaya-recent" titleAttr="Recent izakaya_* calls from savings telemetry">
+      {#snippet heading()}Recent calls{/snippet}
+      {#if !izakayaActivity.length}
+        <p class="muted">{filtering ? 'No recent calls match this filter.' : 'No recent izakaya_* calls yet.'}</p>
+      {:else}
+        <div class="table-wrap">
+          <table class="dash-table">
+            <thead>
+              <tr>
+                {@render col(callSort, 'When', 'when', true)}
+                {@render col(callSort, 'Tool', 'tool')}
+                {@render col(callSort, 'Outcome', 'outcome')}
+                {@render col(callSort, 'ms', 'ms', true)}
+                {@render col(callSort, 'Saved', 'saved', true)}
+                {@render col(callSort, 'Reason', 'reason')}
+              </tr>
+            </thead>
+            <tbody>
+              {#each sortedCalls as row}
+                <tr>
+                  <td class="muted">{row.ago}</td>
+                  <td class="tool-name"><code>{row.tool}</code></td>
+                  <td>
+                    {#if row.outcome !== 'ok'}
+                      <span class="chip warn">{row.outcome}</span>
+                    {:else}
+                      <span class="muted">ok</span>
+                    {/if}
+                  </td>
+                  <td class="num">{row.elapsed_ms}ms</td>
+                  <td class="num good">{row.saved_fmt ?? row.saved}</td>
+                  <td class="text">{row.reason || '—'}</td>
+                </tr>
+              {/each}
+            </tbody>
+          </table>
+        </div>
+      {/if}
+    </CollapsibleSection>
+
+    <CollapsibleSection id="izakaya-agents" titleAttr="Agents in this coordination group; default sort is active-first">
       {#snippet heading()}Agents{/snippet}
       {#if !viewAgents.length}
         <p class="muted">{filtering ? 'No agents match this filter.' : 'No agents in this coordination group.'}</p>
@@ -603,6 +681,30 @@
         </div>
       {/if}
     </CollapsibleSection>
+
+    {#if viewFindings.length}
+      <CollapsibleSection id="izakaya-advisory" titleAttr="Advisory findings from the coordination board">
+        {#snippet heading()}Advisory{/snippet}
+        <div class="table-wrap">
+          <table class="dash-table">
+            <thead>
+              <tr>
+                {@render col(findingSort, 'Kind', 'kind')}
+                {@render col(findingSort, 'Detail', 'detail')}
+              </tr>
+            </thead>
+            <tbody>
+              {#each sortedFindings as finding}
+                <tr>
+                  <td class="tool-name"><code>{finding.kind}</code></td>
+                  <td class="text">{finding.detail}</td>
+                </tr>
+              {/each}
+            </tbody>
+          </table>
+        </div>
+      </CollapsibleSection>
+    {/if}
 
     <CollapsibleSection id="izakaya-claims" titleAttr="Advisory path and symbol claims">
       {#snippet heading()}Claims{/snippet}
@@ -742,82 +844,6 @@
         </div>
       {/if}
     </CollapsibleSection>
-
-    <CollapsibleSection id="izakaya-calls" titleAttr="izakaya_* calls recorded in savings telemetry">
-      {#snippet heading()}MCP calls{/snippet}
-      {#if !izakayaTools.length}
-        <p class="muted">{filtering ? 'No izakaya_* calls match this filter.' : 'No izakaya_* calls in savings telemetry yet.'}</p>
-      {:else}
-        <div class="table-wrap">
-          <table class="dash-table">
-            <thead>
-              <tr>
-                {@render col(toolSort, 'Tool', 'tool')}
-                {@render col(toolSort, 'Calls', 'calls', true)}
-                {@render col(toolSort, 'Avg', 'avg', true)}
-                {@render col(toolSort, 'Errors', 'errors', true)}
-                {@render col(toolSort, 'Trunc', 'trunc', true)}
-                {@render col(toolSort, 'Saved', 'saved', true)}
-                {@render col(toolSort, 'Last', 'last', true)}
-              </tr>
-            </thead>
-            <tbody>
-              {#each sortedTools as tool}
-                <tr>
-                  <td class="tool-name"><code>{tool.name}</code></td>
-                  <td class="num">{tool.calls_fmt ?? tool.calls}</td>
-                  <td class="num">{tool.avg_ms}ms</td>
-                  <td class="num">{tool.error_count}</td>
-                  <td class="num">{tool.trunc_count}</td>
-                  <td class="num good">{tool.saved_fmt ?? tool.saved}</td>
-                  <td class="muted">{tool.last_ago || '—'}</td>
-                </tr>
-              {/each}
-            </tbody>
-          </table>
-        </div>
-      {/if}
-    </CollapsibleSection>
-
-    <CollapsibleSection id="izakaya-recent" titleAttr="Recent izakaya_* calls from savings telemetry">
-      {#snippet heading()}Recent calls{/snippet}
-      {#if !izakayaActivity.length}
-        <p class="muted">{filtering ? 'No recent calls match this filter.' : 'No recent izakaya_* calls yet.'}</p>
-      {:else}
-        <div class="table-wrap">
-          <table class="dash-table">
-            <thead>
-              <tr>
-                {@render col(callSort, 'When', 'when', true)}
-                {@render col(callSort, 'Tool', 'tool')}
-                {@render col(callSort, 'Outcome', 'outcome')}
-                {@render col(callSort, 'ms', 'ms', true)}
-                {@render col(callSort, 'Saved', 'saved', true)}
-                {@render col(callSort, 'Reason', 'reason')}
-              </tr>
-            </thead>
-            <tbody>
-              {#each sortedCalls as row}
-                <tr>
-                  <td class="muted">{row.ago}</td>
-                  <td class="tool-name"><code>{row.tool}</code></td>
-                  <td>
-                    {#if row.outcome !== 'ok'}
-                      <span class="chip warn">{row.outcome}</span>
-                    {:else}
-                      <span class="muted">ok</span>
-                    {/if}
-                  </td>
-                  <td class="num">{row.elapsed_ms}ms</td>
-                  <td class="num good">{row.saved_fmt ?? row.saved}</td>
-                  <td class="text">{row.reason || '—'}</td>
-                </tr>
-              {/each}
-            </tbody>
-          </table>
-        </div>
-      {/if}
-    </CollapsibleSection>
   {/if}
 </div>
 
@@ -826,6 +852,14 @@
     display: flex;
     flex-direction: column;
     gap: 1rem;
+    min-width: 0;
+    max-width: 100%;
+    width: 100%;
+  }
+  .izakaya :global(.collapsible),
+  .izakaya :global(.collapsible-body) {
+    min-width: 0;
+    max-width: 100%;
   }
   .meta {
     margin: 0;

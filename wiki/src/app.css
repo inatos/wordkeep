@@ -213,15 +213,21 @@ article h1, article h2, article h3 { scroll-margin-top: 4rem; }
   }
 }
 
-/* Shared by the telemetry dashboard and the Izakaya page. */
+/* Shared by the telemetry dashboard and the Izakaya page.
+   Bound width + min-width:0 so wide nowrap tables scroll inside the wrap
+   instead of blowing past the panel edge and getting clipped. */
 .table-wrap {
   overflow: auto;
+  max-width: 100%;
+  min-width: 0;
   border: 1px solid var(--border);
   border-radius: var(--radius);
   margin-bottom: 1rem;
+  -webkit-overflow-scrolling: touch;
 }
 .dash-table {
-  width: 100%;
+  width: max-content;
+  min-width: 100%;
   border-collapse: collapse;
   font-size: 0.82rem;
   white-space: nowrap;
