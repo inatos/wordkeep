@@ -20,6 +20,7 @@ wordkeep izakaya status [--agent ID] [--state checked_in|live_code|suspended|che
 wordkeep izakaya check-in --agent ID [--task TEXT] [--claim PATH] [--force] [--no-git]
 wordkeep izakaya update --agent ID --lease LEASE [--state live_code|suspended|checked_in] [--checkpoint REF]
 wordkeep izakaya check-out --agent ID --lease LEASE [--reason completed|handed_off|abandoned] [--handoff-to ID]
+wordkeep izakaya compact
 wordkeep izakaya policy list
 wordkeep izakaya policy evaluate --spec FILE [--profile ID]
 wordkeep izakaya policy promote --spec FILE [--profile ID]
@@ -56,6 +57,7 @@ pub fn cli(root: &Path, argv: &[String]) -> Result<String, String> {
             };
             render(value, format.as_deref())
         }
+        "compact" => store::compact_now(root),
         "policy" => policy_cli(root, &argv[1..]),
         other => Err(format!("unknown izakaya command {other}\n{HELP}")),
     }

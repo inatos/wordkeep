@@ -14,6 +14,12 @@ pub const MAX_PATHS: usize = 64;
 pub const MAX_LIST: usize = 16;
 pub const MAX_ITEM: usize = 240;
 pub const MIN_SUPPORT: f64 = 0.7;
+/// Cap stale lease lines in advisory digests (full count still available via status).
+pub const MAX_STALE_FINDINGS: usize = 8;
+/// Cap per-agent drift lines (remainder summarized).
+pub const MAX_DRIFT_FINDINGS_PER_AGENT: usize = 8;
+/// Truncate persisted journal/idempotency `result` text (MCP reply stays full until budget).
+pub const MAX_JOURNAL_RESULT_CHARS: usize = 480;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AgentState {
@@ -193,41 +199,80 @@ pub struct Finding {
 }
 
 pub fn advisory_findings(agents: &[AgentView<'_>], now: u64) -> Vec<Finding> {
-    let live: Vec<_> = agents
+    let present: Vec<_> = agents
         .iter()
         .filter(|a| a.state != AgentState::CheckedOut)
         .collect();
+    // Pairwise advisories only among non-stale agents. Stale leases still get a
+    // single `stale` line each — not O(n²) base_divergence/drift against history.
+    let active: Vec<_> = present
+        .iter()
+        .copied()
+        .filter(|a| !is_stale(a.state, a.expires_at, now))
+        .collect();
     let mut out = Vec::new();
-    for a in &live {
+    let mut stale_n = 0usize;
+    for a in &present {
         if is_stale(a.state, a.expires_at, now) {
-            out.push(Finding {
-                kind: "stale".into(),
-                agents: vec![a.agent_id.to_string()],
-                detail: format!("{} lease expired; work was not checked out", a.agent_id),
-                stale: true,
-            });
+            if stale_n < MAX_STALE_FINDINGS {
+                out.push(Finding {
+                    kind: "stale".into(),
+                    agents: vec![a.agent_id.to_string()],
+                    detail: format!("{} lease expired; work was not checked out", a.agent_id),
+                    stale: true,
+                });
+            }
+            stale_n += 1;
+            continue;
         }
+        let mut drift_n = 0usize;
+        let mut drift_extra = 0usize;
         for dirty in a.dirty_paths {
             let covered = a.claims.iter().any(|c| path_covers(&c.path, dirty));
             if !covered {
-                out.push(Finding {
-                    kind: "drift".into(),
-                    agents: vec![a.agent_id.to_string()],
-                    detail: format!(
-                        "{} dirty path {dirty} is outside declared claims",
-                        a.agent_id
-                    ),
-                    stale: is_stale(a.state, a.expires_at, now),
-                });
+                if drift_n < MAX_DRIFT_FINDINGS_PER_AGENT {
+                    out.push(Finding {
+                        kind: "drift".into(),
+                        agents: vec![a.agent_id.to_string()],
+                        detail: format!(
+                            "{} dirty path {dirty} is outside declared claims",
+                            a.agent_id
+                        ),
+                        stale: false,
+                    });
+                    drift_n += 1;
+                } else {
+                    drift_extra += 1;
+                }
             }
         }
+        if drift_extra > 0 {
+            out.push(Finding {
+                kind: "drift".into(),
+                agents: vec![a.agent_id.to_string()],
+                detail: format!(
+                    "{} has {drift_extra} additional dirty path(s) outside claims",
+                    a.agent_id
+                ),
+                stale: false,
+            });
+        }
     }
-    for i in 0..live.len() {
-        for j in (i + 1)..live.len() {
-            let a = live[i];
-            let b = live[j];
-            let stale =
-                is_stale(a.state, a.expires_at, now) || is_stale(b.state, b.expires_at, now);
+    if stale_n > MAX_STALE_FINDINGS {
+        out.push(Finding {
+            kind: "stale".into(),
+            agents: vec![],
+            detail: format!(
+                "{} additional stale agent(s) omitted from advisory detail",
+                stale_n - MAX_STALE_FINDINGS
+            ),
+            stale: true,
+        });
+    }
+    for i in 0..active.len() {
+        for j in (i + 1)..active.len() {
+            let a = active[i];
+            let b = active[j];
             for ca in a.claims {
                 for cb in b.claims {
                     if paths_overlap(&ca.path, &cb.path) {
@@ -238,7 +283,7 @@ pub fn advisory_findings(agents: &[AgentView<'_>], now: u64) -> Vec<Finding> {
                                 "{}:{} overlaps {}:{}",
                                 a.agent_id, ca.path, b.agent_id, cb.path
                             ),
-                            stale,
+                            stale: false,
                         });
                     }
                     for sa in &ca.symbols {
@@ -250,20 +295,13 @@ pub fn advisory_findings(agents: &[AgentView<'_>], now: u64) -> Vec<Finding> {
                                     "{} and {} both claim symbol {sa}",
                                     a.agent_id, b.agent_id
                                 ),
-                                stale,
+                                stale: false,
                             });
                         }
                     }
                 }
             }
             if !a.base_oid.is_empty() && !b.base_oid.is_empty() && a.base_oid != b.base_oid {
-                let a_stale = is_stale(a.state, a.expires_at, now);
-                let b_stale = is_stale(b.state, b.expires_at, now);
-                // Skip both-stale pairs: O(n²) historical noise that bloated
-                // check_in/status payloads and falsely flipped net-negative stats.
-                if a_stale && b_stale {
-                    continue;
-                }
                 out.push(Finding {
                     kind: "base_divergence".into(),
                     agents: vec![a.agent_id.to_string(), b.agent_id.to_string()],
@@ -271,7 +309,7 @@ pub fn advisory_findings(agents: &[AgentView<'_>], now: u64) -> Vec<Finding> {
                         "{} base {} != {} base {}",
                         a.agent_id, a.base_oid, b.agent_id, b.base_oid
                     ),
-                    stale: a_stale || b_stale,
+                    stale: false,
                 });
             }
         }
@@ -366,9 +404,10 @@ mod tests {
     }
 
     #[test]
-    fn findings_skip_both_stale_base_divergence() {
+    fn findings_skip_stale_pairwise_noise() {
         let claims: Vec<Claim> = Vec::new();
-        let dirty: Vec<String> = Vec::new();
+        let dirty = vec!["src/orphan.rs".into()];
+        let empty: Vec<String> = Vec::new();
         let agents = vec![
             AgentView {
                 agent_id: "a",
@@ -392,21 +431,36 @@ mod tests {
                 expires_at: 100,
                 base_oid: "ccc",
                 claims: &claims,
-                dirty_paths: &dirty,
+                dirty_paths: &empty,
+            },
+            AgentView {
+                agent_id: "d",
+                state: AgentState::LiveCode,
+                expires_at: 100,
+                base_oid: "ddd",
+                claims: &claims,
+                dirty_paths: &empty,
             },
         ];
         let found = advisory_findings(&agents, 50);
         assert!(
-            !found
-                .iter()
-                .any(|f| f.kind == "base_divergence" && f.detail.contains("a base") && f.detail.contains("b base")),
-            "both-stale pair should be omitted: {found:?}"
+            !found.iter().any(|f| f.kind == "base_divergence"
+                && (f.detail.contains("a base") || f.detail.contains("b base"))),
+            "stale agents must not enter base_divergence: {found:?}"
+        );
+        assert!(
+            !found.iter().any(|f| f.kind == "drift" && f.agents.iter().any(|id| id == "a")),
+            "stale drift must be omitted: {found:?}"
         );
         assert!(
             found
                 .iter()
-                .any(|f| f.kind == "base_divergence" && f.detail.contains("c base")),
-            "live vs stale divergence should remain: {found:?}"
+                .any(|f| f.kind == "base_divergence" && f.detail.contains("c base") && f.detail.contains("d base")),
+            "live vs live divergence should remain: {found:?}"
+        );
+        assert!(
+            found.iter().any(|f| f.kind == "stale" && f.agents.iter().any(|id| id == "a")),
+            "stale lease should still be reported: {found:?}"
         );
     }
 

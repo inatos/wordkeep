@@ -1,14 +1,15 @@
 //! Locked append-only Izakaya journal and rebuildable projection.
 //!
 //! Linked Git worktrees share one coordination group via `git rev-parse --git-common-dir`.
-//! The journal is the source of truth. `projection.json` is a cache and is rebuilt when
-//! its sequence does not match the last valid event.
+//! Hot path trusts `projection.json` when its `seq` matches the journal tip. The NDJSON
+//! journal remains the rebuild source (via `snapshot` events + tail) and is compacted
+//! when it grows past size/count thresholds.
 
 use serde_json::{json, Value};
 use std::collections::hash_map::DefaultHasher;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::hash::{Hash, Hasher};
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -18,6 +19,20 @@ use crate::workspace;
 const MAX_IDEMPOTENCY: usize = 256;
 const MAX_MESSAGES: usize = 64;
 const MAX_HANDOFFS: usize = 256;
+/// Drop checked-out agents from the projection unless a handoff still references them.
+const MAX_CHECKED_OUT_RETAIN: usize = 0;
+/// Cap retained expired (stale) agents on the board; newest `last_seen_at` win.
+const MAX_STALE_AGENTS: usize = 32;
+/// Compact when the journal exceeds this many bytes.
+const JOURNAL_COMPACT_BYTES: u64 = 1_048_576;
+/// Compact when the journal exceeds this many events.
+const JOURNAL_COMPACT_COUNT: usize = 128;
+/// Keep this many post-snapshot events after compaction (wiki / since_seq tail).
+const JOURNAL_KEEP_TAIL: usize = 32;
+/// Distill baseline credits at most this many journal bytes (unbounded history is noise).
+const DISTILL_EVENTS_BYTES_CAP: u64 = 256 * 1024;
+/// Bytes to scan from EOF when peeking the last event seq / recent tail.
+const TAIL_READ_BYTES: u64 = 512 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct Agent {
@@ -637,6 +652,7 @@ pub fn apply(proj: &mut Projection, event: &Event) {
     }
     proj.updated_at = event.ts;
     match event.kind.as_str() {
+        "snapshot" => apply_snapshot(proj, event),
         "check_in" => apply_check_in(proj, event),
         "update" => apply_update(proj, event),
         "check_out" => apply_check_out(proj, event),
@@ -652,7 +668,7 @@ pub fn apply(proj: &mut Projection, event: &Event) {
             key.clone(),
             IdemHit {
                 seq: event.seq,
-                result: event.result.clone(),
+                result: model::bound(&event.result, model::MAX_JOURNAL_RESULT_CHARS),
             },
         );
         while proj.idempotency.len() > MAX_IDEMPOTENCY {
@@ -668,6 +684,19 @@ pub fn apply(proj: &mut Projection, event: &Event) {
             }
         }
     }
+}
+
+fn apply_snapshot(proj: &mut Projection, event: &Event) {
+    let Some(mut next) = Projection::from_value(&event.body) else {
+        proj.malformed += 1;
+        return;
+    };
+    if next.coordination_id.is_empty() {
+        next.coordination_id = proj.coordination_id.clone();
+    }
+    next.seq = event.seq;
+    next.updated_at = event.ts;
+    *proj = next;
 }
 
 fn apply_check_in(proj: &mut Projection, event: &Event) {
@@ -799,6 +828,8 @@ fn apply_check_out(proj: &mut Projection, event: &Event) {
     agent.revision = u(&event.body, "revision");
     agent.last_seen_at = event.ts;
     agent.claims.clear();
+    agent.dirty_paths.clear();
+    agent.blockers.clear();
     agent.checkout_reason = opt_str(&event.body, "reason");
     if let Some(h) = event.body.get("handoff") {
         if proj.handoffs.len() >= MAX_HANDOFFS {
@@ -876,12 +907,26 @@ pub fn read(root: &Path) -> Result<Snapshot, String> {
     load_locked(&dir, &id)
 }
 
-/// Estimated tokens an agent would spend re-reading the on-disk journal + projection.
+/// Full journal (under lock). Used by Dream-RSI replay; presence hot path uses [`read`].
+pub fn read_events(root: &Path) -> Result<Vec<Event>, String> {
+    let dir = group_dir(root);
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+    let _lock = GroupLock::acquire(&dir)?;
+    load_events(&dir)
+}
+
+/// Estimated tokens an agent would spend re-reading the live board without this tool.
+///
+/// Credits projection size plus a capped journal tail — not the unbounded historical
+/// NDJSON (which falsely inflated savings after long multi-agent sessions).
 pub fn distill_baseline_tokens(root: &Path) -> u64 {
     let dir = group_dir(root);
     let events = std::fs::metadata(events_path(&dir))
         .map(|m| m.len())
-        .unwrap_or(0);
+        .unwrap_or(0)
+        .min(DISTILL_EVENTS_BYTES_CAP);
     let projection = std::fs::metadata(projection_path(&dir))
         .map(|m| m.len())
         .unwrap_or(0);
@@ -889,25 +934,295 @@ pub fn distill_baseline_tokens(root: &Path) -> u64 {
 }
 
 fn load_locked(dir: &Path, coordination_id: &str) -> Result<Snapshot, String> {
-    let events = load_events(dir)?;
-    let rebuilt = fold(&events, coordination_id);
     let path = projection_path(dir);
-    let projection = match workspace::read_json(&path)? {
-        Some(v) => match Projection::from_value(&v) {
-            Some(p) if p.seq == rebuilt.seq && p.coordination_id == coordination_id => p,
-            _ => {
-                let _ = workspace::write_atomic_json(&path, &rebuilt.to_value());
-                rebuilt
+    let tip = peek_last_event_seq(&events_path(dir));
+    if let Some(v) = workspace::read_json(&path)? {
+        if let Some(mut p) = Projection::from_value(&v) {
+            if p.coordination_id == coordination_id
+                && tip.is_some_and(|seq| seq == p.seq)
+            {
+                if gc_projection(&mut p, now_secs()) {
+                    let _ = workspace::write_atomic_json(&path, &p.to_value());
+                }
+                let events = load_recent_events(dir, JOURNAL_KEEP_TAIL)?;
+                maybe_compact(dir, &p, &events)?;
+                let events = load_recent_events(dir, JOURNAL_KEEP_TAIL)?;
+                return Ok(Snapshot {
+                    projection: p,
+                    events,
+                });
             }
-        },
-        None => {
-            if !events.is_empty() {
-                let _ = workspace::write_atomic_json(&path, &rebuilt.to_value());
-            }
-            rebuilt
         }
+    }
+
+    let events = load_events(dir)?;
+    let mut rebuilt = fold(&events, coordination_id);
+    let _ = gc_projection(&mut rebuilt, now_secs());
+    let _ = workspace::write_atomic_json(&path, &rebuilt.to_value());
+    maybe_compact(dir, &rebuilt, &events)?;
+    let events = load_recent_events(dir, JOURNAL_KEEP_TAIL).unwrap_or(events);
+    Ok(Snapshot {
+        projection: rebuilt,
+        events,
+    })
+}
+
+/// Returns true when the projection lost agents or handoffs.
+fn gc_projection(proj: &mut Projection, now: u64) -> bool {
+    let mut referenced = BTreeSet::new();
+    for h in &proj.handoffs {
+        if h.status == "offered" || h.status == "accepted" {
+            referenced.insert(h.from.clone());
+            if !h.to.is_empty() {
+                referenced.insert(h.to.clone());
+            }
+            if let Some(by) = &h.accepted_by {
+                referenced.insert(by.clone());
+            }
+        }
+    }
+
+    let mut stale_ids: Vec<(u64, String)> = Vec::new();
+    let mut checked_out: Vec<(u64, String)> = Vec::new();
+    let mut trimmed = false;
+    for (id, agent) in proj.agents.iter_mut() {
+        let Ok(state) = AgentState::parse(&agent.state) else {
+            continue;
+        };
+        if state == AgentState::CheckedOut
+            || model::is_stale(state, agent.expires_at, now)
+        {
+            // Slim tombstones / handoff anchors — drop claim/dirty payload that
+            // bloated projection.json and snapshot events.
+            if !agent.dirty_paths.is_empty()
+                || !agent.claims.is_empty()
+                || !agent.blockers.is_empty()
+            {
+                agent.dirty_paths.clear();
+                agent.claims.clear();
+                agent.blockers.clear();
+                trimmed = true;
+            }
+        }
+        if referenced.contains(id) {
+            continue;
+        }
+        if state == AgentState::CheckedOut {
+            checked_out.push((agent.last_seen_at, id.clone()));
+            continue;
+        }
+        if model::is_stale(state, agent.expires_at, now) {
+            stale_ids.push((agent.last_seen_at, id.clone()));
+        }
+    }
+
+    let before_agents = proj.agents.len();
+    checked_out.sort_by(|a, b| b.0.cmp(&a.0));
+    for (_, id) in checked_out.into_iter().skip(MAX_CHECKED_OUT_RETAIN) {
+        proj.agents.remove(&id);
+    }
+
+    stale_ids.sort_by(|a, b| b.0.cmp(&a.0));
+    for (_, id) in stale_ids.into_iter().skip(MAX_STALE_AGENTS) {
+        proj.agents.remove(&id);
+    }
+
+    let before_handoffs = proj.handoffs.len();
+    if proj.handoffs.len() > MAX_HANDOFFS {
+        let drop_n = proj.handoffs.len() - MAX_HANDOFFS;
+        proj.handoffs.drain(0..drop_n);
+    }
+
+    // Historical check-ins stored full advisory boards in idempotency hits (~100KiB each).
+    for hit in proj.idempotency.values_mut() {
+        if hit.result.len() > model::MAX_JOURNAL_RESULT_CHARS {
+            hit.result = model::bound(&hit.result, model::MAX_JOURNAL_RESULT_CHARS);
+            trimmed = true;
+        }
+    }
+
+    trimmed || proj.agents.len() != before_agents || proj.handoffs.len() != before_handoffs
+}
+
+fn journal_file_bloated(dir: &Path) -> bool {
+    std::fs::metadata(events_path(dir))
+        .map(|m| m.len() > JOURNAL_COMPACT_BYTES)
+        .unwrap_or(false)
+}
+
+fn is_presence_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "check_in" | "update" | "check_out" | "policy_promote" | "policy_retire"
+    )
+}
+
+fn maybe_compact(dir: &Path, proj: &Projection, hint: &[Event]) -> Result<(), String> {
+    // Always reload from disk before compact so decision/outcome lab events are kept
+    // even when the caller only held a recent presence tail.
+    if !journal_file_bloated(dir) && hint.len() <= JOURNAL_COMPACT_COUNT {
+        return Ok(());
+    }
+    let all = load_events(dir)?;
+    let presence = all.iter().filter(|e| is_presence_kind(&e.kind)).count();
+    if presence == 0 {
+        // Refresh snapshot body when GC slimmed the projection (otherwise the
+        // single snapshot line keeps the old fat board forever).
+        if let Some(snap) = all.iter().find(|e| e.kind == "snapshot") {
+            let proj_bytes = serde_json::to_vec(&proj.to_value())
+                .map(|b| b.len())
+                .unwrap_or(0);
+            let snap_bytes = serde_json::to_vec(&snap.body)
+                .map(|b| b.len())
+                .unwrap_or(0);
+            if snap_bytes > proj_bytes.saturating_add(4096) {
+                return compact_journal(dir, proj, &all);
+            }
+        }
+        return Ok(());
+    }
+    let fat_results = all
+        .iter()
+        .any(|e| e.result.len() > model::MAX_JOURNAL_RESULT_CHARS);
+    if !journal_file_bloated(dir) && all.len() <= JOURNAL_COMPACT_COUNT && !fat_results {
+        return Ok(());
+    }
+    compact_journal(dir, proj, &all)
+}
+
+/// Force a snapshot compact (CLI / migration).
+pub fn compact_now(root: &Path) -> Result<String, String> {
+    let id = coordination_id(root);
+    let dir = group_dir(root);
+    if !dir.exists() {
+        return Ok("izakaya compact - no journal".into());
+    }
+    let _lock = GroupLock::acquire(&dir)?;
+    let mut snap = load_locked(&dir, &id)?;
+    let _ = gc_projection(&mut snap.projection, now_secs());
+    workspace::write_atomic_json(&projection_path(&dir), &snap.projection.to_value())?;
+    let all = load_events(&dir)?;
+    let before = std::fs::metadata(events_path(&dir))
+        .map(|m| m.len())
+        .unwrap_or(0);
+    compact_journal(&dir, &snap.projection, &all)?;
+    let after = std::fs::metadata(events_path(&dir))
+        .map(|m| m.len())
+        .unwrap_or(0);
+    Ok(format!(
+        "izakaya compact - seq {} events {before} -> {after} bytes",
+        snap.projection.seq
+    ))
+}
+
+fn compact_journal(dir: &Path, proj: &Projection, events: &[Event]) -> Result<(), String> {
+    let mut body = proj.to_value();
+    if let Some(obj) = body.as_object_mut() {
+        // Snapshot body carries board state; seq/updated_at come from the event.
+        obj.remove("seq");
+        obj.remove("updated_at");
+    }
+    let snap = Event {
+        v: SCHEMA_VERSION,
+        seq: proj.seq,
+        id: format!("snap{}", proj.seq),
+        idempotency_key: None,
+        ts: proj.updated_at.max(1),
+        kind: "snapshot".into(),
+        agent_id: "izakaya".into(),
+        lease_id: String::new(),
+        result: String::new(),
+        body,
     };
-    Ok(Snapshot { projection, events })
+    // Snapshot rebuilds presence; keep offline lab events for Dream-RSI replay.
+    let mut out = vec![snap];
+    for event in events {
+        if event.kind == "decision" || event.kind == "outcome" {
+            out.push(event.clone());
+        }
+    }
+    rewrite_events(dir, &out)
+}
+
+fn rewrite_events(dir: &Path, events: &[Event]) -> Result<(), String> {
+    let path = events_path(dir);
+    let tmp = path.with_extension("ndjson.tmp");
+    {
+        let mut file = std::fs::File::create(&tmp)
+            .map_err(|e| format!("create {}: {e}", tmp.display()))?;
+        for event in events {
+            let line = serde_json::to_string(&event.to_value())
+                .map_err(|e| format!("serialize event: {e}"))?;
+            writeln!(file, "{line}").map_err(|e| format!("write {}: {e}", tmp.display()))?;
+        }
+        file.sync_all()
+            .map_err(|e| format!("sync {}: {e}", tmp.display()))?;
+    }
+    std::fs::rename(&tmp, &path).map_err(|e| format!("rename {}: {e}", path.display()))?;
+    Ok(())
+}
+
+fn peek_last_event_seq(path: &Path) -> Option<u64> {
+    let raw = read_file_tail(path, TAIL_READ_BYTES)?;
+    for line in raw.lines().rev() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Ok(v) = serde_json::from_str::<Value>(line) {
+            let seq = u(&v, "seq");
+            if seq > 0 {
+                return Some(seq);
+            }
+        }
+    }
+    None
+}
+
+fn load_recent_events(dir: &Path, max: usize) -> Result<Vec<Event>, String> {
+    if max == 0 {
+        return Ok(Vec::new());
+    }
+    let path = events_path(dir);
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let Some(raw) = read_file_tail(&path, TAIL_READ_BYTES) else {
+        return Ok(Vec::new());
+    };
+    let mut parsed = Vec::new();
+    for line in raw.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if let Ok(event) = Event::from_value(&v) {
+            parsed.push(event);
+        }
+    }
+    if parsed.len() > max {
+        parsed = parsed.split_off(parsed.len() - max);
+    }
+    Ok(parsed)
+}
+
+fn read_file_tail(path: &Path, max_bytes: u64) -> Option<String> {
+    let mut file = std::fs::File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    let start = len.saturating_sub(max_bytes);
+    file.seek(SeekFrom::Start(start)).ok()?;
+    let mut buf = Vec::new();
+    file.read_to_end(&mut buf).ok()?;
+    let text = String::from_utf8_lossy(&buf);
+    if start == 0 {
+        return Some(text.into_owned());
+    }
+    // Drop the partial first line after a mid-file seek.
+    let trimmed = text.split_once('\n').map(|(_, rest)| rest).unwrap_or("");
+    Some(trimmed.to_string())
 }
 
 pub struct Prepared {
@@ -949,12 +1264,15 @@ pub fn commit(root: &Path, prepared: Prepared) -> Result<Value, String> {
     };
     let mut next = snap.projection.clone();
     apply(&mut next, &event);
+    let _ = gc_projection(&mut next, ts);
     let mut rendered = (prepared.result_fn)(&next, &event);
-    event.result = rendered
+    let full_text = rendered
         .get("text")
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_string();
+    // Persist a short digest only — full advisory boards used to be ~100KiB/event.
+    event.result = model::bound(&full_text, model::MAX_JOURNAL_RESULT_CHARS);
     if let Some(key) = &event.idempotency_key {
         if let Some(hit) = next.idempotency.get_mut(key) {
             hit.result = event.result.clone();
@@ -962,13 +1280,14 @@ pub fn commit(root: &Path, prepared: Prepared) -> Result<Value, String> {
     }
     append_event(&dir, &event)?;
     workspace::write_atomic_json(&projection_path(&dir), &next.to_value())?;
+    let mut journal = snap.events;
+    journal.push(event.clone());
+    maybe_compact(&dir, &next, &journal)?;
+    rendered["text"] = json!(full_text);
     rendered["seq"] = json!(seq);
     rendered["lease_id"] = json!(event.lease_id);
     rendered["coordination_id"] = json!(id);
     rendered["idempotent"] = json!(false);
-    if rendered.get("text").is_none() {
-        rendered["text"] = json!(event.result);
-    }
     Ok(rendered)
 }
 
@@ -1139,6 +1458,131 @@ mod tests {
         assert!(p.messages.is_empty());
         assert_eq!(p.agents["a"].claims.len(), 0);
         assert!(Projection::from_value(&json!({"version": 99})).is_none());
+    }
+
+    #[test]
+    fn journal_result_is_capped_and_board_gcs_checked_out() {
+        let (_g, root, cache) = isolated("cap");
+        let prepared = Prepared {
+            kind: "check_in".into(),
+            agent_id: "alpha".into(),
+            lease_id: "L1".into(),
+            idempotency_key: None,
+            body: json!({
+                "state": "checked_in",
+                "revision": 1,
+                "checked_in_at": 1,
+                "expires_at": 9_999,
+                "ttl_secs": 100,
+                "dirty_paths": [],
+                "claims": []
+            }),
+            result_fn: |_, e| {
+                json!({
+                    "text": format!("{}\n{}", e.agent_id, "x".repeat(2_000)),
+                })
+            },
+        };
+        commit(&root, prepared).unwrap();
+        let snap = read(&root).unwrap();
+        let event = snap.events.iter().find(|e| e.kind == "check_in").unwrap();
+        assert!(event.result.len() <= model::MAX_JOURNAL_RESULT_CHARS);
+
+        let out = Prepared {
+            kind: "check_out".into(),
+            agent_id: "alpha".into(),
+            lease_id: "L1".into(),
+            idempotency_key: None,
+            body: json!({"reason": "completed", "revision": 2}),
+            result_fn: |_, e| {
+                json!({"text": format!("checked out {}", e.agent_id)})
+            },
+        };
+        commit(&root, out).unwrap();
+        let after = read(&root).unwrap();
+        assert!(
+            !after.projection.agents.contains_key("alpha"),
+            "checked_out agents should be GC'd when unreferenced"
+        );
+        std::env::remove_var("XDG_CACHE_HOME");
+        let _ = std::fs::remove_dir_all(&cache);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn bloated_journal_compacts_to_snapshot() {
+        let (_g, root, cache) = isolated("compact");
+        let dir = group_dir(&root);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Write a fake oversized journal tip + matching projection.
+        let mut proj = Projection::empty(coordination_id(&root));
+        proj.seq = 3;
+        proj.updated_at = 30;
+        proj.agents.insert(
+            "keep".into(),
+            Agent {
+                agent_id: "keep".into(),
+                lease_id: "L".into(),
+                revision: 1,
+                state: "live_code".into(),
+                role: String::new(),
+                task: String::new(),
+                summary: String::new(),
+                mas_session: None,
+                checked_in_at: 1,
+                last_seen_at: 30,
+                expires_at: 9_999,
+                ttl_secs: 100,
+                workspace_id: String::new(),
+                worktree: String::new(),
+                branch: String::new(),
+                base_oid: "abc".into(),
+                head_oid: "abc".into(),
+                dirty_paths: Vec::new(),
+                claims: Vec::new(),
+                blockers: Vec::new(),
+                checkpoint: None,
+                checkout_reason: None,
+            },
+        );
+        workspace::write_atomic_json(&projection_path(&dir), &proj.to_value()).unwrap();
+        let fat = "y".repeat((JOURNAL_COMPACT_BYTES as usize) + 64);
+        let mut raw = String::new();
+        for seq in 1..=3 {
+            let ev = json!({
+                "v": 1,
+                "seq": seq,
+                "id": format!("e{seq}"),
+                "idempotency_key": null,
+                "ts": seq * 10,
+                "kind": "check_in",
+                "agent_id": "keep",
+                "lease_id": "L",
+                "result": fat,
+                "body": {
+                    "state": "live_code",
+                    "revision": 1,
+                    "expires_at": 9999,
+                    "base_oid": "abc"
+                }
+            });
+            raw.push_str(&ev.to_string());
+            raw.push('\n');
+        }
+        std::fs::write(events_path(&dir), raw).unwrap();
+        let before = std::fs::metadata(events_path(&dir)).unwrap().len();
+        assert!(before > JOURNAL_COMPACT_BYTES);
+        let snap = read(&root).unwrap();
+        assert!(snap.projection.agents.contains_key("keep"));
+        let after = std::fs::metadata(events_path(&dir)).unwrap().len();
+        assert!(after < before, "journal should compact: before={before} after={after}");
+        let rebuilt = load_events(&dir).unwrap();
+        assert_eq!(rebuilt.len(), 1);
+        assert_eq!(rebuilt[0].kind, "snapshot");
+        assert_eq!(fold(&rebuilt, &snap.projection.coordination_id).seq, 3);
+        std::env::remove_var("XDG_CACHE_HOME");
+        let _ = std::fs::remove_dir_all(&cache);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

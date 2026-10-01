@@ -380,7 +380,7 @@ fn claim_symbols(agent: &Value) -> Vec<String> {
 }
 
 fn recent_events(path: &Path) -> Vec<Value> {
-    let Ok(raw) = std::fs::read_to_string(path) else {
+    let Some(raw) = read_file_tail(path, 512 * 1024) else {
         return Vec::new();
     };
     let mut out = Vec::new();
@@ -391,9 +391,13 @@ fn recent_events(path: &Path) -> Vec<Value> {
         let Ok(value) = serde_json::from_str::<Value>(line) else {
             continue;
         };
+        let kind = value.get("kind").and_then(Value::as_str).unwrap_or("");
+        if kind == "snapshot" {
+            continue;
+        }
         out.push(json!({
             "seq": u64_field(&value, "seq"),
-            "kind": value.get("kind").and_then(Value::as_str).unwrap_or(""),
+            "kind": kind,
             "agent_id": value.get("agent_id").and_then(Value::as_str).unwrap_or(""),
             "ts": u64_field(&value, "ts"),
             "result": truncate(value.get("result").and_then(Value::as_str).unwrap_or(""), 180),
@@ -407,11 +411,27 @@ fn recent_events(path: &Path) -> Vec<Value> {
 }
 
 fn last_event_seq(path: &Path) -> Option<u64> {
-    let raw = std::fs::read_to_string(path).ok()?;
+    let raw = read_file_tail(path, 64 * 1024)?;
     raw.lines().rev().find_map(|line| {
         let value: Value = serde_json::from_str(line).ok()?;
         Some(u64_field(&value, "seq")).filter(|seq| *seq > 0)
     })
+}
+
+fn read_file_tail(path: &Path, max_bytes: u64) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    let start = len.saturating_sub(max_bytes);
+    file.seek(SeekFrom::Start(start)).ok()?;
+    let mut buf = Vec::new();
+    file.read_to_end(&mut buf).ok()?;
+    let text = String::from_utf8_lossy(&buf);
+    if start == 0 {
+        return Some(text.into_owned());
+    }
+    let trimmed = text.split_once('\n').map(|(_, rest)| rest).unwrap_or("");
+    Some(trimmed.to_string())
 }
 
 fn paths_overlap(a: &str, b: &str) -> bool {

@@ -124,8 +124,10 @@ pub fn evaluate(root: &Path, spec_value: &Value, profile_id: &str) -> Result<Val
     let spec = parse_spec(spec_value)?;
     let profile = profiles::load(root, profile_id)?;
     let snap = store::read(root)?;
-    let worlds = compile_worlds(&snap.events, &snap.projection);
-    let outcomes = compile_outcomes(&snap.events);
+    // Presence `read` returns a capped journal tail; replay needs decision/outcome history.
+    let events = store::read_events(root)?;
+    let worlds = compile_worlds(&events, &snap.projection);
+    let outcomes = compile_outcomes(&events);
     let incumbent = parse_spec(&incumbent_spec())?;
     let (train, holdout) = split_holdout(&worlds);
     let task_holdout = task_holdout(&worlds);
@@ -457,7 +459,8 @@ fn compile_worlds(events: &[Event], proj: &Projection) -> Vec<World> {
             proj.agents
                 .get(id)
                 .map(|a| a.state != AgentState::CheckedOut.as_str())
-                .unwrap_or(true)
+                // GC'd agents are finished work, not open/censored episodes.
+                .unwrap_or(false)
         });
         worlds.push(World {
             episode_id,
