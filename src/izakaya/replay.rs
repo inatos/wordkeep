@@ -302,8 +302,7 @@ fn replay_world(
         trace: Vec::new(),
         revealed: Vec::new(),
     };
-    let mut rounds = 0usize;
-    for decision in &world.decisions {
+    for (rounds, decision) in world.decisions.iter().enumerate() {
         if rounds >= spec.max_rounds {
             break;
         }
@@ -320,7 +319,6 @@ fn replay_world(
         if batch.is_empty() {
             break;
         }
-        rounds += 1;
         for action in batch {
             let supported = decision.selected.iter().any(|s| s == &action.id);
             if supported {

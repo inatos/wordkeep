@@ -8,6 +8,8 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+pub mod shrift;
+
 /// Cross-platform parent directory for Wordkeep caches.
 ///
 /// Keep this shared by the MCP and wiki crates so runtime captures resolve to

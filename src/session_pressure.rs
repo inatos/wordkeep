@@ -268,12 +268,12 @@ mod tests {
         drop(f);
 
         let out = report(&root, &json!({})).unwrap();
-        assert!(out.contains("level=high") || out.contains("level=critical"), "{out}");
-        assert!(out.contains("autopilot_draft:"), "{out}");
         assert!(
-            out.contains("call session_handoff to persist"),
+            out.contains("level=high") || out.contains("level=critical"),
             "{out}"
         );
+        assert!(out.contains("autopilot_draft:"), "{out}");
+        assert!(out.contains("call session_handoff to persist"), "{out}");
         // Must not have auto-written the handoff marker.
         assert!(
             !workspace::workspace_file(&root, HANDOFF_MARKER).is_file(),

@@ -14,7 +14,7 @@ during long walks (status only; the agent still sees one final text result).
 Default off — Cursor's Shared MCP client currently fatals on unrecognized
 progress tokens and drops the server connection.
 
-**Surface:** 51 tools + MCP resources `wordkeep://readme`, `wordkeep://capabilities`.
+**Surface:** 58 tools + MCP resources `wordkeep://readme`, `wordkeep://capabilities`.
 
 ## Navigation
 
@@ -76,6 +76,13 @@ progress tokens and drops the server connection.
 | `session_pressure` | optional `session` | Heuristic context-pressure (+ autopilot draft when high) |
 | `defect_upsert` | `summary` | Structured defect create/update |
 | `defect_list` | optional filters | Digest by default (`digest:false` / `format:"full"` for detail) |
+| `shrift_list` | optional filters | Idea digest (`status`/`freshness`/`tag`/`query`; `semantic:true` hybrid rank) |
+| `shrift_show` | `slug` | One idea + similar + design-link suggestions |
+| `shrift_upsert` | `title` | Capture seed or update slug (dedupe warn, not block) |
+| `shrift_touch` | `slug` | Refresh `touched` + ledger |
+| `shrift_review` | optional `max` | Due/stale/dormant queue + stalest for `/handoff` |
+| `shrift_status` | `slug`, `status` | Lifecycle + optional `links` / `archive_reason` |
+| `shrift_bookmark` | `slug` | Toggle local bookmark (`.wordkeep/shrift-bookmarks.json`) |
 
 ## Multi-agent (MAS)
 

@@ -73,7 +73,9 @@ pub fn build(root: &Path, args: &Value) -> Result<String, String> {
                 "\n(no test files with tags {tag_filter:?} reference \"{symbol}\")\n"
             ));
             out.push_str("Run with fewer tags or omit \"tags\" to broaden.\n");
-            out.push_str(&crate::symbol_resolve::did_you_mean_hint(root, &symbol, &paths));
+            out.push_str(&crate::symbol_resolve::did_you_mean_hint(
+                root, &symbol, &paths,
+            ));
             stats::record("test_map", baseline, (out.len() / 4) as u64);
             return Ok(out);
         }
@@ -81,7 +83,9 @@ pub fn build(root: &Path, args: &Value) -> Result<String, String> {
 
     if filtered.is_empty() {
         out.push_str("\n(no test file references this symbol - it may be untested)\n");
-        out.push_str(&crate::symbol_resolve::did_you_mean_hint(root, &symbol, &paths));
+        out.push_str(&crate::symbol_resolve::did_you_mean_hint(
+            root, &symbol, &paths,
+        ));
         stats::record("test_map", baseline, (out.len() / 4) as u64);
         return Ok(out);
     }

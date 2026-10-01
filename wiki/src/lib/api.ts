@@ -402,6 +402,75 @@ export function fetchIzakaya() {
   return getJson<IzakayaPayload>(`${API_BASE}/izakaya`);
 }
 
+export type ShriftIdea = {
+  slug: string;
+  title: string;
+  status: string;
+  created?: string;
+  touched?: string;
+  tags?: string[];
+  source?: string;
+  links?: string[];
+  archive_reason?: string;
+  path: string;
+  age_days?: number;
+  freshness?: string;
+  bookmarked?: boolean;
+  body_preview?: string;
+};
+
+export type ShriftPayload = {
+  available?: boolean;
+  error?: string;
+  ideas?: ShriftIdea[];
+  stalest?: ShriftIdea[];
+  dormant?: ShriftIdea[];
+  review_queue?: ShriftIdea[];
+  metrics?: {
+    total?: number;
+    bookmarked?: number;
+    by_status?: Record<string, number>;
+    by_freshness?: Record<string, number>;
+    tag_histogram?: Record<string, number>;
+  };
+  ttl?: { fresh_days?: number; stale_days?: number; dormant_days?: number };
+};
+
+export function fetchShrift() {
+  return getJson<ShriftPayload>(`${API_BASE}/shrift`);
+}
+
+export async function postShrift(path: string, body: Record<string, unknown>) {
+  const res = await fetch(`${API_BASE}/shrift/${path}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(text || res.statusText);
+  }
+  return res.json();
+}
+
+export async function createShriftIdea(body: {
+  title: string;
+  body?: string;
+  tags?: string[];
+  source?: string;
+}) {
+  const res = await fetch(`${API_BASE}/shrift`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(text || res.statusText);
+  }
+  return res.json();
+}
+
 export type RuntimeRegion = {
   start?: string;
   end?: string;

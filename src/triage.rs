@@ -8,8 +8,8 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use crate::{
-    call_graph, config, diff_map, progress, stats, symbol_context, symbol_def, symbol_refs, test_map,
-    trace_profile,
+    call_graph, config, diff_map, progress, stats, symbol_context, symbol_def, symbol_refs,
+    test_map, trace_profile,
 };
 
 const DEFAULT_BATCH_BUDGET: usize = 4000;
@@ -254,8 +254,7 @@ pub fn test_impact(root: &Path, args: &Value) -> Result<String, String> {
     }
 
     out.push_str("## Changed symbols\n");
-    let mut shown = 0usize;
-    for (rel, name, line) in &changed {
+    for (shown, (rel, name, line)) in changed.iter().enumerate() {
         if shown >= max || out.len() / 4 > budget / 3 {
             out.push_str(&format!(
                 "  … (+{} more)\n",
@@ -264,7 +263,6 @@ pub fn test_impact(root: &Path, args: &Value) -> Result<String, String> {
             break;
         }
         out.push_str(&format!("  {name}  {rel}:{line}\n"));
-        shown += 1;
     }
 
     let test_paths = config::paths_from_args_or(root, &json!({}), &["tests"])?;
@@ -497,7 +495,10 @@ mod tests {
 
     #[test]
     fn clean_zone_strips_tracy_noise() {
-        assert_eq!(clean_zone_name("PhysicsStep                   "), "PhysicsStep");
+        assert_eq!(
+            clean_zone_name("PhysicsStep                   "),
+            "PhysicsStep"
+        );
         assert_eq!(clean_zone_name("ns::sys_water_sim"), "sys_water_sim");
         assert!(clean_zone_name("  ").is_empty());
     }

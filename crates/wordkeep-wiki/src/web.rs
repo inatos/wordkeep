@@ -98,6 +98,13 @@ pub(crate) async fn serve(
         .route("/api/stats", get(stats))
         .route("/api/dashboard", get(dashboard_api))
         .route("/api/izakaya", get(izakaya_api))
+        .route("/api/shrift", get(shrift_api).post(shrift_upsert_api))
+        .route("/api/shrift/touch", post(shrift_touch_api))
+        .route("/api/shrift/status", post(shrift_status_api))
+        .route("/api/shrift/promote", post(shrift_promote_api))
+        .route("/api/shrift/bookmark", post(shrift_bookmark_api))
+        .route("/api/shrift/tags", post(shrift_tags_api))
+        .route("/api/shrift/search", get(shrift_search_api))
         .route("/api/runtime", get(runtime_get))
         .route("/api/runtime/stream", get(runtime_stream))
         .route("/api/runtime/ingest", post(runtime_ingest))
@@ -511,6 +518,156 @@ async fn dashboard_api() -> ApiResult {
 
 async fn izakaya_api(State(state): State<AppState>) -> ApiResult {
     Ok(Json(crate::izakaya::board(&state.root)))
+}
+
+async fn shrift_api(State(state): State<AppState>) -> ApiResult {
+    Ok(Json(crate::shrift::board(&state.root)))
+}
+
+#[derive(Deserialize)]
+struct ShriftSlugBody {
+    #[serde(default)]
+    slug: String,
+    #[serde(default)]
+    archive_reason: Option<String>,
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    links: Option<Vec<String>>,
+    #[serde(default)]
+    on: Option<bool>,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    body: Option<String>,
+    #[serde(default)]
+    tags: Option<Vec<String>>,
+    #[serde(default)]
+    source: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ShriftSearchQuery {
+    q: Option<String>,
+    semantic: Option<bool>,
+}
+
+fn shrift_write_guard(state: &AppState) -> Result<(), ApiError> {
+    if state.config.read_only {
+        return Err(api_error(
+            StatusCode::FORBIDDEN,
+            "wiki is read-only in this environment",
+        ));
+    }
+    Ok(())
+}
+
+async fn shrift_touch_api(
+    State(state): State<AppState>,
+    Json(body): Json<ShriftSlugBody>,
+) -> ApiResult {
+    shrift_write_guard(&state)?;
+    if body.slug.is_empty() {
+        return Err(api_error(StatusCode::BAD_REQUEST, "slug is required"));
+    }
+    crate::shrift::touch(&state.root, &body.slug)
+        .map(Json)
+        .map_err(|e| api_error(StatusCode::BAD_REQUEST, e))
+}
+
+async fn shrift_status_api(
+    State(state): State<AppState>,
+    Json(body): Json<ShriftSlugBody>,
+) -> ApiResult {
+    shrift_write_guard(&state)?;
+    if body.slug.is_empty() {
+        return Err(api_error(StatusCode::BAD_REQUEST, "slug is required"));
+    }
+    let status = body
+        .status
+        .as_deref()
+        .ok_or_else(|| api_error(StatusCode::BAD_REQUEST, "status is required"))?;
+    crate::shrift::set_status(
+        &state.root,
+        &body.slug,
+        status,
+        body.archive_reason.as_deref(),
+        body.links.as_deref(),
+    )
+    .map(Json)
+    .map_err(|e| api_error(StatusCode::BAD_REQUEST, e))
+}
+
+async fn shrift_promote_api(
+    State(state): State<AppState>,
+    Json(body): Json<ShriftSlugBody>,
+) -> ApiResult {
+    shrift_write_guard(&state)?;
+    if body.slug.is_empty() {
+        return Err(api_error(StatusCode::BAD_REQUEST, "slug is required"));
+    }
+    crate::shrift::promote(&state.root, &body.slug)
+        .map(Json)
+        .map_err(|e| api_error(StatusCode::BAD_REQUEST, e))
+}
+
+async fn shrift_bookmark_api(
+    State(state): State<AppState>,
+    Json(body): Json<ShriftSlugBody>,
+) -> ApiResult {
+    shrift_write_guard(&state)?;
+    if body.slug.is_empty() {
+        return Err(api_error(StatusCode::BAD_REQUEST, "slug is required"));
+    }
+    crate::shrift::bookmark(&state.root, &body.slug, body.on)
+        .map(Json)
+        .map_err(|e| api_error(StatusCode::BAD_REQUEST, e))
+}
+
+async fn shrift_tags_api(
+    State(state): State<AppState>,
+    Json(body): Json<ShriftSlugBody>,
+) -> ApiResult {
+    shrift_write_guard(&state)?;
+    if body.slug.is_empty() {
+        return Err(api_error(StatusCode::BAD_REQUEST, "slug is required"));
+    }
+    let tags = body.tags.unwrap_or_default();
+    crate::shrift::set_tags(&state.root, &body.slug, &tags)
+        .map(Json)
+        .map_err(|e| api_error(StatusCode::BAD_REQUEST, e))
+}
+
+async fn shrift_search_api(
+    State(state): State<AppState>,
+    Query(query): Query<ShriftSearchQuery>,
+) -> ApiResult {
+    let q = query.q.unwrap_or_default();
+    let semantic = query.semantic.unwrap_or(false);
+    crate::shrift::search(&state.root, &q, semantic)
+        .map(Json)
+        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e))
+}
+
+async fn shrift_upsert_api(
+    State(state): State<AppState>,
+    Json(body): Json<ShriftSlugBody>,
+) -> ApiResult {
+    shrift_write_guard(&state)?;
+    let title = body
+        .title
+        .as_deref()
+        .ok_or_else(|| api_error(StatusCode::BAD_REQUEST, "title is required"))?;
+    let tags = body.tags.unwrap_or_default();
+    crate::shrift::upsert(
+        &state.root,
+        title,
+        body.body.as_deref().unwrap_or(""),
+        &tags,
+        body.source.as_deref().unwrap_or("wiki"),
+    )
+    .map(Json)
+    .map_err(|e| api_error(StatusCode::BAD_REQUEST, e))
 }
 
 fn origin_ok(headers: &HeaderMap) -> bool {

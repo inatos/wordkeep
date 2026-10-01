@@ -81,7 +81,8 @@ pub fn encode(tool: &str, args_fp: u64, offset: u64, kind: &str) -> String {
 
 pub fn decode(token: &str) -> Result<Token, String> {
     let raw = b64url_decode(token.trim()).map_err(|e| format!("bad continuation token: {e}"))?;
-    let v: Value = serde_json::from_slice(&raw).map_err(|e| format!("bad continuation json: {e}"))?;
+    let v: Value =
+        serde_json::from_slice(&raw).map_err(|e| format!("bad continuation json: {e}"))?;
     let ver = v.get("v").and_then(Value::as_u64).unwrap_or(0);
     if ver != VERSION as u64 {
         return Err(format!("unsupported continuation version {ver}"));
@@ -150,7 +151,14 @@ pub fn resume_offset(
 
 /// Append truncation + continuation footer. Keeps the `truncated by token_budget`
 /// phrase so stats classification still works.
-pub fn append_footer(out: &mut String, tool: &str, args_fp: u64, offset: u64, kind: &str, omitted: &str) {
+pub fn append_footer(
+    out: &mut String,
+    tool: &str,
+    args_fp: u64,
+    offset: u64,
+    kind: &str,
+    omitted: &str,
+) {
     if !out.ends_with('\n') {
         out.push('\n');
     }
@@ -176,7 +184,7 @@ pub fn schema_prop() -> Value {
 
 fn b64url_encode(data: &[u8]) -> String {
     const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-    let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
     let mut i = 0;
     while i + 3 <= data.len() {
         let n = ((data[i] as u32) << 16) | ((data[i + 1] as u32) << 8) | (data[i + 2] as u32);
@@ -287,7 +295,14 @@ mod tests {
     #[test]
     fn footer_contains_markers() {
         let mut out = String::from("body\n");
-        append_footer(&mut out, "repo_map", 1, 5, KIND_FILE_SKIP, "+3 file(s) omitted");
+        append_footer(
+            &mut out,
+            "repo_map",
+            1,
+            5,
+            KIND_FILE_SKIP,
+            "+3 file(s) omitted",
+        );
         assert!(out.contains("truncated by token_budget"));
         assert!(out.contains("continuation: "));
         assert!(out.contains("hint: re-call with continuation"));

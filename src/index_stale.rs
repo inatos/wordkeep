@@ -191,11 +191,7 @@ pub fn health(root: &Path, args: &Value) -> Result<String, String> {
         if let Some(hit) = guard.as_ref() {
             if hit.key == cache_key && hit.at.elapsed() < HEALTH_TTL {
                 let out = hit.body.clone();
-                stats::record(
-                    "index_health",
-                    hit.baseline.max(64),
-                    (out.len() / 4) as u64,
-                );
+                stats::record("index_health", hit.baseline.max(64), (out.len() / 4) as u64);
                 return Ok(out);
             }
         }
@@ -251,16 +247,14 @@ fn health_build(root: &Path, gitref: &str) -> Result<(String, u64), String> {
         out.push_str("(no sampled source files outside profile union)\n");
     } else {
         for g in gaps.iter().take(16) {
-            let suggested = config::infer_profile(root, g)
-                .unwrap_or_else(|| suggest_profile_name(g));
+            let suggested =
+                config::infer_profile(root, g).unwrap_or_else(|| suggest_profile_name(g));
             out.push_str(&format!("  {g}  → suggest profile \"{suggested}\"\n"));
         }
         if gaps.len() > 16 {
             out.push_str(&format!("  … (+{} more sampled)\n", gaps.len() - 16));
         }
-        out.push_str(
-            "Tip: `profile_upsert` with paths:[...] to persist a missing tree.\n",
-        );
+        out.push_str("Tip: `profile_upsert` with paths:[...] to persist a missing tree.\n");
     }
 
     // Tracked changes only — `ls-files --others` is too slow on huge dirty trees.
@@ -285,8 +279,8 @@ fn health_build(root: &Path, gitref: &str) -> Result<(String, u64), String> {
         out.push_str("(none — tracked only; untracked omitted for speed)\n");
     } else {
         for p in outside.iter().take(12) {
-            let suggested = config::infer_profile(root, p)
-                .unwrap_or_else(|| suggest_profile_name(p));
+            let suggested =
+                config::infer_profile(root, p).unwrap_or_else(|| suggest_profile_name(p));
             out.push_str(&format!("  {p}  → try profile \"{suggested}\"\n"));
         }
         if outside.len() > 12 {
@@ -575,7 +569,10 @@ mod tests {
     fn suggest_profile_from_path() {
         assert_eq!(suggest_profile_name("web/bifrost/foo.ts"), "bifrost");
         assert_eq!(suggest_profile_name("tools/wordkeep/src/a.rs"), "wordkeep");
-        assert_eq!(suggest_profile_name("tests/test_asset_factory.cpp"), "tests");
+        assert_eq!(
+            suggest_profile_name("tests/test_asset_factory.cpp"),
+            "tests"
+        );
         assert_eq!(suggest_profile_name("assets/scripts/foo.das"), "scripts");
     }
 
@@ -595,7 +592,10 @@ mod tests {
         let out = health(&dir, &serde_json::json!({"ref": "HEAD"})).unwrap();
         assert!(out.contains("index_health"), "{out}");
         assert!(out.contains("engine"), "{out}");
-        assert!(out.contains("Coverage gaps") || out.contains("tools/"), "{out}");
+        assert!(
+            out.contains("Coverage gaps") || out.contains("tools/"),
+            "{out}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

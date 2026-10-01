@@ -5,7 +5,23 @@ All notable changes to wordkeep are documented here. The project follows
 
 ## [Unreleased]
 
-Telemetry upgrade pass (token → accuracy → latency). Surface is **51** tools.
+## [0.4.3] - 2026-10-01
+
+Telemetry upgrade pass (token → accuracy → latency). Surface is **58** tools
+(was 51; +7 Shrift idea-keeper tools).
+
+### Added (Shrift idea-keeper)
+
+- **MCP tools**: `shrift_list`, `shrift_show`, `shrift_upsert`, `shrift_touch`,
+  `shrift_review`, `shrift_status`, `shrift_bookmark` over
+  `.wordkeep/notes/shrift/*.md` + `shrift-ledger.md`.
+- **Wiki Shrifts tab** (`?tab=shrift`): collapsible results table under search,
+  tag assign column (garden tag store + typeahead combo), capture/touch/promote/
+  archive/bookmark via `/api/shrift*` (incl. `POST /api/shrift/tags`). Bookmarks in
+  `.wordkeep/shrift-bookmarks.json` (Turso/libSQL migration target).
+- **Shared store** in `wordkeep-knowledge::shrift`: TTL freshness
+  (fresh/due/stale/dormant), lifecycle, Jaccard dedupe warnings, design-link
+  suggestions, confirm-gated dormant archive, `set_tags`.
 
 ### Added (progressive MCP)
 

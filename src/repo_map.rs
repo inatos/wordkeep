@@ -37,9 +37,7 @@ enum MapMode {
 static SYMBOL_CACHE: OnceLock<Mutex<DiskMap>> = OnceLock::new();
 
 fn normalize_rel(path: &str) -> String {
-    path.replace('\\', "/")
-        .trim_start_matches("./")
-        .to_string()
+    path.replace('\\', "/").trim_start_matches("./").to_string()
 }
 
 fn resolve_mode(args: &Value, pattern: &Option<String>) -> MapMode {
@@ -76,13 +74,7 @@ fn format_symbol_block(rel: &str, symbols: &[String]) -> String {
 }
 
 pub fn build(root: &Path, args: &Value) -> Result<String, String> {
-    const FP_KEYS: &[&str] = &[
-        "paths",
-        "profile",
-        "mode",
-        "expand",
-        "pattern",
-    ];
+    const FP_KEYS: &[&str] = &["paths", "profile", "mode", "expand", "pattern"];
     let paths = crate::config::paths_from_args(root, args)?;
     let budget = args
         .get("token_budget")
@@ -120,12 +112,7 @@ pub fn build(root: &Path, args: &Value) -> Result<String, String> {
             let Some(lang) = Lang::from_path(path) else {
                 continue;
             };
-            let rel = normalize_rel(
-                &path
-                    .strip_prefix(root)
-                    .unwrap_or(path)
-                    .to_string_lossy(),
-            );
+            let rel = normalize_rel(&path.strip_prefix(root).unwrap_or(path).to_string_lossy());
             if let Some(pat) = &pattern {
                 if !rel.to_lowercase().contains(pat) {
                     continue;
@@ -179,7 +166,11 @@ pub fn build(root: &Path, args: &Value) -> Result<String, String> {
             }
         }
     }
-    progress::tick(files as u64, Some(files as u64 + skipped_files as u64), "repo_map: done");
+    progress::tick(
+        files as u64,
+        Some(files as u64 + skipped_files as u64),
+        "repo_map: done",
+    );
 
     // Persist any newly extracted symbols so the next cold spawn is warm too.
     if let Some(c) = SYMBOL_CACHE.get() {
@@ -883,10 +874,8 @@ int Transform_area(const Transform& t) { return 0; }
     }
 
     fn fixture_tree(name: &str) -> std::path::PathBuf {
-        let root = std::env::temp_dir().join(format!(
-            "cbtest_repomap_{name}_{}",
-            std::process::id()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("cbtest_repomap_{name}_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::write(

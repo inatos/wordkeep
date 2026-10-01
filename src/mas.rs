@@ -926,16 +926,11 @@ fn compact_pressure_handoff(root: &Path, session: Option<&str>) -> String {
     let defects = defects::unresolved(root);
     let recent_runs = runs::recent(root, 5);
     let mut out = String::from("# Next-session prime (Wordkeep autopilot draft)\n\n");
-    out.push_str(&format!(
-        "Workspace: {}\n",
-        workspace::workspace_id(root)
-    ));
+    out.push_str(&format!("Workspace: {}\n", workspace::workspace_id(root)));
     if let Some(s) = session {
         out.push_str(&format!("Session hint: {s}\n"));
     }
-    out.push_str(
-        "\nNOTE: draft only — call `session_handoff` to persist / reset pressure.\n\n",
-    );
+    out.push_str("\nNOTE: draft only — call `session_handoff` to persist / reset pressure.\n\n");
     out.push_str("## Priority defects (unresolved)\n\n");
     if defects.is_empty() {
         out.push_str("(none)\n\n");

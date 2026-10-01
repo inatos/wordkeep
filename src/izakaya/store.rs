@@ -304,14 +304,12 @@ impl Projection {
             .and_then(Value::as_array)
             .map(|arr| {
                 arr.iter()
-                    .filter_map(|m| {
-                        Some(Note {
-                            seq: u(m, "seq"),
-                            from: str_or(m, "from"),
-                            to: str_or(m, "to"),
-                            body: str_or(m, "body"),
-                            acked: m.get("acked").and_then(Value::as_bool).unwrap_or(false),
-                        })
+                    .map(|m| Note {
+                        seq: u(m, "seq"),
+                        from: str_or(m, "from"),
+                        to: str_or(m, "to"),
+                        body: str_or(m, "body"),
+                        acked: m.get("acked").and_then(Value::as_bool).unwrap_or(false),
                     })
                     .collect()
             })
@@ -938,9 +936,7 @@ fn load_locked(dir: &Path, coordination_id: &str) -> Result<Snapshot, String> {
     let tip = peek_last_event_seq(&events_path(dir));
     if let Some(v) = workspace::read_json(&path)? {
         if let Some(mut p) = Projection::from_value(&v) {
-            if p.coordination_id == coordination_id
-                && tip.is_some_and(|seq| seq == p.seq)
-            {
+            if p.coordination_id == coordination_id && tip.is_some_and(|seq| seq == p.seq) {
                 if gc_projection(&mut p, now_secs()) {
                     let _ = workspace::write_atomic_json(&path, &p.to_value());
                 }
@@ -989,9 +985,7 @@ fn gc_projection(proj: &mut Projection, now: u64) -> bool {
         let Ok(state) = AgentState::parse(&agent.state) else {
             continue;
         };
-        if state == AgentState::CheckedOut
-            || model::is_stale(state, agent.expires_at, now)
-        {
+        if state == AgentState::CheckedOut || model::is_stale(state, agent.expires_at, now) {
             // Slim tombstones / handoff anchors — drop claim/dirty payload that
             // bloated projection.json and snapshot events.
             if !agent.dirty_paths.is_empty()
@@ -1017,12 +1011,12 @@ fn gc_projection(proj: &mut Projection, now: u64) -> bool {
     }
 
     let before_agents = proj.agents.len();
-    checked_out.sort_by(|a, b| b.0.cmp(&a.0));
+    checked_out.sort_by_key(|b| std::cmp::Reverse(b.0));
     for (_, id) in checked_out.into_iter().skip(MAX_CHECKED_OUT_RETAIN) {
         proj.agents.remove(&id);
     }
 
-    stale_ids.sort_by(|a, b| b.0.cmp(&a.0));
+    stale_ids.sort_by_key(|b| std::cmp::Reverse(b.0));
     for (_, id) in stale_ids.into_iter().skip(MAX_STALE_AGENTS) {
         proj.agents.remove(&id);
     }
@@ -1072,9 +1066,7 @@ fn maybe_compact(dir: &Path, proj: &Projection, hint: &[Event]) -> Result<(), St
             let proj_bytes = serde_json::to_vec(&proj.to_value())
                 .map(|b| b.len())
                 .unwrap_or(0);
-            let snap_bytes = serde_json::to_vec(&snap.body)
-                .map(|b| b.len())
-                .unwrap_or(0);
+            let snap_bytes = serde_json::to_vec(&snap.body).map(|b| b.len()).unwrap_or(0);
             if snap_bytes > proj_bytes.saturating_add(4096) {
                 return compact_journal(dir, proj, &all);
             }
@@ -1148,8 +1140,8 @@ fn rewrite_events(dir: &Path, events: &[Event]) -> Result<(), String> {
     let path = events_path(dir);
     let tmp = path.with_extension("ndjson.tmp");
     {
-        let mut file = std::fs::File::create(&tmp)
-            .map_err(|e| format!("create {}: {e}", tmp.display()))?;
+        let mut file =
+            std::fs::File::create(&tmp).map_err(|e| format!("create {}: {e}", tmp.display()))?;
         for event in events {
             let line = serde_json::to_string(&event.to_value())
                 .map_err(|e| format!("serialize event: {e}"))?;
@@ -1494,9 +1486,7 @@ mod tests {
             lease_id: "L1".into(),
             idempotency_key: None,
             body: json!({"reason": "completed", "revision": 2}),
-            result_fn: |_, e| {
-                json!({"text": format!("checked out {}", e.agent_id)})
-            },
+            result_fn: |_, e| json!({"text": format!("checked out {}", e.agent_id)}),
         };
         commit(&root, out).unwrap();
         let after = read(&root).unwrap();
@@ -1575,7 +1565,10 @@ mod tests {
         let snap = read(&root).unwrap();
         assert!(snap.projection.agents.contains_key("keep"));
         let after = std::fs::metadata(events_path(&dir)).unwrap().len();
-        assert!(after < before, "journal should compact: before={before} after={after}");
+        assert!(
+            after < before,
+            "journal should compact: before={before} after={after}"
+        );
         let rebuilt = load_events(&dir).unwrap();
         assert_eq!(rebuilt.len(), 1);
         assert_eq!(rebuilt[0].kind, "snapshot");

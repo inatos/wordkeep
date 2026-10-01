@@ -211,20 +211,18 @@ fn approx_tokens(s: &str) -> usize {
 #[test]
 fn eval_repo_map_files_mode_stays_under_budget() {
     let mut s = Server::start();
-    let (err, text) = s.tool(
-        "repo_map",
-        json!({ "mode": "files", "token_budget": 400 }),
-    );
+    let (err, text) = s.tool("repo_map", json!({ "mode": "files", "token_budget": 400 }));
     assert!(!err, "{text}");
     assert!(
         !text.contains("truncated by token_budget"),
         "files mode should fit tiny trees without trunc: {text}"
     );
+    assert!(text.contains("files") || text.contains("symbol"), "{text}");
     assert!(
-        text.contains("files") || text.contains("symbol"),
-        "{text}"
+        approx_tokens(&text) <= 500,
+        "tokens={}",
+        approx_tokens(&text)
     );
-    assert!(approx_tokens(&text) <= 500, "tokens={}", approx_tokens(&text));
 }
 
 #[test]
@@ -235,16 +233,16 @@ fn eval_repo_map_symbols_finds_widget() {
         json!({ "mode": "symbols", "pattern": "sample", "token_budget": 2000 }),
     );
     assert!(!err, "{text}");
-    assert!(text.contains("Widget") || text.contains("widget_area"), "{text}");
+    assert!(
+        text.contains("Widget") || text.contains("widget_area"),
+        "{text}"
+    );
 }
 
 #[test]
 fn eval_symbol_resolve_exact_and_fuzzy() {
     let mut s = Server::start();
-    let (err, text) = s.tool(
-        "symbol_resolve",
-        json!({ "symbol": "widget_area" }),
-    );
+    let (err, text) = s.tool("symbol_resolve", json!({ "symbol": "widget_area" }));
     assert!(!err, "{text}");
     assert!(
         text.to_lowercase().contains("widget_area") || text.contains("found"),
@@ -331,10 +329,7 @@ fn eval_symbol_resolve_typo_no_short_garbage() {
 #[test]
 fn eval_type_layout_normalizes_qualified_name() {
     let mut s = Server::start();
-    let (err, text) = s.tool(
-        "type_layout",
-        json!({ "type": "::demo::Widget" }),
-    );
+    let (err, text) = s.tool("type_layout", json!({ "type": "::demo::Widget" }));
     assert!(!err, "{text}");
     assert!(
         text.contains("id") || text.contains("value") || text.contains("Widget"),
@@ -368,7 +363,11 @@ fn eval_knowledge_answer_has_citations() {
         text.contains("citation") || text.contains("Physics") || text.contains("answer"),
         "{text}"
     );
-    assert!(approx_tokens(&text) <= 900, "tokens={}", approx_tokens(&text));
+    assert!(
+        approx_tokens(&text) <= 900,
+        "tokens={}",
+        approx_tokens(&text)
+    );
 }
 
 #[test]
@@ -421,8 +420,11 @@ fn eval_index_health_reports_profiles() {
     let (err, text) = s.tool("index_health", json!({}));
     assert!(!err, "{text}");
     assert!(
-        text.contains("profile") || text.contains("engine") || text.contains("coverage")
-            || text.contains("health") || text.contains("stale"),
+        text.contains("profile")
+            || text.contains("engine")
+            || text.contains("coverage")
+            || text.contains("health")
+            || text.contains("stale"),
         "{text}"
     );
 }
@@ -471,25 +473,27 @@ fn eval_new_tools_are_listed() {
         "perf_triage",
         "test_impact",
         "index_health",
+        "shrift_list",
+        "shrift_upsert",
+        "shrift_review",
     ] {
         assert!(names.contains(&n), "missing {n} in {names:?}");
     }
-    assert_eq!(names.len(), 51, "surface drift: {names:?}");
+    assert_eq!(names.len(), 58, "surface drift: {names:?}");
 }
 
 fn extract_continuation(text: &str) -> Option<String> {
-    text.lines()
-        .find_map(|l| l.strip_prefix("continuation: ").map(|s| s.trim().to_string()))
+    text.lines().find_map(|l| {
+        l.strip_prefix("continuation: ")
+            .map(|s| s.trim().to_string())
+    })
 }
 
 #[test]
 fn eval_repo_map_continuation_pages_disjoint() {
     let mut s = Server::start();
     // Force pagination: first file always emits; starve so the second cannot fit.
-    let (err, page1) = s.tool(
-        "repo_map",
-        json!({ "mode": "files", "token_budget": 8 }),
-    );
+    let (err, page1) = s.tool("repo_map", json!({ "mode": "files", "token_budget": 8 }));
     assert!(!err, "{page1}");
     assert!(
         page1.contains("truncated by token_budget") && page1.contains("continuation: "),
@@ -526,10 +530,7 @@ fn eval_repo_map_continuation_pages_disjoint() {
 #[test]
 fn eval_continuation_rejects_args_drift() {
     let mut s = Server::start();
-    let (err, page1) = s.tool(
-        "repo_map",
-        json!({ "mode": "files", "token_budget": 8 }),
-    );
+    let (err, page1) = s.tool("repo_map", json!({ "mode": "files", "token_budget": 8 }));
     assert!(!err, "{page1}");
     let Some(tok) = extract_continuation(&page1) else {
         // Tiny trees may not truncate; still validate mismatch path via encode in-unit.

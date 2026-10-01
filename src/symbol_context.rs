@@ -39,7 +39,9 @@ pub fn build(root: &Path, args: &Value) -> Result<String, String> {
             "symbol_context - \"{symbol}\": no definition found under {paths:?}\n{}",
             crate::config::symbol_not_found_hint(&paths)
         );
-        out.push_str(&crate::symbol_resolve::did_you_mean_hint(root, symbol, &paths));
+        out.push_str(&crate::symbol_resolve::did_you_mean_hint(
+            root, symbol, &paths,
+        ));
         stats::record("symbol_context", scanned_def / 4, (out.len() / 4) as u64);
         return Ok(out);
     };
@@ -68,6 +70,7 @@ pub fn build(root: &Path, args: &Value) -> Result<String, String> {
     Ok(out)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render(
     symbol: &str,
     info: &DefInfo,

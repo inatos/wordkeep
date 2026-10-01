@@ -194,10 +194,7 @@ fn agent_view(agent: &Value, now: u64) -> Value {
         .and_then(Value::as_array)
         .map(|items| items.len())
         .unwrap_or(0);
-    let head = agent
-        .get("head_oid")
-        .and_then(Value::as_str)
-        .unwrap_or("");
+    let head = agent.get("head_oid").and_then(Value::as_str).unwrap_or("");
     let head_short: String = head.chars().take(8).collect();
     json!({
         "agent_id": agent.get("agent_id").and_then(Value::as_str).unwrap_or(""),

@@ -54,8 +54,9 @@
   import type { BarDatum, DonutDatum, SparkPoint } from './lib/charts/utils';
   import RuntimeHealth from './lib/RuntimeHealth.svelte';
   import IzakayaBoard from './lib/IzakayaBoard.svelte';
+  import ShriftBoard from './lib/ShriftBoard.svelte';
 
-  type Tab = 'search' | 'reader' | 'dashboard' | 'health';
+  type Tab = 'search' | 'reader' | 'dashboard' | 'health' | 'shrift';
   type EditorTab = { path: string; pinned: boolean };
   type SortKey =
     | 'name'
@@ -71,7 +72,7 @@
     | 'peak_saved'
     | 'last_ts';
 
-  const TABS: Tab[] = ['search', 'reader', 'dashboard', 'health'];
+  const TABS: Tab[] = ['search', 'reader', 'dashboard', 'health', 'shrift'];
   const SIDEBAR_MIN = 240;
   const SIDEBAR_MAX = 720;
   const SIDEBAR_DEFAULT = 320;
@@ -280,6 +281,7 @@
     else if (tab === 'dashboard' && dashView === 'izakaya') url.searchParams.set('view', 'izakaya');
     else url.searchParams.delete('view');
     if (tab === 'dashboard' && dashQuery.trim()) url.searchParams.set('dq', dashQuery.trim());
+    else if (tab === 'shrift' && dashQuery.trim()) url.searchParams.set('dq', dashQuery.trim());
     else url.searchParams.delete('dq');
     const next = `${url.pathname}${url.search}${url.hash}`;
     const cur = `${location.pathname}${location.search}${location.hash}`;
@@ -1430,6 +1432,29 @@
             stroke-width="2"
             stroke-linecap="round"
             stroke-linejoin="round"
+          /></svg
+        >
+      </button>
+      <button
+        class="icon-btn"
+        class:active={tab === 'shrift'}
+        title="Shrifts — idea keeper (capture, freshness, promote, bookmarks, tags)"
+        aria-label="Shrifts"
+        onclick={() => setTab('shrift')}
+      >
+        <svg viewBox="0 0 24 24" aria-hidden="true"
+          ><path
+            d="M5 4h11l3 3v13H5z"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="2"
+            stroke-linejoin="round"
+          /><path
+            d="M8 10h8M8 14h6"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="2"
+            stroke-linecap="round"
           /></svg
         >
       </button>
@@ -3181,6 +3206,32 @@
           >
         </footer>
         {/if}
+      </section>
+    {:else if tab === 'shrift'}
+      <section class="dashboard panel enter">
+        <header class="panel-head">
+          <h2
+            class="section-title"
+            title="Shrifts idea-keeper — capture, freshness TTL, promote, archive, bookmarks, tags."
+          >
+            Shrifts
+          </h2>
+        </header>
+        <label class="dash-filter">
+          <input
+            bind:value={dashQuery}
+            type="search"
+            placeholder="Filter shrifts by slug, title, tags, status…"
+            aria-label="Filter Shrifts"
+            title="Space-separated substrings over idea fields. Results appear in the table below."
+          />
+        </label>
+        <ShriftBoard
+          query={dashQuery}
+          onOpenPath={(path) => {
+            void openPath(path);
+          }}
+        />
       </section>
     {:else}
       <div class="health-wrap">

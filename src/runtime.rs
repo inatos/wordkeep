@@ -27,16 +27,13 @@ pub fn snapshot(root: &Path, args: &Value) -> Result<String, String> {
 }
 
 pub fn memory_diff(root: &Path, args: &Value) -> Result<String, String> {
-    let base = args
-        .get("base")
-        .and_then(Value::as_str)
-        .ok_or_else(|| {
-            format!(
-                "base is required (capture id digits). Produce captures via wiki Health → Runtime \
+    let base = args.get("base").and_then(Value::as_str).ok_or_else(|| {
+        format!(
+            "base is required (capture id digits). Produce captures via wiki Health → Runtime \
                  (Capture), then pass the numeric id. Available: {}",
-                available_captures_hint(root)
-            )
-        })?;
+            available_captures_hint(root)
+        )
+    })?;
     let current = args
         .get("current")
         .and_then(Value::as_str)
@@ -539,10 +536,7 @@ mod tests {
 
     #[test]
     fn missing_capture_lists_available_and_soft_route() {
-        let dir = std::env::temp_dir().join(format!(
-            "wk_runtime_miss_{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("wk_runtime_miss_{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(dir.join(".wordkeep/runtime")).unwrap();
         fs::write(

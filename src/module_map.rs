@@ -15,13 +15,7 @@ const SAMPLE_CAP: usize = 4;
 
 pub fn build(root: &Path, args: &Value) -> Result<String, String> {
     const FP_KEYS: &[&str] = &[
-        "paths",
-        "profile",
-        "depth",
-        "max",
-        "samples",
-        "min_edge",
-        "focus",
+        "paths", "profile", "depth", "max", "samples", "min_edge", "focus",
     ];
     let paths = crate::config::paths_from_args(root, args)?;
     let depth = args
@@ -99,7 +93,11 @@ pub fn build(root: &Path, args: &Value) -> Result<String, String> {
         args_fp,
         resume_at,
     });
-    progress::tick(visible.len() as u64, Some(visible.len() as u64), "module_map: done");
+    progress::tick(
+        visible.len() as u64,
+        Some(visible.len() as u64),
+        "module_map: done",
+    );
     stats::record("module_map", adj.scanned_bytes / 4, (out.len() / 4) as u64);
     Ok(out)
 }

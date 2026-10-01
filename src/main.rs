@@ -45,6 +45,13 @@
 //!   * session_handoff  - paste-ready next-session prime from MAS/defects/runs
 //!   * defect_upsert    - structured defect registry write
 //!   * defect_list      - list unresolved defects (eyeball_fail first)
+//!   * shrift_list      - list /shrift ideas (status/freshness/tag)
+//!   * shrift_show      - one idea + similar + design-link suggestions
+//!   * shrift_upsert    - capture or update an idea stub
+//!   * shrift_touch     - refresh idea touched timestamp
+//!   * shrift_review    - due/stale/dormant queue + handoff stalest
+//!   * shrift_status    - set lifecycle status / accepted links
+//!   * shrift_bookmark  - toggle local idea bookmark
 //!   * run_record       - metadata-only gate/run history write
 //!   * run_history      - filter recent runs and missing artifacts
 //!   * artifact_index   - metadata index over configured artifact roots
@@ -97,6 +104,7 @@ mod repo_map;
 mod runs;
 mod runtime;
 mod session_pressure;
+mod shrift;
 mod stats;
 mod symbol_context;
 mod symbol_def;
@@ -245,6 +253,13 @@ fn main() {
     let root_session_handoff = root.clone();
     let root_defect_upsert = root.clone();
     let root_defect_list = root.clone();
+    let root_shrift_list = root.clone();
+    let root_shrift_show = root.clone();
+    let root_shrift_upsert = root.clone();
+    let root_shrift_touch = root.clone();
+    let root_shrift_review = root.clone();
+    let root_shrift_status = root.clone();
+    let root_shrift_bookmark = root.clone();
     let root_run_record = root.clone();
     let root_run_history = root.clone();
     let root_artifact_index = root.clone();
@@ -1217,6 +1232,113 @@ fn main() {
                 }
             }),
             handler: Box::new(move |args| defects::list(&root_defect_list, args)),
+        },
+        mcp::Tool {
+            name: "shrift_list",
+            description: "List /shrift idea-keeper notes under .wordkeep/notes/shrift/ \
+                          (digest by default). Filter by status/freshness/tag/query. \
+                          semantic:true re-ranks with local hybrid similarity.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "digest": { "type": "boolean", "description": "Digest summary (default true)." },
+                    "status": { "type": "string", "description": "seed|sprouted|planned|implemented|archived" },
+                    "freshness": { "type": "string", "description": "fresh|due|stale|dormant" },
+                    "tag": { "type": "string" },
+                    "query": { "type": "string" },
+                    "semantic": { "type": "boolean", "description": "Hybrid similarity rank. Default false." },
+                    "max": { "type": "integer" },
+                    "token_budget": { "type": "integer" }
+                }
+            }),
+            handler: Box::new(move |args| shrift::list(&root_shrift_list, args)),
+        },
+        mcp::Tool {
+            name: "shrift_show",
+            description: "Show one /shrift idea (frontmatter + body) with similar-idea \
+                          warnings and suggested docs/designs links (confirm before writing).",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "slug": { "type": "string", "description": "Idea slug. Required." }
+                },
+                "required": ["slug"]
+            }),
+            handler: Box::new(move |args| shrift::show(&root_shrift_show, args)),
+        },
+        mcp::Tool {
+            name: "shrift_upsert",
+            description: "Capture a new /shrift idea (status seed) or update an existing slug. \
+                          Emits dedupe warnings; does not block on similarity.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "title": { "type": "string", "description": "Idea title. Required." },
+                    "body": { "type": "string" },
+                    "slug": { "type": "string", "description": "When set, update that idea." },
+                    "tags": { "type": "array", "items": { "type": "string" } },
+                    "source": { "type": "string", "description": "Default shrift." }
+                },
+                "required": ["title"]
+            }),
+            handler: Box::new(move |args| shrift::upsert(&root_shrift_upsert, args)),
+        },
+        mcp::Tool {
+            name: "shrift_touch",
+            description: "Refresh an idea's touched date (keeps it fresh) and rewrite the ledger.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "slug": { "type": "string", "description": "Idea slug. Required." }
+                },
+                "required": ["slug"]
+            }),
+            handler: Box::new(move |args| shrift::touch(&root_shrift_touch, args)),
+        },
+        mcp::Tool {
+            name: "shrift_review",
+            description: "Due/stale/dormant review queue plus the 1–3 stalest seed/sprouted \
+                          ideas for /handoff surfacing.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "max": { "type": "integer", "description": "Max queue rows. Default 20." }
+                }
+            }),
+            handler: Box::new(move |args| shrift::review(&root_shrift_review, args)),
+        },
+        mcp::Tool {
+            name: "shrift_status",
+            description: "Set idea lifecycle status (seed|sprouted|planned|implemented|archived). \
+                          Dormant archive requires archive_reason. Optional links[] / tags[] write \
+                          accepted design-doc links or frontmatter tags after user confirm.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "slug": { "type": "string" },
+                    "status": { "type": "string" },
+                    "archive_reason": { "type": "string" },
+                    "links": { "type": "array", "items": { "type": "string" } },
+                    "tags": { "type": "array", "items": { "type": "string" },
+                              "description": "Replace idea tags when provided (same store as wiki tags)." }
+                },
+                "required": ["slug", "status"]
+            }),
+            handler: Box::new(move |args| shrift::status(&root_shrift_status, args)),
+        },
+        mcp::Tool {
+            name: "shrift_bookmark",
+            description: "Toggle a local idea bookmark (.wordkeep/shrift-bookmarks.json; \
+                          Turso/libSQL migration target for wiki user-state).",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "slug": { "type": "string" },
+                    "on": { "type": "boolean", "description": "Force on/off; omit to toggle." }
+                },
+                "required": ["slug"]
+            }),
+            handler: Box::new(move |args| shrift::bookmark(&root_shrift_bookmark, args)),
         },
         mcp::Tool {
             name: "run_record",

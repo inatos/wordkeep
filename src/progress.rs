@@ -27,7 +27,12 @@ static OUT_LOCK: Mutex<()> = Mutex::new(());
 pub fn progress_enabled() -> bool {
     matches!(
         std::env::var("WORDKEEP_MCP_PROGRESS").ok().as_deref(),
-        Some("1") | Some("true") | Some("TRUE") | Some("yes") | Some("YES") | Some("on")
+        Some("1")
+            | Some("true")
+            | Some("TRUE")
+            | Some("yes")
+            | Some("YES")
+            | Some("on")
             | Some("ON")
     )
 }
@@ -113,10 +118,7 @@ mod tests {
             "arguments": {},
             "_meta": { "progressToken": "abc-1" }
         });
-        assert_eq!(
-            token_from_call_params(&params),
-            Some(json!("abc-1"))
-        );
+        assert_eq!(token_from_call_params(&params), Some(json!("abc-1")));
     }
 
     #[test]

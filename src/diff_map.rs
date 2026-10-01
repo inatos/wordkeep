@@ -210,11 +210,13 @@ pub(crate) fn changed_functions(
 }
 
 /// Collect per-file changed symbols (with change tags) vs `gitref`.
+type ChangedDetail = (Vec<(String, Vec<ChangedSym>)>, u64);
+
 fn collect_changed_detail(
     root: &Path,
     gitref: &str,
     paths: &[String],
-) -> Result<(Vec<(String, Vec<ChangedSym>)>, u64), String> {
+) -> Result<ChangedDetail, String> {
     let diff = git_diff(root, gitref, paths, 0)?;
     // Diff paths are repo-top-relative; resolve files against the repo top, but
     // display them relative to our root when possible.

@@ -39,6 +39,7 @@ pub mod repo_map;
 mod runs;
 mod runtime;
 mod session_pressure;
+mod shrift;
 mod stats;
 mod symbol_context;
 mod symbol_def;

@@ -7,3 +7,7 @@
 # Wiki UI (Bun/npm); keep source, ignore install tree. Built `wiki/dist` is
 # produced in CI/release and for local `serve`.
 /wiki/node_modules
+
+# Local soak / attach scratch — never commit.
+/.cache-live-test/
+/.cache-live-test2/

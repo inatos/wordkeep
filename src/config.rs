@@ -231,11 +231,7 @@ pub fn large_file_bytes(root: &Path) -> u64 {
 pub fn commit_ignore(root: &Path) -> Vec<String> {
     match load_config(root) {
         Some(cfg) if cfg.get("commit_ignore").is_some() => string_vec(&cfg, "commit_ignore"),
-        _ => vec![
-            ".cache/".into(),
-            "target/".into(),
-            "node_modules/".into(),
-        ],
+        _ => vec![".cache/".into(), "target/".into(), "node_modules/".into()],
     }
 }
 

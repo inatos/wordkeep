@@ -32,8 +32,8 @@ pub fn build(root: &Path, args: &Value) -> Result<String, String> {
         .and_then(Value::as_u64)
         .unwrap_or(1200) as usize;
     let args_fp = continuation::args_fingerprint(args, FP_KEYS);
-    let resume_at = continuation::resume_offset(args, "big_functions", FP_KEYS, KIND_ITEM_SKIP)?
-        as usize;
+    let resume_at =
+        continuation::resume_offset(args, "big_functions", FP_KEYS, KIND_ITEM_SKIP)? as usize;
 
     progress::tick(0, None, "big_functions: scanning");
     let prune = walk::prune_set(root);
@@ -78,7 +78,11 @@ pub fn build(root: &Path, args: &Value) -> Result<String, String> {
     });
 
     let out = render(&paths, min_lines, &items, max, budget, args_fp, resume_at);
-    progress::tick(items.len() as u64, Some(items.len() as u64), "big_functions: done");
+    progress::tick(
+        items.len() as u64,
+        Some(items.len() as u64),
+        "big_functions: done",
+    );
     stats::record("big_functions", scanned_bytes / 4, (out.len() / 4) as u64);
     Ok(out)
 }

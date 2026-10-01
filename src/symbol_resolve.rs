@@ -81,9 +81,8 @@ pub fn resolve(root: &Path, args: &Value) -> Result<String, String> {
         }
     }
 
-    let mut out = format!(
-        "symbol_resolve - \"{raw}\" → \"{symbol}\": no definition under {paths:?}\n"
-    );
+    let mut out =
+        format!("symbol_resolve - \"{raw}\" → \"{symbol}\": no definition under {paths:?}\n");
     if !profile_hits.is_empty() {
         out.push_str("\nfound under other profile(s):\n");
         for (pname, rel, line, kind) in &profile_hits {
@@ -200,11 +199,7 @@ fn length_ratio_ok(a: usize, b: usize) -> bool {
 
 /// Shared ≥3-char prefix or ≥50% character overlap (set intersection / longer).
 fn shares_prefix_or_overlap(a: &str, b: &str) -> bool {
-    let pref = a
-        .chars()
-        .zip(b.chars())
-        .take_while(|(x, y)| x == y)
-        .count();
+    let pref = a.chars().zip(b.chars()).take_while(|(x, y)| x == y).count();
     if pref >= 3 {
         return true;
     }
@@ -242,8 +237,7 @@ fn score_candidate(needle: &str, cand: &str) -> Option<i32> {
     }
     // Edit distance: only near-length identifiers with shared shape.
     if n_len <= 40
-        && c_len >= 4
-        && c_len <= 40
+        && (4..=40).contains(&c_len)
         && n_len.abs_diff(c_len) <= 2
         && shares_prefix_or_overlap(&n_l, &c_l)
     {
@@ -271,9 +265,7 @@ fn levenshtein(a: &str, b: &str) -> usize {
         cur[0] = i;
         for j in 1..=m {
             let cost = if a[i - 1] == b[j - 1] { 0 } else { 1 };
-            cur[j] = (prev[j] + 1)
-                .min(cur[j - 1] + 1)
-                .min(prev[j - 1] + cost);
+            cur[j] = (prev[j] + 1).min(cur[j - 1] + 1).min(prev[j - 1] + cost);
         }
         std::mem::swap(&mut prev, &mut cur);
     }
@@ -372,10 +364,7 @@ mod tests {
         );
         // Typo within edit distance 2.
         let typo = suggestions(&dir, "widget_aree", &["src".into()], 5);
-        assert!(
-            typo.iter().any(|s| s.contains("widget_are")),
-            "{typo:?}"
-        );
+        assert!(typo.iter().any(|s| s.contains("widget_are")), "{typo:?}");
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -401,15 +390,13 @@ mod tests {
         for needle in ["symbl_resolve", "widget_are"] {
             let sugg = suggestions(&dir, needle, &["src".into()], 8);
             for s in &sugg {
-                assert!(
-                    s.len() >= 3,
-                    "short garbage for {needle}: {sugg:?}"
-                );
+                assert!(s.len() >= 3, "short garbage for {needle}: {sugg:?}");
             }
         }
         let for_typo = suggestions(&dir, "symbl_resolve", &["src".into()], 5);
         assert!(
-            for_typo.iter().any(|s| s == "symbol_resolve") || for_typo.is_empty()
+            for_typo.iter().any(|s| s == "symbol_resolve")
+                || for_typo.is_empty()
                 || for_typo.iter().all(|s| s.len() >= 3),
             "{for_typo:?}"
         );

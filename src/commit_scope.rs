@@ -341,11 +341,7 @@ mod tests {
 
     #[test]
     fn ignore_filters_cache_and_target_prefixes() {
-        let ignore = vec![
-            ".cache/".into(),
-            "target/".into(),
-            "node_modules/".into(),
-        ];
+        let ignore = vec![".cache/".into(), "target/".into(), "node_modules/".into()];
         assert!(path_matches_ignore(".cache/foo.bin", &ignore));
         assert!(path_matches_ignore("target/debug/bar", &ignore));
         assert!(path_matches_ignore("node_modules/pkg/index.js", &ignore));

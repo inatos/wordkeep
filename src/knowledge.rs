@@ -222,8 +222,8 @@ pub fn search(root: &Path, args: &Value) -> Result<String, String> {
         .and_then(Value::as_u64)
         .unwrap_or(1200) as usize;
     let args_fp = continuation::args_fingerprint(args, FP_KEYS);
-    let resume_at = continuation::resume_offset(args, "knowledge_search", FP_KEYS, KIND_HIT_SKIP)?
-        as usize;
+    let resume_at =
+        continuation::resume_offset(args, "knowledge_search", FP_KEYS, KIND_HIT_SKIP)? as usize;
 
     progress::tick(0, None, "knowledge_search: retrieve");
     let retrieval = retrieve(root, args)?;
@@ -242,7 +242,9 @@ pub fn search(root: &Path, args: &Value) -> Result<String, String> {
     let start = resume_at.min(end);
     let mut out = format!(
         "knowledge_search - query {:?}, top {} of {} matches",
-        retrieval.query, end, retrieval.hits.len()
+        retrieval.query,
+        end,
+        retrieval.hits.len()
     );
     if resume_at > 0 {
         out.push_str(&format!(" [continuation from hit #{resume_at}]"));

@@ -119,8 +119,8 @@ impl Server {
             let mut resp = String::new();
             let n = self.stdout.read_line(&mut resp).expect("read response");
             assert!(n > 0, "server closed stdout without responding");
-            let v: Value =
-                serde_json::from_str(&resp).unwrap_or_else(|e| panic!("bad response {resp:?}: {e}"));
+            let v: Value = serde_json::from_str(&resp)
+                .unwrap_or_else(|e| panic!("bad response {resp:?}: {e}"));
             if v.get("id").is_some() {
                 return v;
             }
@@ -237,6 +237,13 @@ fn lists_all_tools() {
         "izakaya_update",
         "izakaya_check_out",
         "izakaya_advise",
+        "shrift_list",
+        "shrift_show",
+        "shrift_upsert",
+        "shrift_touch",
+        "shrift_review",
+        "shrift_status",
+        "shrift_bookmark",
     ] {
         assert!(names.contains(&n), "missing tool {n}: {names:?}");
     }
@@ -254,8 +261,8 @@ fn lists_all_tools() {
     );
     assert_eq!(
         names.len(),
-        51,
-        "expected 51 tools, got {}: {names:?}",
+        58,
+        "expected 58 tools, got {}: {names:?}",
         names.len()
     );
 }
@@ -322,8 +329,9 @@ fn resources_list_and_read_readme() {
         "params": { "uri": "wordkeep://capabilities" }
     }));
     let caps_text = caps["result"]["contents"][0]["text"].as_str().unwrap_or("");
-    assert!(caps_text.contains("\"tool_count\": 51"), "{caps}");
+    assert!(caps_text.contains("\"tool_count\": 58"), "{caps}");
     assert!(caps_text.contains("knowledge_upsert"), "{caps}");
+    assert!(caps_text.contains("shrift_upsert"), "{caps}");
 }
 
 #[test]
@@ -382,10 +390,7 @@ fn continuity_tools_smoke() {
 #[test]
 fn repo_map_maps_fixture_source() {
     let mut s = Server::start();
-    let out = s.tool_text(
-        "repo_map",
-        json!({ "paths": ["src"], "mode": "symbols" }),
-    );
+    let out = s.tool_text("repo_map", json!({ "paths": ["src"], "mode": "symbols" }));
     assert!(out.contains("sample.cpp"), "{out}");
     assert!(out.contains("namespace demo"), "{out}");
     assert!(out.contains("struct Widget"), "{out}");
@@ -962,7 +967,10 @@ fn progress_token_emits_notification() {
             break;
         }
     }
-    assert!(saw_progress, "expected notifications/progress before result");
+    assert!(
+        saw_progress,
+        "expected notifications/progress before result"
+    );
     assert!(saw_result, "expected tools/call result");
 }
 

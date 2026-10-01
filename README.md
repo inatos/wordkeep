@@ -18,7 +18,8 @@ displacement, recent activity, and health signals. Large counts abbreviate as
 
 `wordkeep-wiki` is an optional local browser UI over the same Markdown knowledge
 (Meilisearch + dark Svelte app). Same telemetry as the terminal dashboard, plus
-search, reader tabs, and garden health.
+search, reader tabs, garden health, and the **Shrifts** idea-keeper
+(`?tab=shrift`).
 
 ![Wiki GUI MCP telemetry dashboard with overview cards, sortable tools table, and editor tabs](docs/wiki-dashboard.png)
 
@@ -151,7 +152,7 @@ CLI: `wordkeep run-record …` records gate metadata without executing commands.
 
 ## What you get
 
-51 MCP tools + 2 MCP resources (`wordkeep://readme`, `wordkeep://capabilities`), including:
+58 MCP tools + 2 MCP resources (`wordkeep://readme`, `wordkeep://capabilities`), including:
 
 | Tool | Use when you need |
 | --- | --- |
@@ -174,10 +175,12 @@ CLI: `wordkeep run-record …` records gate metadata without executing commands.
 | `locality_hotspots` | Sampled PMC/ETW/perf hotspots, or explicit unavailable |
 | `stats` | Measured token displacement per tool |
 | `izakaya_status` / `izakaya_check_in` | Who has live work, then take a lease before editing |
+| `shrift_list` / `shrift_upsert` / `shrift_review` | Idea-keeper digest, capture, and stale queue (`/shrift`) |
 
 Full catalog: [docs/tools.md](docs/tools.md). Design notes:
 [docs/onboarding.md](docs/onboarding.md). Izakaya presence and the offline replay
-lab: [docs/designs/izakaya.md](docs/designs/izakaya.md).
+lab: [docs/designs/izakaya.md](docs/designs/izakaya.md). Shrift idea-keeper:
+wiki **Shrifts** tab at http://127.0.0.1:8787/?tab=shrift.
 
 Languages (via tree-sitter): C/C++, GLSL, Rust, Python, C#, TypeScript/TSX/Svelte/JS.
 Daslang (`.das`) uses a lightweight scanner by default; exact parsing is

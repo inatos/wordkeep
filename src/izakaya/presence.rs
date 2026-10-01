@@ -616,9 +616,8 @@ fn render_status(root: &Path, proj: &Projection, events: &[Event], args: &Value)
             if !matches {
                 continue;
             }
-        } else if agent.state == "checked_out" && !include_out {
-            continue;
-        } else if stale && want_agent.is_none() {
+        } else if (agent.state == "checked_out" && !include_out) || (stale && want_agent.is_none())
+        {
             continue;
         }
         if let Some(path) = want_path {

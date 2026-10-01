@@ -163,7 +163,10 @@ fn outline_one_into(
     let located = repo_map::symbols_located(parser, lang, &src);
     let baseline = (src.len() / 4) as u64;
     if located.is_empty() {
-        return Ok((format!("outline - {rel}: no top-level symbols found"), baseline));
+        return Ok((
+            format!("outline - {rel}: no top-level symbols found"),
+            baseline,
+        ));
     }
 
     let starts = line_starts(&src);
@@ -198,7 +201,8 @@ fn basename_candidate_list(root: &Path, args: &Value, file: &str) -> Option<Stri
         return None;
     }
     let prune = crate::walk::prune_set(root);
-    let search = config::paths_from_args(root, args).unwrap_or_else(|_| config::default_paths(root));
+    let search =
+        config::paths_from_args(root, args).unwrap_or_else(|_| config::default_paths(root));
     let mut matches = config::basename_matches(root, name, &prune, search);
     if matches.is_empty() {
         matches = config::basename_matches(root, name, &prune, vec!["".to_string()]);
@@ -318,8 +322,11 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("cbtest_outline_cand_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("src/nested")).unwrap();
-        std::fs::write(dir.join("src/nested/unique_outline_cand.cpp"), "int z() { return 0; }\n")
-            .unwrap();
+        std::fs::write(
+            dir.join("src/nested/unique_outline_cand.cpp"),
+            "int z() { return 0; }\n",
+        )
+        .unwrap();
         // Config default_paths → src so basename search finds the nested file when
         // resolve_file_with_args would otherwise fail on a bare basename that is
         // unique — here we pass a wrong path so not-found triggers candidates.

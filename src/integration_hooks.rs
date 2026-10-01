@@ -70,7 +70,9 @@ pub fn find(root: &Path, args: &Value) -> Result<String, String> {
 
         // Soften empty query terms: Ok with vocabulary hint (do not Err).
         if query.is_empty() && from.is_none() && to.is_none() {
-            out.push_str("\n(no query terms - listing vocabulary; pass query / from / to to filter)\n");
+            out.push_str(
+                "\n(no query terms - listing vocabulary; pass query / from / to to filter)\n",
+            );
             append_vocab_hint(&mut out, &sections);
         } else {
             let (matched_secs, mode) = select_sections(&sections, &q_tokens, from, to);
@@ -182,7 +184,10 @@ fn select_sections<'a>(
             continue;
         }
         let lower = sec.to_lowercase();
-        let hits = q_tokens.iter().filter(|t| lower.contains(t.as_str())).count();
+        let hits = q_tokens
+            .iter()
+            .filter(|t| lower.contains(t.as_str()))
+            .count();
         if hits >= 1 {
             scored.push((hits, sec));
         }

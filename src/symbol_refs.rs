@@ -213,7 +213,9 @@ pub fn find(root: &Path, args: &Value) -> Result<String, String> {
     }
 
     let mut out = if defs_only {
-        format!("symbol_refs - \"{symbol}\": {nd} def across {files_scanned} file(s) (definition-only)")
+        format!(
+            "symbol_refs - \"{symbol}\": {nd} def across {files_scanned} file(s) (definition-only)"
+        )
     } else {
         format!(
             "symbol_refs - \"{symbol}\": {nd} def, {nc} call, {nr} ref across {files_scanned} file(s)"
@@ -260,7 +262,9 @@ pub fn find(root: &Path, args: &Value) -> Result<String, String> {
 
     if shown == 0 && resume_at == 0 {
         out.push_str("(no matching occurrences)\n");
-        out.push_str(&crate::symbol_resolve::did_you_mean_hint(root, symbol, &paths));
+        out.push_str(&crate::symbol_resolve::did_you_mean_hint(
+            root, symbol, &paths,
+        ));
     }
     if let Some(idx) = truncated_at {
         continuation::append_footer(

@@ -319,9 +319,7 @@ fn resolve_digest_mode(args: &Value) -> bool {
             _ => {}
         }
     }
-    args.get("digest")
-        .and_then(Value::as_bool)
-        .unwrap_or(true)
+    args.get("digest").and_then(Value::as_bool).unwrap_or(true)
 }
 
 fn format_digest(defects: &[Defect], max: usize) -> String {
@@ -357,10 +355,7 @@ fn format_digest(defects: &[Defect], max: usize) -> String {
     if by_sub.is_empty() {
         out.push_str("by subsystem: (none)\n");
     } else {
-        let parts: Vec<String> = by_sub
-            .iter()
-            .map(|(k, n)| format!("{k}={n}"))
-            .collect();
+        let parts: Vec<String> = by_sub.iter().map(|(k, n)| format!("{k}={n}")).collect();
         out.push_str(&format!("by subsystem: {}\n", parts.join(", ")));
     }
     out.push_str("top:\n");

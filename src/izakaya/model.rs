@@ -449,17 +449,21 @@ mod tests {
             "stale agents must not enter base_divergence: {found:?}"
         );
         assert!(
-            !found.iter().any(|f| f.kind == "drift" && f.agents.iter().any(|id| id == "a")),
+            !found
+                .iter()
+                .any(|f| f.kind == "drift" && f.agents.iter().any(|id| id == "a")),
             "stale drift must be omitted: {found:?}"
+        );
+        assert!(
+            found.iter().any(|f| f.kind == "base_divergence"
+                && f.detail.contains("c base")
+                && f.detail.contains("d base")),
+            "live vs live divergence should remain: {found:?}"
         );
         assert!(
             found
                 .iter()
-                .any(|f| f.kind == "base_divergence" && f.detail.contains("c base") && f.detail.contains("d base")),
-            "live vs live divergence should remain: {found:?}"
-        );
-        assert!(
-            found.iter().any(|f| f.kind == "stale" && f.agents.iter().any(|id| id == "a")),
+                .any(|f| f.kind == "stale" && f.agents.iter().any(|id| id == "a")),
             "stale lease should still be reported: {found:?}"
         );
     }

@@ -84,6 +84,14 @@ else CMake/`Cargo.toml`/`package.json`, else the workspace folder name.
   Both dashboard pages share a `dq` filter (URL `?dq=`): space-separated
   substrings over Izakaya data and over MCP telemetry charts, tables, and
   overview totals. Session savings is not filtered.
+- Shrifts page (`?tab=shrift`): idea-keeper board over
+  `.wordkeep/notes/shrift/*.md` with freshness metrics, status filters,
+  collapsible results table, tag assign (garden store typeahead +
+  `POST /api/shrift/tags`), capture/touch/promote/archive/bookmark actions
+  (`GET/POST /api/shrift*`), dormant confirm-gated archive, and deep-links into
+  the reader. Bookmarks persist in `.wordkeep/shrift-bookmarks.json`
+  (Turso/libSQL migration target). Shares `dq` filter with dashboard when on
+  the Shrifts tab.
 - Dashboard charts (SVG, no chart npm deps): tokens-saved + calls bars, outcome
   donut with hover metrics, recent-savings line chart with axes + point hover;
   chart/section tooltips via `CHART_HELP` / `OUTCOME_HELP`
@@ -98,8 +106,8 @@ else CMake/`Cargo.toml`/`package.json`, else the workspace folder name.
 
 ## Deferred
 
-- Turso/libSQL user state (bookmarks/drafts)
-- Meilisearch hybrid/vector search
+- Turso/libSQL user state beyond Shrift bookmarks (drafts, generic bookmarks)
+- Meilisearch hybrid/vector search beyond Shrift Jaccard semantic mode
 - Azera intelligence (cited librarian, dream jobs) — design inspiration only;
   no runtime coupling
 - Runtime Memory Health UI/API is implemented (see
