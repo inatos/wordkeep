@@ -138,6 +138,9 @@ Copy [`.wordkeep/config.example.json`](.wordkeep/config.example.json) to your
   lines.
 - Continuity: `artifact_roots`, `commit_scopes`, `mas.*`, defects/runs — see
   [docs/designs/session_continuity.md](docs/designs/session_continuity.md).
+- SemIf: optional `"semif": { "enabled": true, "backend": "heuristic" }` for
+  `semantic_decide` and `knowledge_search` `semif:true` rerank (see
+  [docs/tools.md](docs/tools.md) and [CHANGELOG.md](CHANGELOG.md)).
 
 Environment variables:
 
@@ -152,7 +155,7 @@ CLI: `wordkeep run-record …` records gate metadata without executing commands.
 
 ## What you get
 
-58 MCP tools + 2 MCP resources (`wordkeep://readme`, `wordkeep://capabilities`), including:
+59 MCP tools + 2 MCP resources (`wordkeep://readme`, `wordkeep://capabilities`), including:
 
 | Tool | Use when you need |
 | --- | --- |
@@ -162,8 +165,9 @@ CLI: `wordkeep run-record …` records gate metadata without executing commands.
 | `symbol_refs` | Where a symbol is defined, called, referenced |
 | `call_graph` / `call_path` | Caller/callee blast radius or shortest chain |
 | `symbol_context` / `batch_context` | Body + one hop of graph + layout (one or many symbols) |
-| `knowledge_search` | Relevant docs/rules (and boosted open defects) |
+| `knowledge_search` | Relevant docs/rules (and boosted open defects); optional `semif:true` heuristic rerank |
 | `knowledge_answer` | Extractive answer + citations from the same index |
+| `semantic_decide` | SemIf-style typed option probabilities (heuristic v1; no answer decoding) |
 | `session_handoff` | Paste-ready next-session prime |
 | `defect_list` / `run_history` | Unresolved blockers (digest by default) and recent gate evidence |
 | `session_pressure` | Heuristic context-pressure signal (+ autopilot draft when high) |

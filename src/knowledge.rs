@@ -4,7 +4,9 @@
 //! with Okapi BM25. Zero dependencies, fully deterministic, no model download - a
 //! strong offline baseline. With `--features embeddings`, the BM25 head is reranked
 //! by a small local embedding model (see embed.rs); BM25 stays the fallback.
-//! `knowledge_answer` builds an extractive synthesis + citations from the same pipeline.
+//! Pass `semif:true` to optionally rerank the BM25 head with the SemIf heuristic
+//! scorer ([`crate::semif`]). `knowledge_answer` builds an extractive synthesis +
+//! citations from the same pipeline.
 
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -14,7 +16,7 @@ use wordkeep_knowledge::chunk_bodies;
 
 use crate::cache::{self, DiskMap};
 use crate::continuation::{self, KIND_HIT_SKIP};
-use crate::{coeffects, config, defects, effect_journal, mas, progress, stats, walk};
+use crate::{coeffects, config, defects, effect_journal, mas, progress, semif, stats, walk};
 
 #[cfg(feature = "embeddings")]
 mod embed;
@@ -172,27 +174,62 @@ fn retrieve(root: &Path, args: &Value) -> Result<Retrieval, String> {
             scored.push((score, i));
         }
     }
-    scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+      scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
 
-    // Optional semantic rerank of the BM25 head (opt-in `embeddings` feature).
-    #[cfg(feature = "embeddings")]
-    let scored = if args
-        .get("semantic")
-        .and_then(Value::as_bool)
-        .unwrap_or(true)
-    {
-        match embed::rerank(&query, &chunks, scored.clone()) {
-            Ok(reranked) => reranked,
-            Err(e) => {
-                eprintln!("[wordkeep] semantic rerank unavailable, using BM25: {e}");
-                scored
-            }
-        }
-    } else {
-        scored
-    };
+      // Optional semantic rerank of the BM25 head (opt-in `embeddings` feature).
+      #[cfg(feature = "embeddings")]
+      let scored = if args
+          .get("semantic")
+          .and_then(Value::as_bool)
+          .unwrap_or(true)
+      {
+          match embed::rerank(&query, &chunks, scored.clone()) {
+              Ok(reranked) => reranked,
+              Err(e) => {
+                  eprintln!("[wordkeep] semantic rerank unavailable, using BM25: {e}");
+                  scored
+              }
+          }
+      } else {
+          scored
+      };
 
-    let hits = scored
+      // Optional SemIf heuristic rerank (distinct from embedding `semantic`).
+      // Also used as a soft fallback when `semantic:true` but embeddings are off.
+      let want_semif = args
+          .get("semif")
+          .and_then(Value::as_bool)
+          .unwrap_or(false)
+          || {
+              #[cfg(not(feature = "embeddings"))]
+              {
+                  args.get("semantic")
+                      .and_then(Value::as_bool)
+                      .unwrap_or(false)
+              }
+              #[cfg(feature = "embeddings")]
+              {
+                  false
+              }
+          };
+      let scored = if want_semif {
+          let candidates: Vec<(String, String)> = chunks
+              .iter()
+              .map(|c| (c.heading.clone(), c.body.clone()))
+              .collect();
+          let bm25 = scored.clone();
+          match semif::rerank_knowledge(root, &query, &candidates, scored) {
+              Ok((reranked, _fallback)) => reranked,
+              Err(e) => {
+                  eprintln!("[wordkeep] semif knowledge rerank unavailable, using BM25: {e}");
+                  bm25
+              }
+          }
+      } else {
+          scored
+      };
+
+      let hits = scored
         .into_iter()
         .map(|(score, idx)| {
             let c = &chunks[idx];

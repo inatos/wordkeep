@@ -4142,6 +4142,7 @@ dependencies = [
  "fs2",
  "ratatui",
  "serde_json",
+ "sha2",
  "tree-sitter",
  "tree-sitter-c-sharp",
  "tree-sitter-cpp",

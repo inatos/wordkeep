@@ -38,6 +38,7 @@ mod progress;
 pub mod repo_map;
 mod runs;
 mod runtime;
+mod semif;
 mod session_pressure;
 mod shrift;
 mod stats;

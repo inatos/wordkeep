@@ -29,6 +29,7 @@
 //!   * knowledge_search - BM25 retrieval over docs/, designs, and .cursor rules
 //!   * knowledge_answer - extractive synthesis + citations from the same BM25 pipeline
 //!   * knowledge_upsert - write/update a markdown section for knowledge_search
+//!   * semantic_decide  - SemIf-style typed option probabilities (heuristic v1)
 //!   * trace_summary    - condense a Tracy CSV export into the hottest zones (or diff two)
 //!   * trace_profile    - hitch workflow: max-sorted zones + diff_map + index_stale
 //!   * runtime_snapshot - summarize the latest Runtime Health census or a capture
@@ -103,6 +104,7 @@ mod progress;
 mod repo_map;
 mod runs;
 mod runtime;
+mod semif;
 mod session_pressure;
 mod shrift;
 mod stats;
@@ -238,6 +240,7 @@ fn main() {
     let root_kb = root.clone();
     let root_kb_answer = root.clone();
     let root_kb_upsert = root.clone();
+    let root_semif = root.clone();
     let root_trace = root.clone();
     let root_trace_profile = root.clone();
     let root_runtime_snapshot = root.clone();
@@ -792,7 +795,9 @@ fn main() {
                     "token_budget": { "type": "integer",
                                       "description": "Approx max tokens to return. Default 1200." },
                     "semantic": { "type": "boolean",
-                                  "description": "Rerank BM25 hits with embeddings (only when built with --features embeddings). Default true." },
+                                  "description": "Rerank BM25 hits with embeddings (only when built with --features embeddings). Default true. Without embeddings, semantic:true soft-falls back to SemIf heuristic rerank." },
+                    "semif": { "type": "boolean",
+                               "description": "Rerank BM25 head with SemIf heuristic scorer (semantic_decide). Default false. Distinct from embedding semantic." },
                     "continuation": continuation::schema_prop()
                 },
                 "required": ["query"]
@@ -819,7 +824,9 @@ fn main() {
                     "token_budget": { "type": "integer",
                                       "description": "Approx max tokens for the whole answer+citations output. Default 1200." },
                     "semantic": { "type": "boolean",
-                                  "description": "Rerank BM25 hits with embeddings (only when built with --features embeddings). Default true." }
+                                  "description": "Rerank BM25 hits with embeddings (only when built with --features embeddings). Default true. Without embeddings, semantic:true soft-falls back to SemIf heuristic rerank." },
+                    "semif": { "type": "boolean",
+                               "description": "Rerank BM25 head with SemIf heuristic scorer. Default false." }
                 },
                 "required": ["query"]
             }),
@@ -859,6 +866,45 @@ fn main() {
                 "required": ["path"]
             }),
             handler: Box::new(move |args| knowledge::upsert(&root_kb_upsert, args)),
+        },
+        mcp::Tool {
+            name: "semantic_decide",
+            description: "SemIf-style semantic decision: unstructured state + runtime question + \
+                          typed options → option probabilities (no answer decoding). v1 uses a \
+                          deterministic heuristic scorer; configure via .wordkeep/config.json \
+                          semif.backend. Pass batch:[{question,options},…] with a shared state for \
+                          multi-criterion scoring. Returns JSON with chosen, probabilities, \
+                          prompt_sha256, timing_us, and fallback.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string",
+                            "description": "Decision id (default \"decision\")." },
+                    "state": { "description": "Unstructured state: string, JSON object, or array." },
+                    "question": { "type": "string",
+                                  "description": "Runtime criterion / question." },
+                    "options": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "id": { "type": "string" },
+                                "description": { "type": "string" }
+                            },
+                            "required": ["id", "description"]
+                        },
+                        "description": "Typed options (2–16 typical)."
+                    },
+                    "top_k": { "type": "integer",
+                               "description": "Keep only the top-k options by probability." },
+                    "batch": {
+                        "type": "array",
+                        "description": "Shared-state batch: each row has id/question/options; state is taken from the top-level state field.",
+                        "items": { "type": "object" }
+                    }
+                }
+            }),
+            handler: Box::new(move |args| semif::decide(&root_semif, args)),
         },
         mcp::Tool {
             name: "trace_summary",

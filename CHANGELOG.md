@@ -5,6 +5,18 @@ All notable changes to wordkeep are documented here. The project follows
 
 ## [Unreleased]
 
+### Added (SemIf semantic decisions)
+
+- **MCP tool** `semantic_decide`: SemIf/OpenJev-style `state` + runtime `question` +
+  typed `options` → option probabilities (no answer decoding). v1 backend is a
+  deterministic keyword-overlap `HeuristicScorer`; pluggable via
+  `.wordkeep/config.json` `semif.backend`. Supports shared-state `batch` rows.
+- **`knowledge_search` / `knowledge_answer`**: optional `semif:true` reranks the
+  BM25 head with the same scorer (distinct from embedding `semantic`). Without
+  `--features embeddings`, `semantic:true` soft-falls back to SemIf.
+- Owned fixture: `tests/fixtures/semif/decisions.jsonl` (light audit; no model weights).
+- Surface is **59** tools.
+
 ## [0.4.3] - 2026-10-01
 
 Telemetry upgrade pass (token → accuracy → latency). Surface is **58** tools

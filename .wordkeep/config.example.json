@@ -21,6 +21,10 @@
     "auto_promote": false,
     "handoff_tokens": 1600
   },
+  "semif": {
+    "enabled": true,
+    "backend": "heuristic"
+  },
   "izakaya": {
     "ttl_secs": 300,
     "suspend_ttl_secs": 86400,

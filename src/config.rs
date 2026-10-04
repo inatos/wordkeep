@@ -258,6 +258,29 @@ pub fn mas_handoff_tokens(root: &Path) -> usize {
         .unwrap_or(1600)
 }
 
+/// Whether SemIf / `semantic_decide` is enabled (default true).
+pub fn semif_enabled(root: &Path) -> bool {
+    load_config(root)
+        .and_then(|cfg| {
+            cfg.get("semif")
+                .and_then(|m| m.get("enabled"))
+                .and_then(Value::as_bool)
+        })
+        .unwrap_or(true)
+}
+
+/// SemIf scorer backend name (default `"heuristic"`). Unknown names fall back in `semif::resolve_scorer`.
+pub fn semif_backend(root: &Path) -> String {
+    load_config(root)
+        .and_then(|cfg| {
+            cfg.get("semif")
+                .and_then(|m| m.get("backend"))
+                .and_then(Value::as_str)
+                .map(|s| s.to_string())
+        })
+        .unwrap_or_else(|| "heuristic".into())
+}
+
 fn izakaya_u64(root: &Path, key: &str, default: u64) -> u64 {
     load_config(root)
         .and_then(|cfg| {
@@ -524,6 +547,21 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         assert_eq!(default_paths(&dir), vec!["src".to_string()]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn semif_defaults_and_overrides() {
+        let dir = tmp("semif");
+        assert!(semif_enabled(&dir));
+        assert_eq!(semif_backend(&dir), "heuristic");
+        fs::write(
+            dir.join(".wordkeep/config.json"),
+            r#"{"semif":{"enabled":false,"backend":"torch"}}"#,
+        )
+        .unwrap();
+        assert!(!semif_enabled(&dir));
+        assert_eq!(semif_backend(&dir), "torch");
         let _ = fs::remove_dir_all(&dir);
     }
 

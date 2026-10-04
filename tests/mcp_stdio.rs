@@ -210,6 +210,7 @@ fn lists_all_tools() {
         "knowledge_search",
         "knowledge_answer",
         "knowledge_upsert",
+        "semantic_decide",
         "trace_summary",
         "trace_profile",
         "runtime_snapshot",
@@ -261,8 +262,8 @@ fn lists_all_tools() {
     );
     assert_eq!(
         names.len(),
-        58,
-        "expected 58 tools, got {}: {names:?}",
+        59,
+        "expected 59 tools, got {}: {names:?}",
         names.len()
     );
 }
@@ -329,9 +330,43 @@ fn resources_list_and_read_readme() {
         "params": { "uri": "wordkeep://capabilities" }
     }));
     let caps_text = caps["result"]["contents"][0]["text"].as_str().unwrap_or("");
-    assert!(caps_text.contains("\"tool_count\": 58"), "{caps}");
+    assert!(caps_text.contains("\"tool_count\": 59"), "{caps}");
     assert!(caps_text.contains("knowledge_upsert"), "{caps}");
     assert!(caps_text.contains("shrift_upsert"), "{caps}");
+}
+
+#[test]
+fn semantic_decide_scores_typed_options() {
+    let mut s = Server::start();
+    let text = s.tool_text(
+        "semantic_decide",
+        json!({
+            "id": "route-1",
+            "state": "Customer asks to reset a forgotten password and says the reset email never arrived.",
+            "question": "Which queue should handle this request?",
+            "options": [
+                {"id": "account_access", "description": "Account access and authentication support for password reset and email delivery."},
+                {"id": "billing", "description": "Billing and payment support for invoices and charges."},
+                {"id": "sales", "description": "Sales and product evaluation for new purchases."}
+            ]
+        }),
+    );
+    let v: Value = serde_json::from_str(&text).expect("json");
+    assert_eq!(v["chosen"], "account_access", "{text}");
+    assert_eq!(v["scorer"], "heuristic");
+    assert_eq!(v["fallback"], false);
+    assert_eq!(
+        v["prompt_sha256"].as_str().unwrap_or("").len(),
+        64,
+        "{text}"
+    );
+    let opts = v["options"].as_array().expect("options");
+    assert_eq!(opts.len(), 3);
+    let sum: f64 = opts
+        .iter()
+        .map(|o| o["probability"].as_f64().unwrap_or(0.0))
+        .sum();
+    assert!((sum - 1.0).abs() < 1e-6, "softmax sum={sum}");
 }
 
 #[test]
