@@ -16,6 +16,25 @@ pub fn should_commit_draft(probs: &[f64], qhat: f64) -> (bool, usize) {
     (set.len() == 1, set.len())
 }
 
+/// Top-1 minus top-2 probability (0 when fewer than two options).
+pub fn top_margin(probs: &[f64]) -> f64 {
+    if probs.is_empty() {
+        return 0.0;
+    }
+    let mut sorted = probs.to_vec();
+    sorted.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+    if sorted.len() == 1 {
+        return sorted[0];
+    }
+    sorted[0] - sorted[1]
+}
+
+/// Sharp enough to skip adaptive permute cycles: conformal singleton **or** margin.
+pub fn adaptive_sharp_enough(probs: &[f64], qhat: f64, margin_min: f64) -> bool {
+    let (singleton, _) = should_commit_draft(probs, qhat);
+    singleton || top_margin(probs) >= margin_min
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -35,7 +35,7 @@ daslang = ["dep:tree-sitter-language"]
 # default build, so the MCP server binary stays lean.
 dashboard = ["dep:ratatui"]
 # Optional Ereshkigal GGUF letter-logit scorer (llama.cpp). Default cargo test
-# stays heuristic-only; local Betwixt launchers pass this feature.
+# stays heuristic-only; Betwixt launchers pass ereshkigal-vulkan (GPU offload).
 ereshkigal = ["dep:ereshkigal-core"]
 ereshkigal-vulkan = ["ereshkigal", "ereshkigal-core/vulkan"]
 
@@ -45,7 +45,8 @@ sha2 = "0.10"
 walkdir = "2"
 fs2 = "0.4"
 wordkeep-knowledge = { path = "crates/wordkeep-knowledge" }
-ereshkigal-core = { git = "https://github.com/inatos/ereshkigal", optional = true }
+ereshkigal-lang = { path = "../ereshkigal/ereshkigal-lang" }
+ereshkigal-core = { path = "../ereshkigal/ereshkigal-core", optional = true }
 tree-sitter = "0.25"
 tree-sitter-cpp = "0.23"
 fastembed = { version = "4", optional = true }

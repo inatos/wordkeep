@@ -4,6 +4,9 @@
 # On each run: rebuild wordkeep-wiki into $WK/target when missing or older than sources.
 # Opt out of attach: WIKI_RUNTIME_ATTACH=0 ./wiki.sh
 # Opt out of auto-rebuild: WIKI_AUTO_REBUILD=0 ./wiki.sh
+# Cargo features: WORDKEEP_FEATURES (default embeddings,daslang,dashboard,ereshkigal-vulkan)
+# same as mcp.sh. Wiki crate has no GGUF features; the companion `wordkeep` binary
+# is rebuilt with that set so Dashboard/MCP stay on the Ereshkigal scorer.
 set -euo pipefail
 
 WK="$(cd "$(dirname "$0")" && pwd)"
@@ -35,6 +38,16 @@ if [[ "${1:-}" == "--restart" || "${1:-}" == "-f" || "${1:-}" == "--force" ]]; t
 fi
 # Set when ensure_wiki_bin actually ran cargo build.
 REBUILT_BIN=0
+
+# shellcheck source=ereshkigal_gpu.sh
+source "$WK/ereshkigal_gpu.sh"
+wordkeep_nvidia_icd
+
+wordkeep_features() {
+  # Vulkan llama.cpp by default (n_gpu_layers offload). CPU-only:
+  # WORDKEEP_FEATURES=embeddings,daslang,dashboard,ereshkigal
+  wordkeep_default_features
+}
 
 # Dashboard reads $XDG_CACHE_HOME/wordkeep/savings.json (same file MCP writes).
 # Live tests / eval harnesses often export XDG_CACHE_HOME to a temp dir; if the
@@ -112,9 +125,67 @@ newest_wiki_src_mtime() {
   printf '%s\n' "$newest"
 }
 
+newest_wordkeep_src_mtime() {
+  local newest=0
+  local t
+  while IFS= read -r t; do
+    [[ -n "$t" ]] || continue
+    if [[ "$t" -gt "$newest" ]]; then
+      newest="$t"
+    fi
+  done < <(
+    {
+      find "$WK/src" -type f \( -name '*.rs' -o -name 'Cargo.toml' \) \
+        -printf '%T@\n' 2>/dev/null || true
+      for f in "$WK/Cargo.toml" "$WK/Cargo.lock"; do
+        [[ -f "$f" ]] && stat -c '%Y' "$f" 2>/dev/null || true
+      done
+    } | cut -d. -f1
+  )
+  printf '%s\n' "$newest"
+}
+
+wordkeep_mcp_bin_stale() {
+  local mcp="$WK/target/release/wordkeep"
+  local src_mtime bin_mtime feats
+  feats="$(wordkeep_features)"
+  if [[ ! -x "$mcp" ]]; then
+    return 0
+  fi
+  bin_mtime=$(stat -c '%Y' "$mcp" 2>/dev/null || echo 0)
+  src_mtime="$(newest_wordkeep_src_mtime)"
+  if [[ "$src_mtime" -gt "$bin_mtime" ]]; then
+    return 0
+  fi
+  case ",$feats," in
+    *,ereshkigal,*|*,ereshkigal-vulkan,*)
+      if grep -a -q 'wordkeep built without --features ereshkigal' "$mcp" 2>/dev/null; then
+        return 0
+      fi
+      ;;
+  esac
+  case ",$feats," in
+    *,ereshkigal-vulkan,*)
+      if wordkeep_bin_missing_vulkan "$mcp"; then
+        return 0
+      fi
+      ;;
+  esac
+  return 1
+}
+
 build_wiki_bin() {
-  echo "[wordkeep:wiki] building wordkeep-wiki --release into $WK/target …" >&2
-  (cd "$WK" && CARGO_TARGET_DIR="$WK/target" cargo build -p wordkeep-wiki --release)
+  local feats
+  feats="$(wordkeep_features)"
+  echo "[wordkeep:wiki] building wordkeep-wiki + wordkeep --release (features=$feats) into $WK/target …" >&2
+  case ",$feats," in
+    *,ereshkigal-vulkan,*)
+      wordkeep_vulkan_cmake_env
+      wordkeep_wipe_cpu_llama_sys
+      ;;
+  esac
+  (cd "$WK" && CARGO_TARGET_DIR="$WK/target" cargo build -p wordkeep-wiki --release \
+    && CARGO_TARGET_DIR="$WK/target" cargo build -p wordkeep --release --features "$feats")
   REBUILT_BIN=1
 }
 
@@ -129,8 +200,12 @@ ensure_wiki_bin() {
   if bin="$(pick_bin)"; then
     bin_mtime=$(stat -c '%Y' "$bin" 2>/dev/null || echo 0)
     src_mtime="$(newest_wiki_src_mtime)"
-    if [[ "$AUTO_REBUILD" -eq 1 && "$src_mtime" -gt "$bin_mtime" ]]; then
-      echo "[wordkeep:wiki] $bin is older than crates/; rebuilding …" >&2
+    if [[ "$AUTO_REBUILD" -eq 1 ]] && { [[ "$src_mtime" -gt "$bin_mtime" ]] || wordkeep_mcp_bin_stale; }; then
+      if [[ "$src_mtime" -gt "$bin_mtime" ]]; then
+        echo "[wordkeep:wiki] $bin is older than crates/; rebuilding …" >&2
+      else
+        echo "[wordkeep:wiki] release wordkeep is missing, stale, or built without WORDKEEP_FEATURES; rebuilding …" >&2
+      fi
       build_wiki_bin
       bin="$(pick_bin)" || {
         echo "[wordkeep:wiki] rebuild succeeded but binary still missing" >&2
@@ -138,12 +213,12 @@ ensure_wiki_bin() {
       }
     elif [[ "$AUTO_REBUILD" -eq 0 && "$src_mtime" -gt "$bin_mtime" ]]; then
       echo "[wordkeep:wiki] warning: $bin is older than crates/; rebuild recommended:" >&2
-      echo "  (cd \"$WK\" && CARGO_TARGET_DIR=\"$WK/target\" cargo build -p wordkeep-wiki --release)" >&2
+      echo "  (cd \"$WK\" && CARGO_TARGET_DIR=\"$WK/target\" cargo build -p wordkeep-wiki --release && cargo build -p wordkeep --release --features $(wordkeep_features))" >&2
     fi
   else
     if [[ "$AUTO_REBUILD" -eq 0 ]]; then
       echo "[wordkeep:wiki] missing wordkeep-wiki binary." >&2
-      echo "  run: (cd \"$WK\" && CARGO_TARGET_DIR=\"$WK/target\" cargo build -p wordkeep-wiki --release)" >&2
+      echo "  run: (cd \"$WK\" && CARGO_TARGET_DIR=\"$WK/target\" cargo build -p wordkeep-wiki --release && cargo build -p wordkeep --release --features $(wordkeep_features))" >&2
       exit 1
     fi
     echo "[wordkeep:wiki] missing wordkeep-wiki binary — building …" >&2
@@ -359,6 +434,9 @@ fi
 ATTACH_ARGS=()
 if [[ "$RUNTIME_ATTACH" -eq 1 ]]; then
   ATTACH_ARGS+=(--runtime-attach)
+  # Wiki itself does not link ereshkigal; warm GGUF is MCP-side (main prefetch).
+  # Surface a reminder so Dashboard cold/warm fields come from a live MCP.
+  echo "[wordkeep:wiki] runtime-attach on — start mcp.sh so SemIf engines prefetch/warm" >&2
 fi
 echo "[wordkeep:wiki] starting $BIN serve --watch ${ATTACH_ARGS[*]:-} --root $ROOT"
 # Rotate chatty serve logs so folder-open relaunches do not grow forever.

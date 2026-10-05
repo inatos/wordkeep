@@ -155,7 +155,7 @@ CLI: `wordkeep run-record …` records gate metadata without executing commands.
 
 ## What you get
 
-59 MCP tools + 2 MCP resources (`wordkeep://readme`, `wordkeep://capabilities`), including:
+60 MCP tools + 2 MCP resources (`wordkeep://readme`, `wordkeep://capabilities`), including:
 
 | Tool | Use when you need |
 | --- | --- |
@@ -197,7 +197,8 @@ cargo build --release --features embeddings   # semantic rerank for knowledge_se
 cargo build --release --features daslang      # vendored Daslang grammar
 cargo run --features dashboard -- dashboard   # live stats terminal UI
 cargo build --release --features ereshkigal   # GGUF letter-logit SemIf (llama.cpp)
-# Local Betwixt: embeddings,daslang,dashboard,ereshkigal (+ ereshkigal-vulkan if ICD)
+# Local Betwixt: embeddings,daslang,dashboard,ereshkigal-vulkan (GPU offload)
+# CPU-only GGUF: embeddings,daslang,dashboard,ereshkigal
 # GUI: wordkeep-wiki serve → Dashboard → Ereshkigal when the MCP feature is on
 ```
 

@@ -14,7 +14,7 @@ during long walks (status only; the agent still sees one final text result).
 Default off — Cursor's Shared MCP client currently fatals on unrecognized
 progress tokens and drops the server connection.
 
-**Surface:** 59 tools + MCP resources `wordkeep://readme`, `wordkeep://capabilities`.
+**Surface:** 60 tools + MCP resources `wordkeep://readme`, `wordkeep://capabilities`.
 
 ## Navigation
 
@@ -56,6 +56,7 @@ progress tokens and drops the server connection.
 | `knowledge_answer` | `query` | Extractive synthesis + citations (shared BM25 pipeline) |
 | `knowledge_upsert` | `path` + mode fields | Write/update markdown section; optional `effect_session` for revertible writes |
 | `semantic_decide` | `state` + `question` + `options` (or `batch`) | SemIf-style option probabilities + `prompt_sha256` / timing (heuristic v1); see [semif.md](semif.md) |
+| `decree` | `method` + optional `lib` | Ereshkigal library `check`/`lint`/`run`/`test`/`decide`/`stats`; see [semif.md](semif.md) |
 
 ## Performance and workflow
 

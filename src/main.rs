@@ -30,6 +30,7 @@
 //!   * knowledge_answer - extractive synthesis + citations from the same BM25 pipeline
 //!   * knowledge_upsert - write/update a markdown section for knowledge_search
 //!   * semantic_decide  - SemIf-style typed option probabilities (heuristic v1)
+//!   * decree           - Ereshkigal library check/lint/run/test/decide/stats
 //!   * trace_summary    - condense a Tracy CSV export into the hottest zones (or diff two)
 //!   * trace_profile    - hitch workflow: max-sorted zones + diff_map + index_stale
 //!   * runtime_snapshot - summarize the latest Runtime Health census or a capture
@@ -84,6 +85,7 @@ mod continuation;
 #[cfg(feature = "dashboard")]
 mod dashboard;
 mod dead_code;
+mod decree;
 mod defects;
 mod diff_map;
 mod doc_comment;
@@ -105,6 +107,7 @@ mod repo_map;
 mod runs;
 mod runtime;
 mod semif;
+#[cfg(feature = "ereshkigal")]
 mod semif_cascade;
 mod semif_debias;
 #[cfg(feature = "ereshkigal")]
@@ -246,6 +249,7 @@ fn main() {
     let root_kb_answer = root.clone();
     let root_kb_upsert = root.clone();
     let root_semif = root.clone();
+    let root_decree = root.clone();
     let root_trace = root.clone();
     let root_trace_profile = root.clone();
     let root_runtime_snapshot = root.clone();
@@ -274,6 +278,7 @@ fn main() {
     let root_session_pressure = root.clone();
     let root_commit_scope = root.clone();
     let root_profile_upsert = root.clone();
+    let root_prefetch = root.clone();
     let root_izakaya = root;
 
     let mut raw_tools = vec![
@@ -910,6 +915,32 @@ fn main() {
                 }
             }),
             handler: Box::new(move |args| semif::decide(&root_semif, args)),
+        },
+        mcp::Tool {
+            name: "decree",
+            description: "Ereshkigal decision-language library tools. method=check|lint (in-process \
+                          parse of .esk/TOML), or method=run|test|decide|stats via a resident \
+                          `ereshkigal serve --stdio` child. Host-agnostic: no game/ECS wording. \
+                          Pass lib to override semif.decrees.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "method": {
+                        "type": "string",
+                        "enum": ["check", "lint", "run", "test", "decide", "stats"],
+                        "description": "check/lint do not need GGUF. run/test/decide/stats need the serve binary + GGUF."
+                    },
+                    "lib": { "type": "string",
+                             "description": "Decree library directory (default: semif.decrees)." },
+                    "decree": { "type": "string", "description": "Decree name for method=decide." },
+                    "program": { "type": "string", "description": "Program name for method=run." },
+                    "state": { "description": "JSON state for decide/run." },
+                    "split": { "type": "string",
+                               "description": "Gold split for method=test (dev|test|all)." }
+                },
+                "required": ["method"]
+            }),
+            handler: Box::new(move |args| decree::dispatch(&root_decree, args)),
         },
         mcp::Tool {
             name: "trace_summary",
@@ -1550,6 +1581,16 @@ fn main() {
         server_name: "wordkeep".to_string(),
         server_version: env!("CARGO_PKG_VERSION").to_string(),
     };
+
+    // Prefetch GGUF so the first agent `semantic_decide` is warm, not a ~2 s hitch.
+    #[cfg(feature = "ereshkigal")]
+    if config::semif_enabled(&root_prefetch) && config::semif_backend(&root_prefetch) != "heuristic"
+    {
+        match semif_gguf::ensure_loaded(&root_prefetch) {
+            Ok(()) => eprintln!("[wordkeep] semif engines prefetched (warm)"),
+            Err(e) => eprintln!("[wordkeep] semif prefetch skipped: {e}"),
+        }
+    }
 
     if let Err(e) = server.run() {
         eprintln!("[wordkeep] fatal: {e}");

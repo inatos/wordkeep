@@ -18,6 +18,7 @@ mod continuation;
 #[cfg(feature = "dashboard")]
 mod dashboard;
 mod dead_code;
+mod decree;
 mod defects;
 pub mod diff_map;
 mod doc_comment;

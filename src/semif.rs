@@ -195,17 +195,11 @@ fn resolve_scorer_ex(root: &Path, for_decide: bool) -> ResolvedScorer {
 fn resolve_ereshkigal(root: &Path, for_decide: bool) -> ResolvedScorer {
     #[cfg(feature = "ereshkigal")]
     {
+        let _ = for_decide;
         match crate::semif_gguf::ensure_loaded(root) {
             Ok(()) => {
-                let allow_cascade = if for_decide {
-                    config::semif_cascade_routing(root) == "conformal"
-                } else {
-                    config::semif_knowledge_cascade(root)
-                };
                 let scorer = crate::semif_gguf::EreshkigalScorer {
-                    allow_cascade,
                     mode: config::semif_mode(root),
-                    qhat: config::semif_cascade_qhat(root),
                 };
                 ResolvedScorer::Ready(Box::new(scorer), false)
             }
@@ -228,24 +222,48 @@ fn score_with_policy(
 ) -> Result<ScoreBundle, String> {
     let mut ident = scorer.score_detailed(req)?;
     match config::semif_debias(root).as_str() {
-        "none" | "" => Ok(ident),
+        "none" | "" => {}
         "pride" => {
             ident.averaged_probs =
                 Some(semif_debias::pride_from_identity(scorer, req, &ident.raw)?);
             ident.already_normalized = false;
-            Ok(ident)
         }
-        _ => {
+        "adaptive" => {
+            let (avg, ran) = semif_debias::adaptive_from_identity(
+                scorer,
+                req,
+                &ident.raw,
+                3,
+                config::semif_adaptive_qhat(root),
+                config::semif_adaptive_margin_min(root),
+            )?;
+            if ran {
+                ident.averaged_probs = Some(avg);
+                ident.already_normalized = false;
+                ident.cascade_source = Some("cascade-adaptive".into());
+            }
+        }
+        "permute" | _ => {
             ident.averaged_probs = Some(semif_debias::permute_from_identity(
                 scorer, req, &ident.raw, 3,
             )?);
             ident.already_normalized = false;
-            Ok(ident)
         }
     }
+    #[cfg(feature = "ereshkigal")]
+    if scorer.name() == "ereshkigal" && config::semif_cascade_routing(root) == "conformal" {
+        ident = crate::semif_gguf::escalate_cascade(
+            root,
+            req,
+            ident,
+            config::semif_cascade_qhat(root),
+        )?;
+    }
+    Ok(ident)
 }
 
 /// Score one decision; returns a fully filled [`DecisionResult`].
+#[cfg(test)]
 pub fn decide_one(scorer: &dyn Scorer, req: &DecisionRequest, force_fallback: bool) -> DecisionResult {
     decide_one_at(None, scorer, req, force_fallback)
 }
@@ -324,13 +342,19 @@ fn decide_one_at(
         .unwrap_or(heuristic_hash);
     let timing_us = t0.elapsed().as_micros() as u64;
     if let Some(root) = root {
+        #[cfg(feature = "ereshkigal")]
+        let warm = crate::semif_gguf::is_warm();
+        #[cfg(not(feature = "ereshkigal"))]
+        let warm = false;
         semif_telemetry::record_event(serde_json::json!({
             "id": req.id,
             "chosen": chosen,
             "timing_us": timing_us,
+            "warm": warm,
             "fallback": fallback,
             "scorer": scorer.name(),
             "cascade_source": bundle.cascade_source,
+            "cascade_set_size": bundle.cascade_set_size,
             "kind": "decide",
         }));
         let _ = root;

@@ -477,10 +477,11 @@ fn eval_new_tools_are_listed() {
         "shrift_upsert",
         "shrift_review",
         "semantic_decide",
+        "decree",
     ] {
         assert!(names.contains(&n), "missing {n} in {names:?}");
     }
-    assert_eq!(names.len(), 59, "surface drift: {names:?}");
+    assert_eq!(names.len(), 60, "surface drift: {names:?}");
 }
 
 fn extract_continuation(text: &str) -> Option<String> {

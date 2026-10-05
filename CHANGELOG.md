@@ -7,12 +7,17 @@ All notable changes to wordkeep are documented here. The project follows
 
 ### Changed (SemIf → Ereshkigal)
 
-- Optional `--features ereshkigal` git-deps [ereshkigal-core](https://github.com/inatos/ereshkigal).
+- Optional `--features ereshkigal` path-deps `tools/ereshkigal/ereshkigal-core`
+  (git submodule). `ereshkigal-lang` is always linked for `decree` check/lint.
   Local Betwixt launchers enable it with embeddings/daslang/dashboard (Vulkan when an ICD exists).
 - Production backend is GGUF letter logits (`direct-options-v1`), conformal cascade,
-  permute `(i+k)%n` debias, shared-prefix batch. Heuristic is explicit/`--no-default-features` only.
-- Wiki Dashboard **Ereshkigal** page (`GET /api/semif`) with 1080 Ti same-GGUF bakeoff captions.
-- Missing GGUF does not silently score as heuristic.
+  **adaptive** permute, Vulkan draft + CPU escalate + 4B verify (tandem).
+  Heuristic is explicit / hermetic tests / `--no-default-features` only.
+- Wiki Dashboard **Ereshkigal** page (`GET /api/semif`) with Vulkan-aware bakeoff captions.
+- Live MCP (1080 Ti, 2026-10-05 13:53): sharp **111 → 3.8 ms** `cascade-draft`;
+  first uncertain 4B **~3.1 s** `cascade-verify`, repeat **11 ms**. Cold MCP was ~2.4 s.
+- Missing GGUF does not silently score as heuristic. Shared process-global
+  `LlamaBackend` so tandem CPU + verify can load after GPU draft.
 
 ### Added (SemIf semantic decisions)
 
@@ -24,7 +29,7 @@ All notable changes to wordkeep are documented here. The project follows
   BM25 head with the same scorer (distinct from embedding `semantic`). Without
   `--features embeddings`, `semantic:true` soft-falls back to SemIf.
 - Owned fixture: `tests/fixtures/semif/decisions.jsonl` (light audit; no model weights).
-- Surface is **59** tools.
+- Surface is **60** tools (`decree` MCP + Ereshkigal path dep / submodule).
 
 ## [0.4.3] - 2026-10-01
 

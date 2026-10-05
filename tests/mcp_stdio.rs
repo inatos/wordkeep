@@ -89,6 +89,14 @@ impl Server {
             COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
         std::fs::create_dir_all(&workdir).expect("cwd");
+        // Hermetic fixture has no GGUF; pin heuristic so `--features ereshkigal*`
+        // does not fail `semantic_decide` on missing `semif.gguf`.
+        std::fs::create_dir_all(fixture.root.join(".wordkeep")).expect("semif cfg dir");
+        std::fs::write(
+            fixture.root.join(".wordkeep/config.json"),
+            r#"{"semif":{"enabled":true,"backend":"heuristic","debias":"none"}}"#,
+        )
+        .expect("semif cfg");
         let mut child = Command::new(env!("CARGO_BIN_EXE_wordkeep"))
             .arg("--root")
             .arg(&fixture.root)
@@ -211,6 +219,7 @@ fn lists_all_tools() {
         "knowledge_answer",
         "knowledge_upsert",
         "semantic_decide",
+        "decree",
         "trace_summary",
         "trace_profile",
         "runtime_snapshot",
@@ -262,8 +271,8 @@ fn lists_all_tools() {
     );
     assert_eq!(
         names.len(),
-        59,
-        "expected 59 tools, got {}: {names:?}",
+        60,
+        "expected 60 tools, got {}: {names:?}",
         names.len()
     );
 }
@@ -330,7 +339,7 @@ fn resources_list_and_read_readme() {
         "params": { "uri": "wordkeep://capabilities" }
     }));
     let caps_text = caps["result"]["contents"][0]["text"].as_str().unwrap_or("");
-    assert!(caps_text.contains("\"tool_count\": 59"), "{caps}");
+    assert!(caps_text.contains("\"tool_count\": 60"), "{caps}");
     assert!(caps_text.contains("knowledge_upsert"), "{caps}");
     assert!(caps_text.contains("shrift_upsert"), "{caps}");
 }
@@ -367,6 +376,22 @@ fn semantic_decide_scores_typed_options() {
         .map(|o| o["probability"].as_f64().unwrap_or(0.0))
         .sum();
     assert!((sum - 1.0).abs() < 1e-6, "softmax sum={sum}");
+}
+
+#[test]
+fn decree_check_lints_ereshkigal_std() {
+    let lib = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../ereshkigal/decrees");
+    if !lib.is_dir() {
+        return;
+    }
+    let mut s = Server::start();
+    let text = s.tool_text(
+        "decree",
+        json!({ "method": "check", "lib": lib.display().to_string() }),
+    );
+    let v: Value = serde_json::from_str(&text).expect("json");
+    assert_eq!(v["ok"], true, "{text}");
+    assert!(v["decrees"].as_u64().unwrap_or(0) >= 1, "{text}");
 }
 
 #[test]

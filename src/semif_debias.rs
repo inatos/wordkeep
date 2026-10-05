@@ -4,6 +4,7 @@
 //! (Zheng-style). `(i - k)` is the verified wrong mapping.
 
 use crate::semif::{softmax_labeled, DecisionRequest, OptionSpec, Scorer};
+use crate::semif_cascade;
 
 /// Average softmax over `cycles` cyclic rotations of option order.
 pub fn permute_average(
@@ -50,6 +51,27 @@ pub fn permute_from_identity(
         .zip(acc.iter())
         .map(|(o, s)| (o.id.clone(), *s / scale))
         .collect())
+}
+
+/// Adaptive permute: identity only when sharp; else full cyclic average.
+/// Returns `(averaged_probs, ran_extra_cycles)`.
+pub fn adaptive_from_identity(
+    scorer: &dyn Scorer,
+    req: &DecisionRequest,
+    identity_raw: &[(String, f64)],
+    cycles: usize,
+    qhat: f64,
+    margin_min: f64,
+) -> Result<(Vec<(String, f64)>, bool), String> {
+    let probs = softmax_labeled(identity_raw);
+    let p_only: Vec<f64> = probs.iter().map(|(_, p)| *p).collect();
+    if semif_cascade::adaptive_sharp_enough(&p_only, qhat, margin_min) {
+        return Ok((probs, false));
+    }
+    Ok((
+        permute_from_identity(scorer, req, identity_raw, cycles)?,
+        true,
+    ))
 }
 
 /// Identity plus reversed option order (opt-in; weaker than permute).
@@ -121,5 +143,61 @@ mod tests {
         assert_eq!(once[0].0, "yes");
         let sum: f64 = avg.iter().map(|(_, p)| *p).sum();
         assert!((sum - 1.0).abs() < 1e-6, "sum={sum}");
+    }
+
+    #[test]
+    fn adaptive_runs_when_margin_impossible() {
+        let req = DecisionRequest {
+            id: "p".into(),
+            state: "x".into(),
+            question: "Pick?".into(),
+            options: vec![
+                OptionSpec {
+                    id: "a".into(),
+                    description: "option a".into(),
+                },
+                OptionSpec {
+                    id: "b".into(),
+                    description: "option b".into(),
+                },
+                OptionSpec {
+                    id: "c".into(),
+                    description: "option c".into(),
+                },
+            ],
+        };
+        let s = HeuristicScorer;
+        let ident = s.score_one(&req).unwrap();
+        let (_avg, ran) = adaptive_from_identity(&s, &req, &ident, 3, 0.1, 0.99).unwrap();
+        assert!(ran, "margin_min=0.99 should force permute cycles");
+    }
+
+    #[test]
+    fn adaptive_skips_when_margin_zero() {
+        let req = DecisionRequest {
+            id: "p".into(),
+            state: "alpha evidence matches yes strongly".into(),
+            question: "Pick yes?".into(),
+            options: vec![
+                OptionSpec {
+                    id: "yes".into(),
+                    description: "alpha evidence yes strongly".into(),
+                },
+                OptionSpec {
+                    id: "no".into(),
+                    description: "unrelated zebra".into(),
+                },
+            ],
+        };
+        let s = HeuristicScorer;
+        let ident = s.score_one(&req).unwrap();
+        let probs = softmax_labeled(&ident);
+        let margin = crate::semif_cascade::top_margin(
+            &probs.iter().map(|(_, p)| *p).collect::<Vec<_>>(),
+        );
+        assert!(margin > 0.0, "heuristic should peak on yes");
+        let (_avg, ran) = adaptive_from_identity(&s, &req, &ident, 2, 0.1, 0.0).unwrap();
+        // margin_min=0 always treats any positive margin as sharp enough.
+        assert!(!ran, "margin_min=0 should skip extra cycles when margin>0");
     }
 }

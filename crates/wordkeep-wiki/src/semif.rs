@@ -30,16 +30,20 @@ pub(crate) fn build() -> Result<Value, String> {
         "events": events,
         "bakeoff": [
             {
-                "value": "0.6B 144/144, max |Δp| ≈ 0",
-                "caption": "1080 Ti 2026-10-04 21:42Z, same Q8. Esk 0.480 s/row vs Python SemIf 0.480 s/row (llamacpp CPU). Tight 1e-6 gate."
+                "value": "CPU 0.6B 144/144, max |Δp| ≈ 0 @ 1e-6",
+                "caption": "1080 Ti CPU ggml vs Python SemIf (2026-10-05). Bit-exact gate. ~0.49 s/row."
             },
             {
-                "value": "bartowski 4B 3/3, max Δp 0.0053",
-                "caption": "1080 Ti, same bartowski Q4_K_M, 1e-2 gate. ABI / Qwen3.5 hybrid KV, not a 1e-6 CI pin."
+                "value": "Vulkan 0.6B 144/144 argmax+SHA, ~0.089 s/row",
+                "caption": "1080 Ti Vulkan n_gpu_layers=99. Max |Δp|~0.25 vs Python — smoke gate only, never 1e-6."
             },
             {
-                "value": "Wordkeep 7-row p50 575 ms none / 2176 ms permute",
-                "caption": "Fresh-process draft 0.6B on this 1080 Ti. Same GGUF hash. Not heuristic µs."
+                "value": "Vulkan bartowski 4B 3/3 @ 1e-2, ~0.51 s/row",
+                "caption": "Same-host Vulkan verify path. ~6× vs CPU Python. Not a BF16 quality claim."
+            },
+            {
+                "value": "Wordkeep permute p50 ~226 ms (Vulkan)",
+                "caption": "Fresh-process draft 0.6B on this 1080 Ti. Adaptive skips cycles when sharp. Not heuristic µs."
             },
             {
                 "value": "SemIf published BF16 ~0.813",
@@ -57,7 +61,11 @@ mod tests {
     fn bakeoff_has_honest_captions() {
         let v = build().unwrap();
         let rows = v["bakeoff"].as_array().unwrap();
-        assert_eq!(rows.len(), 4);
-        assert!(rows[3]["caption"].as_str().unwrap().contains("Different checkpoint"));
+        assert_eq!(rows.len(), 5);
+        assert!(rows[1]["caption"].as_str().unwrap().contains("smoke gate"));
+        assert!(rows[4]["caption"]
+            .as_str()
+            .unwrap()
+            .contains("Different checkpoint"));
     }
 }

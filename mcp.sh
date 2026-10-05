@@ -4,36 +4,35 @@ set -euo pipefail
 WK="$(cd "$(dirname "$0")" && pwd)"
 export CARGO_TARGET_DIR="$WK/target"
 
+# shellcheck source=ereshkigal_gpu.sh
+source "$WK/ereshkigal_gpu.sh"
+wordkeep_nvidia_icd
+
 wordkeep_features() {
-  # CPU GGUF by default. Vulkan llama.cpp cmake is opt-in (WORDKEEP_FEATURES=...ereshkigal-vulkan)
-  # — a half-configured llama-cpp-sys-2 build dir has no Makefile and fails wiki/MCP launch.
-  printf '%s\n' "${WORDKEEP_FEATURES:-embeddings,daslang,dashboard,ereshkigal}"
+  # Vulkan llama.cpp by default so n_gpu_layers offloads. CPU-only:
+  # WORDKEEP_FEATURES=embeddings,daslang,dashboard,ereshkigal
+  wordkeep_default_features
 }
 
 pick_bin() {
+  # Prefer release: cargo test / default debug builds omit --features ereshkigal
+  # and win a newest-mtime race against an older GGUF-linked release binary.
   local release="$WK/target/release/wordkeep"
   local debug="$WK/target/debug/wordkeep"
-  local best=""
-  local best_mtime=0
-  local cand mtime
-  for cand in "$release" "$debug"; do
-    if [[ -x "$cand" ]]; then
-      mtime=$(stat -c '%Y' "$cand" 2>/dev/null || echo 0)
-      if [[ -z "$best" || "$mtime" -gt "$best_mtime" ]]; then
-        best="$cand"
-        best_mtime="$mtime"
-      fi
-    fi
-  done
-  if [[ -z "$best" ]]; then
-    return 1
+  if [[ -x "$release" ]]; then
+    printf '%s\n' "$release"
+    return 0
   fi
-  printf '%s\n' "$best"
+  if [[ -x "$debug" ]]; then
+    printf '%s\n' "$debug"
+    return 0
+  fi
+  return 1
 }
 
 BIN="$(pick_bin)" || {
   echo "[wordkeep:mcp] missing wordkeep binary." >&2
-  echo "  run: (cd \"$WK\" && CARGO_TARGET_DIR=\"$WK/target\" cargo build --release --features embeddings,daslang,dashboard,ereshkigal)" >&2
+  echo "  run: (cd \"$WK\" && CARGO_TARGET_DIR=\"$WK/target\" cargo build --release --features embeddings,daslang,dashboard,ereshkigal-vulkan)" >&2
   dev_rebuild="$WK/../dev/rebuild_wordkeep.sh"
   if [[ -x "$dev_rebuild" ]]; then
     echo "  or: $dev_rebuild  # when wordkeep lives under tools/wordkeep in this repo" >&2
@@ -50,13 +49,15 @@ fi
 BIN_MTIME=$(stat -c '%Y' "$BIN" 2>/dev/null || echo 0)
 if [[ -n "${NEWEST_SRC:-}" && "$NEWEST_SRC" -gt "$BIN_MTIME" ]]; then
   echo "[wordkeep:mcp] warning: $BIN is older than src/; rebuild recommended:" >&2
-  echo "  (cd \"$WK\" && CARGO_TARGET_DIR=\"$WK/target\" cargo build --release --features embeddings,daslang,dashboard,ereshkigal)  # then reload MCP" >&2
+  echo "  (cd \"$WK\" && CARGO_TARGET_DIR=\"$WK/target\" cargo build --release --features embeddings,daslang,dashboard,ereshkigal-vulkan)  # then reload MCP" >&2
   dev_rebuild="$WK/../dev/rebuild_wordkeep.sh"
   if [[ -x "$dev_rebuild" ]]; then
     echo "  or: $dev_rebuild" >&2
   fi
   if [[ "${WORDKEEP_AUTO_REBUILD:-}" == "1" ]]; then
     echo "[wordkeep:mcp] WORDKEEP_AUTO_REBUILD=1 — rebuilding into $WK/target ..." >&2
+    wordkeep_vulkan_cmake_env || true
+    wordkeep_wipe_cpu_llama_sys
     if ! (cd "$WK" && CARGO_TARGET_DIR="$WK/target" cargo build --release --features "$(wordkeep_features)"); then
       echo "[wordkeep:mcp] auto-rebuild failed; continuing with stale binary" >&2
     else
@@ -66,6 +67,21 @@ if [[ -n "${NEWEST_SRC:-}" && "$NEWEST_SRC" -gt "$BIN_MTIME" ]]; then
       }
     fi
   fi
+fi
+
+if [[ "${WORDKEEP_AUTO_REBUILD:-}" == "1" ]]; then
+  case ",$(wordkeep_features)," in
+    *,ereshkigal-vulkan,*)
+      if wordkeep_bin_missing_vulkan "$BIN"; then
+        echo "[wordkeep:mcp] release binary has no ggml-vulkan — rebuilding GPU llama.cpp …" >&2
+        wordkeep_vulkan_cmake_env || true
+        wordkeep_wipe_cpu_llama_sys
+        if (cd "$WK" && CARGO_TARGET_DIR="$WK/target" cargo build --release --features "$(wordkeep_features)"); then
+          BIN="$(pick_bin)" || true
+        fi
+      fi
+      ;;
+  esac
 fi
 
 echo "[wordkeep:mcp] using $BIN" >&2

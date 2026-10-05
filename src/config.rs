@@ -307,9 +307,47 @@ pub fn semif_mode(root: &Path) -> String {
     semif_str(root, "mode").unwrap_or_else(|| "shared".into())
 }
 
-/// Debias: `none` | `permute` | `pride`.
+/// Debias: `none` | `permute` | `pride` | `adaptive`.
 pub fn semif_debias(root: &Path) -> String {
-    semif_str(root, "debias").unwrap_or_else(|| "permute".into())
+    semif_str(root, "debias").unwrap_or_else(|| "adaptive".into())
+}
+
+/// Vulkan draft + CPU escalate when conformal will not commit.
+/// Default true when built with `ereshkigal-vulkan`; ignored without GGUF feature.
+pub fn semif_tandem(root: &Path) -> bool {
+    load_config(root)
+        .and_then(|cfg| {
+            cfg.get("semif")
+                .and_then(|m| m.get("tandem"))
+                .and_then(Value::as_bool)
+        })
+        .unwrap_or_else(|| cfg!(feature = "ereshkigal-vulkan"))
+}
+
+/// Adaptive debias: conformal qhat used to decide whether extra permute cycles run.
+#[cfg(any(test, feature = "ereshkigal"))]
+pub fn semif_adaptive_qhat(root: &Path) -> f64 {
+    load_config(root)
+        .and_then(|cfg| {
+            cfg.get("semif")
+                .and_then(|m| m.get("adaptive"))
+                .and_then(|a| a.get("qhat"))
+                .and_then(Value::as_f64)
+        })
+        .unwrap_or_else(|| semif_cascade_qhat(root))
+}
+
+/// Adaptive debias: skip permute cycles when top1−top2 ≥ this margin.
+#[cfg(any(test, feature = "ereshkigal"))]
+pub fn semif_adaptive_margin_min(root: &Path) -> f64 {
+    load_config(root)
+        .and_then(|cfg| {
+            cfg.get("semif")
+                .and_then(|m| m.get("adaptive"))
+                .and_then(|a| a.get("margin_min"))
+                .and_then(Value::as_f64)
+        })
+        .unwrap_or(0.15)
 }
 
 /// Draft GGUF path (`semif.gguf` or `ERESHKIGAL_GGUF`).
@@ -332,10 +370,12 @@ pub fn semif_gguf_verify_path(root: &Path) -> Option<PathBuf> {
     semif_str(root, "gguf_verify").map(|p| resolve_semif_path(root, &p))
 }
 
+#[cfg(any(test, feature = "ereshkigal"))]
 pub fn semif_tokenizer_source(root: &Path) -> String {
     semif_str(root, "tokenizer_source").unwrap_or_else(|| "Qwen/Qwen3-0.6B".into())
 }
 
+#[cfg(any(test, feature = "ereshkigal"))]
 pub fn semif_tokenizer_revision(root: &Path) -> String {
     semif_str(root, "tokenizer_revision")
         .unwrap_or_else(|| "c1899de289a04d12100db370d81485cdf75e47ca".into())
@@ -351,6 +391,7 @@ pub fn semif_n_gpu_layers(root: &Path) -> u32 {
         .unwrap_or(99) as u32
 }
 
+#[cfg(any(test, feature = "ereshkigal"))]
 pub fn semif_threads(root: &Path) -> i32 {
     load_config(root)
         .and_then(|cfg| {
@@ -374,6 +415,7 @@ pub fn semif_cascade_routing(root: &Path) -> String {
         .unwrap_or_else(|| "conformal".into())
 }
 
+#[cfg(any(test, feature = "ereshkigal"))]
 pub fn semif_cascade_qhat(root: &Path) -> f64 {
     load_config(root)
         .and_then(|cfg| {
@@ -403,6 +445,7 @@ pub fn semif_knowledge_debias(root: &Path) -> String {
 
 /// llama.cpp sequences. Wordkeep scores `direct` one seq at a time; `n_seq_max>1`
 /// shrinks per-seq KV on some backends and caused `NoKvCacheSlot` on knowledge heads.
+#[cfg(any(test, feature = "ereshkigal"))]
 pub fn semif_n_seq_max(root: &Path) -> u32 {
     load_config(root)
         .and_then(|cfg| {
@@ -415,7 +458,43 @@ pub fn semif_n_seq_max(root: &Path) -> u32 {
 }
 
 pub fn semif_decrees_path(root: &Path) -> Option<PathBuf> {
-    semif_str(root, "decrees").map(|p| resolve_semif_path(root, &p))
+    if let Some(p) = semif_str(root, "decrees") {
+        return Some(resolve_semif_path(root, &p));
+    }
+    let candidates = [
+        root.join("tools/ereshkigal/decrees"),
+        root.join("decrees"),
+    ];
+    candidates.into_iter().find(|p| p.is_dir())
+}
+
+/// Optional path to the `ereshkigal` language CLI for the resident serve bridge.
+pub fn semif_serve_bin(root: &Path) -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("ERESHKIGAL_BIN") {
+        if !p.trim().is_empty() {
+            return Some(PathBuf::from(p.trim()));
+        }
+    }
+    if let Some(p) = semif_str(root, "serve_bin") {
+        return Some(resolve_semif_path(root, &p));
+    }
+    // Prefer Vulkan CLI when Wordkeep itself is Vulkan-linked.
+    #[cfg(feature = "ereshkigal-vulkan")]
+    {
+        let vk = root.join("tools/ereshkigal/target-vulkan/release/ereshkigal");
+        if vk.is_file() {
+            return Some(vk);
+        }
+    }
+    let rel = root.join("tools/ereshkigal/target/release/ereshkigal");
+    if rel.is_file() {
+        return Some(rel);
+    }
+    let dbg = root.join("tools/ereshkigal/target/debug/ereshkigal");
+    if dbg.is_file() {
+        return Some(dbg);
+    }
+    None
 }
 
 fn resolve_semif_path(root: &Path, p: &str) -> PathBuf {
@@ -702,14 +781,21 @@ mod tests {
         assert!(semif_enabled(&dir));
         assert_eq!(semif_backend(&dir), default_semif_backend());
         assert_eq!(semif_knowledge_debias(&dir), "none");
+        assert_eq!(semif_debias(&dir), "adaptive");
+        assert!((semif_adaptive_margin_min(&dir) - 0.15).abs() < 1e-9);
         assert_eq!(semif_n_seq_max(&dir), 1);
+        assert_eq!(semif_tandem(&dir), cfg!(feature = "ereshkigal-vulkan"));
         fs::write(
             dir.join(".wordkeep/config.json"),
-            r#"{"semif":{"enabled":false,"backend":"torch"}}"#,
+            r#"{"semif":{"enabled":false,"backend":"torch","debias":"permute","tandem":false,"adaptive":{"qhat":0.2,"margin_min":0.25}}}"#,
         )
         .unwrap();
         assert!(!semif_enabled(&dir));
         assert_eq!(semif_backend(&dir), "torch");
+        assert_eq!(semif_debias(&dir), "permute");
+        assert!(!semif_tandem(&dir));
+        assert!((semif_adaptive_qhat(&dir) - 0.2).abs() < 1e-9);
+        assert!((semif_adaptive_margin_min(&dir) - 0.25).abs() < 1e-9);
         let _ = fs::remove_dir_all(&dir);
     }
 
