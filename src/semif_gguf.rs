@@ -12,9 +12,21 @@ struct Live {
     draft: Mutex<ereshkigal_core::score::Scorer>,
     /// Same draft GGUF with `n_gpu_layers=0` for accuracy escalate (tandem).
     cpu_draft: Option<Mutex<ereshkigal_core::score::Scorer>>,
-    verify: Option<Mutex<ereshkigal_core::score::Scorer>>,
+    /// Verify GGUF path + load knobs; engine is loaded on first escalate (VRAM).
+    verify_cfg: Option<VerifyCfg>,
+    /// `None` = not attempted; `Some(Ok)` = loaded; `Some(Err)` = failed once.
+    verify: Mutex<Option<Result<Mutex<ereshkigal_core::score::Scorer>, String>>>,
     n_gpu_layers_used: u32,
     tandem: bool,
+}
+
+struct VerifyCfg {
+    path: std::path::PathBuf,
+    tok_src: String,
+    tok_rev: String,
+    threads: i32,
+    gpu: u32,
+    n_seq: u32,
 }
 
 static SLOT: Mutex<Option<Result<Arc<Live>, String>>> = Mutex::new(None);
@@ -43,6 +55,8 @@ fn load_one(
     threads: i32,
     n_gpu_layers: u32,
     n_seq_max: u32,
+    adapter: Option<&Path>,
+    adapter_scale: f32,
 ) -> Result<(ereshkigal_core::score::Scorer, u32), String> {
     let mut layers = n_gpu_layers;
     loop {
@@ -55,7 +69,8 @@ fn load_one(
             n_gpu_layers: layers,
             n_seq_max: n_seq_max.max(1),
             embeddings: false,
-            adapter: None,
+            adapter: adapter.map(|p| p.to_path_buf()),
+            adapter_scale,
         };
         match ereshkigal_core::EngineOwned::load(cfg) {
             Ok((engine, tok)) => {
@@ -66,7 +81,8 @@ fn load_one(
                 // Vocab / tokenizer mismatches will not heal by dropping GPU layers.
                 let retry_cpu = layers > 0
                     && !msg.contains("vocabulary disagrees")
-                    && !msg.contains("not a shared single token");
+                    && !msg.contains("not a shared single token")
+                    && !msg.contains("lora_adapter");
                 if retry_cpu {
                     eprintln!(
                         "[wordkeep] semif GPU load failed ({msg}); retrying CPU n_gpu_layers=0"
@@ -94,49 +110,88 @@ fn load_live(root: &Path) -> Result<Live, String> {
     let gpu = config::semif_n_gpu_layers(root);
     let n_seq = config::semif_n_seq_max(root);
     let tandem = config::semif_tandem(root) && gpu > 0;
-    match load_one(&gguf, &tok_src, &tok_rev, threads, gpu, n_seq) {
+    let adapter_path = config::semif_adapter_path(root).and_then(|p| {
+        if p.is_file() {
+            Some(p)
+        } else {
+            eprintln!(
+                "[wordkeep] semif.adapter missing ({}); continuing without LoRA",
+                p.display()
+            );
+            None
+        }
+    });
+    let adapter_ref = adapter_path.as_deref();
+    let adapter_scale = config::semif_adapter_scale(root);
+    match load_one(
+        &gguf,
+        &tok_src,
+        &tok_rev,
+        threads,
+        gpu,
+        n_seq,
+        adapter_ref,
+        adapter_scale,
+    ) {
         Ok((draft, used_layers)) => {
-                let cpu_draft = if tandem && used_layers > 0 {
-                    match load_one(&gguf, &tok_src, &tok_rev, threads, 0, n_seq) {
-                        Ok((s, _)) => Some(Mutex::new(s)),
-                        Err(e) => {
-                            eprintln!(
-                                "[wordkeep] tandem CPU draft load failed ({e}); continuing GPU-only"
-                            );
-                            None
-                        }
+            let cpu_draft = if tandem && used_layers > 0 {
+                match load_one(
+                    &gguf,
+                    &tok_src,
+                    &tok_rev,
+                    threads,
+                    0,
+                    n_seq,
+                    adapter_ref,
+                    adapter_scale,
+                ) {
+                    Ok((s, _)) => Some(Mutex::new(s)),
+                    Err(e) => {
+                        eprintln!(
+                            "[wordkeep] tandem CPU draft load failed ({e}); continuing GPU-only"
+                        );
+                        None
                     }
+                }
+            } else {
+                None
+            };
+            let verify_path = config::semif_gguf_verify_path(root);
+            let verify_cfg = verify_path.as_ref().and_then(|p| {
+                if !p.is_file() {
+                    return None;
+                }
+                let (v_src, v_rev) = verify_tokenizer(p, &tok_src, &tok_rev);
+                Some(VerifyCfg {
+                    path: p.clone(),
+                    tok_src: v_src,
+                    tok_rev: v_rev,
+                    threads,
+                    gpu,
+                    n_seq,
+                })
+            });
+            eprintln!(
+                "[wordkeep] semif engines: gpu_layers={used_layers} tandem={} verify={} adapter={}",
+                cpu_draft.is_some(),
+                if verify_cfg.is_some() {
+                    "lazy"
                 } else {
-                    None
-                };
-                let verify_path = config::semif_gguf_verify_path(root);
-                let verify = verify_path.as_ref().and_then(|p| {
-                    if !p.is_file() {
-                        return None;
-                    }
-                    let (v_src, v_rev) = verify_tokenizer(p, &tok_src, &tok_rev);
-                    match load_one(p, &v_src, &v_rev, threads, gpu, n_seq) {
-                        Ok((s, _)) => Some(Mutex::new(s)),
-                        Err(e) => {
-                            eprintln!(
-                                "[wordkeep] gguf_verify load failed ({e}); cascade-verify disabled"
-                            );
-                            None
-                        }
-                    }
-                });
-                eprintln!(
-                    "[wordkeep] semif engines: gpu_layers={used_layers} tandem={} verify={}",
-                    cpu_draft.is_some(),
-                    verify.is_some()
-                );
+                    "false"
+                },
+                adapter_path.is_some()
+            );
             let cold_ms = t0.elapsed().as_millis() as u64;
             let tandem_live = tandem && cpu_draft.is_some();
             semif_telemetry::write_status(
                 root,
                 json!({
                     "gguf_loaded": true,
-                    "gguf_verify_loaded": verify.is_some(),
+                    "gguf_verify_loaded": false,
+                    "gguf_verify_lazy": verify_cfg.is_some(),
+                    "adapter_loaded": adapter_path.is_some(),
+                    "adapter": adapter_path.as_ref().map(|p| p.display().to_string()),
+                    "adapter_scale": adapter_scale,
                     "n_gpu_layers_used": used_layers,
                     "tandem": tandem_live,
                     "cpu_draft_loaded": cpu_draft.is_some(),
@@ -151,7 +206,8 @@ fn load_live(root: &Path) -> Result<Live, String> {
             Ok(Live {
                 draft: Mutex::new(draft),
                 cpu_draft,
-                verify,
+                verify_cfg,
+                verify: Mutex::new(None),
                 n_gpu_layers_used: used_layers,
                 tandem: tandem_live,
             })
@@ -325,6 +381,118 @@ impl Scorer for EreshkigalScorer {
     }
 }
 
+fn bundle_probs(bundle: &ScoreBundle) -> Vec<f64> {
+    if let Some(ref avg) = bundle.averaged_probs {
+        avg.iter().map(|(_, p)| *p).collect()
+    } else {
+        crate::semif::softmax_labeled(&bundle.raw)
+            .into_iter()
+            .map(|(_, p)| p)
+            .collect()
+    }
+}
+
+/// Mark conformal commit on a draft/adaptive bundle. Returns true when draft wins.
+pub fn try_commit_draft(bundle: &mut ScoreBundle, qhat: f64) -> bool {
+    let probs = bundle_probs(bundle);
+    let (commit, set_n) = semif_cascade::should_commit_draft(&probs, qhat);
+    bundle.cascade_set_size = Some(set_n);
+    if !commit {
+        return false;
+    }
+    if bundle.cascade_source.as_deref() == Some("cascade-adaptive") {
+        // keep adaptive label
+    } else if bundle.averaged_probs.is_some() {
+        bundle.cascade_source = Some("cascade-adaptive".into());
+    } else {
+        bundle.cascade_source = Some("cascade-draft".into());
+    }
+    true
+}
+
+fn try_commit_labeled(bundle: &mut ScoreBundle, qhat: f64, source: &str) -> bool {
+    let probs = bundle_probs(bundle);
+    let (commit, set_n) = semif_cascade::should_commit_draft(&probs, qhat);
+    bundle.cascade_set_size = Some(set_n);
+    if commit {
+        bundle.cascade_source = Some(source.into());
+    }
+    commit
+}
+
+fn score_cpu_row(live: &Live, req: &DecisionRequest) -> Result<Option<ScoreBundle>, String> {
+    if !live.tandem {
+        return Ok(None);
+    }
+    let Some(cpu) = &live.cpu_draft else {
+        return Ok(None);
+    };
+    let row = to_row(req);
+    let cpu_res = score_engine(cpu, "direct", &row)?;
+    Ok(Some(ScoreBundle {
+        raw: logits_of(&cpu_res, &req.options),
+        already_normalized: false,
+        averaged_probs: None,
+        prompt_sha256: Some(cpu_res.prompt_sha256.clone()),
+        cascade_source: Some("cascade-cpu".into()),
+        cascade_set_size: None,
+    }))
+}
+
+fn apply_verify_row(
+    live: &Live,
+    root: &Path,
+    req: &DecisionRequest,
+    bundle: &mut ScoreBundle,
+) -> Result<(), String> {
+    let row = to_row(req);
+    match score_with_verify(live, root, &row)? {
+        Some(verify_res) => {
+            bundle.raw = logits_of(&verify_res, &req.options);
+            bundle.averaged_probs = None;
+            bundle.already_normalized = false;
+            bundle.prompt_sha256 = Some(verify_res.prompt_sha256);
+            bundle.cascade_source = Some("cascade-verify".into());
+        }
+        None => {
+            bundle.cascade_source = Some("cascade-skipped".into());
+        }
+    }
+    Ok(())
+}
+
+/// CPU then verify wavefront over residual indices (lazy 4B load once).
+pub fn escalate_residuals(
+    root: &Path,
+    reqs: &[DecisionRequest],
+    bundles: &mut [ScoreBundle],
+    residual: &[usize],
+    qhat: f64,
+) -> Result<(), String> {
+    if residual.is_empty() {
+        return Ok(());
+    }
+    let live = ensure_arc(root)?;
+    let mut need_verify: Vec<usize> = Vec::with_capacity(residual.len());
+    for &i in residual {
+        match score_cpu_row(&live, &reqs[i])? {
+            Some(mut cpu_b) => {
+                if try_commit_labeled(&mut cpu_b, qhat, "cascade-cpu") {
+                    bundles[i] = cpu_b;
+                } else {
+                    bundles[i] = cpu_b;
+                    need_verify.push(i);
+                }
+            }
+            None => need_verify.push(i),
+        }
+    }
+    for &i in &need_verify {
+        apply_verify_row(&live, root, &reqs[i], &mut bundles[i])?;
+    }
+    Ok(())
+}
+
 /// After draft (+ optional adaptive permute), escalate CPU then 4B verify.
 pub fn escalate_cascade(
     root: &Path,
@@ -332,64 +500,70 @@ pub fn escalate_cascade(
     mut bundle: ScoreBundle,
     qhat: f64,
 ) -> Result<ScoreBundle, String> {
-    let live = ensure_arc(root)?;
-    let probs: Vec<f64> = if let Some(ref avg) = bundle.averaged_probs {
-        avg.iter().map(|(_, p)| *p).collect()
-    } else {
-        crate::semif::softmax_labeled(&bundle.raw)
-            .into_iter()
-            .map(|(_, p)| p)
-            .collect()
-    };
-    let (commit, set_n) = semif_cascade::should_commit_draft(&probs, qhat);
-    bundle.cascade_set_size = Some(set_n);
-    if commit {
-        if bundle.cascade_source.as_deref() == Some("cascade-adaptive") {
-            // keep
-        } else if bundle.averaged_probs.is_some() {
-            bundle.cascade_source = Some("cascade-adaptive".into());
-        } else {
-            bundle.cascade_source = Some("cascade-draft".into());
-        }
+    if try_commit_draft(&mut bundle, qhat) {
         return Ok(bundle);
     }
-    let row = to_row(req);
-    if live.tandem {
-        if let Some(cpu) = &live.cpu_draft {
-            let cpu_res = score_engine(cpu, "direct", &row)?;
-            let cpu_bundle = ScoreBundle {
-                raw: logits_of(&cpu_res, &req.options),
-                already_normalized: false,
-                averaged_probs: None,
-                prompt_sha256: Some(cpu_res.prompt_sha256.clone()),
-                cascade_source: Some("cascade-cpu".into()),
-                cascade_set_size: None,
-            };
-            let cpu_probs: Vec<f64> = crate::semif::softmax_labeled(&cpu_bundle.raw)
-                .into_iter()
-                .map(|(_, p)| p)
-                .collect();
-            let (cpu_commit, cpu_n) = semif_cascade::should_commit_draft(&cpu_probs, qhat);
-            let mut out = cpu_bundle;
-            out.cascade_set_size = Some(cpu_n);
-            if cpu_commit {
-                out.cascade_source = Some("cascade-cpu".into());
-                return Ok(out);
+    let mut bundles = vec![bundle];
+    escalate_residuals(root, std::slice::from_ref(req), &mut bundles, &[0], qhat)?;
+    Ok(bundles.remove(0))
+}
+
+/// Lazily load the verify GGUF on first escalate that needs it (keeps prefetch off the 4B).
+fn score_with_verify(
+    live: &Live,
+    root: &Path,
+    row: &ereshkigal_core::DecisionRow,
+) -> Result<Option<ereshkigal_core::ScoreResult>, String> {
+    let mut g = live.verify.lock().map_err(|e| e.to_string())?;
+    if g.is_none() {
+        let Some(cfg) = &live.verify_cfg else {
+            return Ok(None);
+        };
+        eprintln!(
+            "[wordkeep] lazy-loading gguf_verify {}",
+            cfg.path.display()
+        );
+        match load_one(
+            &cfg.path,
+            &cfg.tok_src,
+            &cfg.tok_rev,
+            cfg.threads,
+            cfg.gpu,
+            cfg.n_seq,
+            None, // verify stays bare — LoRA targets draft 0.6B only
+            1.0,
+        ) {
+            Ok((s, layers)) => {
+                eprintln!("[wordkeep] gguf_verify loaded (gpu_layers={layers})");
+                *g = Some(Ok(Mutex::new(s)));
+                semif_telemetry::write_status(
+                    root,
+                    json!({
+                        "gguf_verify_loaded": true,
+                        "gguf_verify_lazy": true,
+                        "gguf_verify_error": null,
+                    }),
+                );
             }
-            bundle = out;
+            Err(e) => {
+                eprintln!("[wordkeep] gguf_verify load failed ({e}); cascade-verify disabled");
+                *g = Some(Err(e.clone()));
+                semif_telemetry::write_status(
+                    root,
+                    json!({
+                        "gguf_verify_loaded": false,
+                        "gguf_verify_lazy": true,
+                        "gguf_verify_error": e,
+                    }),
+                );
+                return Ok(None);
+            }
         }
     }
-    let Some(verify) = &live.verify else {
-        bundle.cascade_source = Some("cascade-skipped".into());
-        return Ok(bundle);
-    };
-    let verify_res = score_engine(verify, "direct", &row)?;
-    bundle.raw = logits_of(&verify_res, &req.options);
-    bundle.averaged_probs = None;
-    bundle.already_normalized = false;
-    bundle.prompt_sha256 = Some(verify_res.prompt_sha256);
-    bundle.cascade_source = Some("cascade-verify".into());
-    Ok(bundle)
+    match g.as_ref().expect("verify slot filled") {
+        Ok(verify) => Ok(Some(score_engine(verify, "direct", row)?)),
+        Err(_) => Ok(None),
+    }
 }
 
 /// Load GGUF engines for `root`. Returns Err if the draft checkpoint is missing.

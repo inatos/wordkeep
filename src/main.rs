@@ -918,17 +918,17 @@ fn main() {
         },
         mcp::Tool {
             name: "decree",
-            description: "Ereshkigal decision-language library tools. method=check|lint (in-process \
-                          parse of .esk/TOML), or method=run|test|decide|stats via a resident \
-                          `ereshkigal serve --stdio` child. Host-agnostic: no game/ECS wording. \
-                          Pass lib to override semif.decrees.",
+            description: "Ereshkigal decision-language library tools. method=check|lint|schema \
+                          (in-process parse of .esk/TOML / JSON Schema), or method=run|test|decide|stats \
+                          via a resident `ereshkigal serve --stdio` child. Host-agnostic: no game/ECS \
+                          wording. Pass lib to override semif.decrees.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "method": {
                         "type": "string",
-                        "enum": ["check", "lint", "run", "test", "decide", "stats"],
-                        "description": "check/lint do not need GGUF. run/test/decide/stats need the serve binary + GGUF."
+                        "enum": ["check", "lint", "schema", "run", "test", "decide", "stats"],
+                        "description": "check/lint/schema do not need GGUF. run/test/decide/stats need the serve binary + GGUF."
                     },
                     "lib": { "type": "string",
                              "description": "Decree library directory (default: semif.decrees)." },
@@ -1582,14 +1582,19 @@ fn main() {
         server_version: env!("CARGO_PKG_VERSION").to_string(),
     };
 
-    // Prefetch GGUF so the first agent `semantic_decide` is warm, not a ~2 s hitch.
+    // Prefetch GGUF in the background so MCP tools are available immediately;
+    // first decide that needs engines waits on the single-flight load.
     #[cfg(feature = "ereshkigal")]
     if config::semif_enabled(&root_prefetch) && config::semif_backend(&root_prefetch) != "heuristic"
     {
-        match semif_gguf::ensure_loaded(&root_prefetch) {
-            Ok(()) => eprintln!("[wordkeep] semif engines prefetched (warm)"),
-            Err(e) => eprintln!("[wordkeep] semif prefetch skipped: {e}"),
-        }
+        let root_bg = root_prefetch.clone();
+        std::thread::Builder::new()
+            .name("semif-prefetch".into())
+            .spawn(move || match semif_gguf::ensure_loaded(&root_bg) {
+                Ok(()) => eprintln!("[wordkeep] semif engines prefetched (warm, bg)"),
+                Err(e) => eprintln!("[wordkeep] semif prefetch skipped: {e}"),
+            })
+            .ok();
     }
 
     if let Err(e) = server.run() {

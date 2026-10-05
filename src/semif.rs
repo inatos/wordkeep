@@ -215,12 +215,12 @@ fn resolve_ereshkigal(root: &Path, for_decide: bool) -> ResolvedScorer {
     }
 }
 
-fn score_with_policy(
+fn apply_debias(
     root: &Path,
     scorer: &dyn Scorer,
     req: &DecisionRequest,
+    mut ident: ScoreBundle,
 ) -> Result<ScoreBundle, String> {
-    let mut ident = scorer.score_detailed(req)?;
     match config::semif_debias(root).as_str() {
         "none" | "" => {}
         "pride" => {
@@ -250,6 +250,15 @@ fn score_with_policy(
             ident.already_normalized = false;
         }
     }
+    Ok(ident)
+}
+
+fn score_with_policy(
+    root: &Path,
+    scorer: &dyn Scorer,
+    req: &DecisionRequest,
+) -> Result<ScoreBundle, String> {
+    let mut ident = apply_debias(root, scorer, req, scorer.score_detailed(req)?)?;
     #[cfg(feature = "ereshkigal")]
     if scorer.name() == "ereshkigal" && config::semif_cascade_routing(root) == "conformal" {
         ident = crate::semif_gguf::escalate_cascade(
@@ -260,6 +269,78 @@ fn score_with_policy(
         )?;
     }
     Ok(ident)
+}
+
+/// Draft-score all rows, compact uncertain indices, escalate CPU then verify (wavefront).
+fn decide_batch_wavefront(
+    root: &Path,
+    scorer: &dyn Scorer,
+    reqs: &[DecisionRequest],
+    state: &str,
+    force_fallback: bool,
+) -> Vec<DecisionResult> {
+    if reqs.is_empty() {
+        return Vec::new();
+    }
+    // Phase 1: draft logits (shared when Scorer supports it).
+    let draft_raw = match scorer.score_batch(state, reqs) {
+        Ok(v) if v.len() == reqs.len() => v,
+        Ok(_) | Err(_) => reqs
+            .iter()
+            .filter_map(|r| scorer.score_one(r).ok())
+            .collect(),
+    };
+    if draft_raw.len() != reqs.len() {
+        return reqs
+            .iter()
+            .map(|r| decide_one_at(Some(root), scorer, r, force_fallback))
+            .collect();
+    }
+    let mut bundles: Vec<ScoreBundle> = draft_raw
+        .into_iter()
+        .map(|raw| ScoreBundle {
+            raw,
+            already_normalized: false,
+            averaged_probs: None,
+            prompt_sha256: None,
+            cascade_source: Some("draft".into()),
+            cascade_set_size: None,
+        })
+        .collect();
+    for (i, req) in reqs.iter().enumerate() {
+        match apply_debias(root, scorer, req, bundles[i].clone()) {
+            Ok(b) => bundles[i] = b,
+            Err(e) => {
+                eprintln!("[wordkeep] semif batch debias error: {e}");
+                return reqs
+                    .iter()
+                    .map(|r| decide_one_at(Some(root), scorer, r, true))
+                    .collect();
+            }
+        }
+    }
+    #[cfg(feature = "ereshkigal")]
+    {
+        if scorer.name() == "ereshkigal" && config::semif_cascade_routing(root) == "conformal" {
+            let qhat = config::semif_cascade_qhat(root);
+            let mut residual: Vec<usize> = Vec::new();
+            for (i, b) in bundles.iter_mut().enumerate() {
+                if !crate::semif_gguf::try_commit_draft(b, qhat) {
+                    residual.push(i);
+                }
+            }
+            if let Err(e) =
+                crate::semif_gguf::escalate_residuals(root, reqs, &mut bundles, &residual, qhat)
+            {
+                eprintln!("[wordkeep] semif batch escalate error: {e}");
+            }
+        }
+    }
+    bundles
+        .into_iter()
+        .zip(reqs.iter())
+        .map(|(bundle, req)| decide_from_bundle(Some(root), scorer, req, bundle, force_fallback))
+        .collect()
 }
 
 /// Score one decision; returns a fully filled [`DecisionResult`].
@@ -274,7 +355,6 @@ fn decide_one_at(
     req: &DecisionRequest,
     force_fallback: bool,
 ) -> DecisionResult {
-    let t0 = Instant::now();
     let prompt = render_prompt(req);
     let heuristic_hash = sha256_hex(&prompt);
     let (bundle, fallback) = match root {
@@ -289,7 +369,7 @@ fn decide_one_at(
                     prompt_sha256: heuristic_hash,
                     scorer: scorer.name().into(),
                     scorer_revision: scorer.revision().into(),
-                    timing_us: t0.elapsed().as_micros() as u64,
+                    timing_us: 0,
                     calibrated: false,
                     fallback: true,
                     cascade_source: Some("error".into()),
@@ -320,7 +400,20 @@ fn decide_one_at(
             }
         },
     };
-    let probs = bundle.probs();
+    decide_from_bundle(root, scorer, req, bundle, fallback)
+}
+
+fn decide_from_bundle(
+    root: Option<&Path>,
+    scorer: &dyn Scorer,
+    req: &DecisionRequest,
+    bundle: ScoreBundle,
+    fallback: bool,
+) -> DecisionResult {
+    let t0 = Instant::now();
+    let heuristic_hash = sha256_hex(&render_prompt(req));
+    let temperature = root.map(config::semif_temperature).unwrap_or(1.0);
+    let (probs, calibrated) = apply_decision_temperature(&bundle, temperature);
     let chosen = probs
         .iter()
         .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
@@ -352,6 +445,8 @@ fn decide_one_at(
             "timing_us": timing_us,
             "warm": warm,
             "fallback": fallback,
+            "calibrated": calibrated,
+            "temperature": temperature,
             "scorer": scorer.name(),
             "cascade_source": bundle.cascade_source,
             "cascade_set_size": bundle.cascade_set_size,
@@ -367,11 +462,44 @@ fn decide_one_at(
         scorer: scorer.name().into(),
         scorer_revision: scorer.revision().into(),
         timing_us,
-        calibrated: false,
+        calibrated,
         fallback,
         cascade_source: bundle.cascade_source,
         cascade_set_size: bundle.cascade_set_size,
     }
+}
+
+/// Softmax option probs; when `temperature != 1`, scale logits (argmax-invariant).
+fn apply_decision_temperature(
+    bundle: &ScoreBundle,
+    temperature: f64,
+) -> (Vec<(String, f64)>, bool) {
+    let calibrated = temperature.is_finite() && (temperature - 1.0).abs() > 1e-12;
+    if !calibrated {
+        return (bundle.probs(), false);
+    }
+    let t = temperature.clamp(0.05, 10.0);
+    // Prefer identity logits; if only averaged probs exist, treat log-probs as logits.
+    let (ids, logits): (Vec<String>, Vec<f64>) = if let Some(avg) = &bundle.averaged_probs {
+        avg.iter()
+            .map(|(id, p)| (id.clone(), (*p).max(1e-300).ln()))
+            .unzip()
+    } else if bundle.already_normalized {
+        return (bundle.raw.clone(), false);
+    } else {
+        bundle
+            .raw
+            .iter()
+            .map(|(id, s)| (id.clone(), *s))
+            .unzip()
+    };
+    let scaled: Vec<f64> = logits.iter().map(|v| v / t).collect();
+    let probs = softmax_labeled(
+        &ids.into_iter()
+            .zip(scaled.into_iter())
+            .collect::<Vec<_>>(),
+    );
+    (probs, true)
 }
 
 /// MCP entry: parse args → score → JSON text.
@@ -401,64 +529,9 @@ pub fn decide(root: &Path, args: &Value) -> Result<String, String> {
             reqs.push(req);
         }
         let t0 = Instant::now();
-        // Prefers Scorer::score_batch (serial for heuristic; parallel for future backends).
-        let batch_raw = match scorer.score_batch(&state, &reqs) {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!("[wordkeep] semif batch scorer error, per-row fallback: {e}");
-                let results: Vec<_> = reqs
-                    .iter()
-                    .map(|r| decide_one_at(Some(root), scorer.as_ref(), r, true))
-                    .collect();
-                let out = json!({
-                    "mode": "batch",
-                    "state_chars": state.len(),
-                    "count": results.len(),
-                    "timing_us": t0.elapsed().as_micros() as u64,
-                    "results": results.iter().map(result_to_json).collect::<Vec<_>>(),
-                });
-                let text = serde_json::to_string_pretty(&out).map_err(|e| e.to_string())?;
-                stats::record("semantic_decide", 64, (text.len() / 4) as u64);
-                return Ok(text);
-            }
-        };
-        let mut results = Vec::with_capacity(reqs.len());
-        for (req, raw) in reqs.iter().zip(batch_raw.into_iter()) {
-            let prompt = render_prompt(req);
-            let probs = softmax_labeled(&raw);
-            let chosen = probs
-                .iter()
-                .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
-                .map(|(id, _)| id.clone())
-                .unwrap_or_default();
-            let options: Vec<OptionScore> = raw
-                .iter()
-                .zip(probs.iter())
-                .map(|((id, raw_score), (_, probability))| OptionScore {
-                    id: id.clone(),
-                    probability: *probability,
-                    raw_score: *raw_score,
-                })
-                .collect();
-            results.push(DecisionResult {
-                id: req.id.clone(),
-                options,
-                chosen,
-                prompt_sha256: sha256_hex(&prompt),
-                scorer: scorer.name().into(),
-                scorer_revision: scorer.revision().into(),
-                timing_us: 0, // filled below as batch wall time share
-                calibrated: false,
-                fallback: unknown,
-                cascade_source: None,
-                cascade_set_size: None,
-            });
-        }
+        // Wavefront: draft-score all → compact uncertain → CPU → verify → scatter.
+        let results = decide_batch_wavefront(root, scorer.as_ref(), &reqs, &state, unknown);
         let timing_us = t0.elapsed().as_micros() as u64;
-        let per = timing_us / results.len().max(1) as u64;
-        for r in &mut results {
-            r.timing_us = per;
-        }
         let out = json!({
             "mode": "batch",
             "state_chars": state.len(),
@@ -873,6 +946,64 @@ mod tests {
             p99 < 100_000,
             "heuristic p99 {p99}µs exceeds 100ms on fixture"
         );
+    }
+
+    #[test]
+    fn batch_wavefront_matches_serial_argmax_shared_state() {
+        let dir = std::env::temp_dir().join(format!("wk_semif_wf_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".wordkeep")).unwrap();
+        std::fs::write(
+            dir.join(".wordkeep/config.json"),
+            r#"{"semif":{"enabled":true,"backend":"heuristic","debias":"none","cascade":{"routing":"off"}}}"#,
+        )
+        .unwrap();
+        // Fixed 3-row shared-state fixture (mirrors fixtures/shared_state.jsonl).
+        let state = "The deployment completed at 14:02 UTC. Health checks passed in all three zones. No rollback was initiated.";
+        let rows = [
+            json!({
+                "id": "s1",
+                "question": "Is there evidence that the deployment succeeded?",
+                "options": [
+                    {"id": "yes", "description": "The deployment succeeded."},
+                    {"id": "no", "description": "The deployment did not succeed."}
+                ]
+            }),
+            json!({
+                "id": "s2",
+                "question": "Were health checks mentioned?",
+                "options": [
+                    {"id": "yes", "description": "Health checks were mentioned."},
+                    {"id": "no", "description": "Health checks were not mentioned."}
+                ]
+            }),
+            json!({
+                "id": "s3",
+                "question": "Was a rollback initiated?",
+                "options": [
+                    {"id": "yes", "description": "A rollback was initiated."},
+                    {"id": "no", "description": "A rollback was not initiated."}
+                ]
+            }),
+        ];
+        let mut serial_chosen = Vec::new();
+        for row in &rows {
+            let mut args = row.clone();
+            args.as_object_mut().unwrap().insert("state".into(), json!(state));
+            let v: Value = serde_json::from_str(&decide(&dir, &args).expect("serial")).unwrap();
+            serial_chosen.push(v["chosen"].as_str().unwrap().to_string());
+        }
+        let batch = json!({ "state": state, "batch": rows });
+        let v: Value = serde_json::from_str(&decide(&dir, &batch).expect("batch")).unwrap();
+        assert_eq!(v["count"], 3);
+        for (i, expect) in serial_chosen.iter().enumerate() {
+            assert_eq!(
+                v["results"][i]["chosen"].as_str().unwrap(),
+                expect.as_str(),
+                "row {i} batch vs serial argmax"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

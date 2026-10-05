@@ -263,7 +263,7 @@
               {@render col(callSort, 'Id', 'id', ERESHKIGAL_COLUMN_HELP.id)}
               {@render col(callSort, 'Chosen', 'chosen', ERESHKIGAL_COLUMN_HELP.chosen)}
               {@render col(callSort, 'Scorer', 'scorer', ERESHKIGAL_COLUMN_HELP.scorer)}
-              {@render col(callSort, 'µs', 'us', ERESHKIGAL_COLUMN_HELP.us, true)}
+              {@render col(callSort, 'Wall Time', 'us', ERESHKIGAL_COLUMN_HELP.us, true)}
               {@render col(callSort, 'Cascade', 'cascade', ERESHKIGAL_COLUMN_HELP.cascade)}
               {@render col(callSort, 'Fallback', 'fallback', ERESHKIGAL_COLUMN_HELP.fallback, true)}
             </tr>
@@ -278,7 +278,9 @@
                 <td class="tool-name" title={ERESHKIGAL_COLUMN_HELP.scorer}
                   ><code>{row.scorer ?? '—'}</code></td
                 >
-                <td class="num" title={ERESHKIGAL_COLUMN_HELP.us}>{row.timing_us ?? '—'}</td>
+                <td class="num" title={ERESHKIGAL_COLUMN_HELP.us}
+                  >{row.timing_us != null ? `${Math.round(Number(row.timing_us) / 1000)}ms` : '—'}</td
+                >
                 <td class="text" title={ERESHKIGAL_COLUMN_HELP.cascade}
                   >{row.cascade_source ?? '—'}</td
                 >

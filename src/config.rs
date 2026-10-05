@@ -370,6 +370,57 @@ pub fn semif_gguf_verify_path(root: &Path) -> Option<PathBuf> {
     semif_str(root, "gguf_verify").map(|p| resolve_semif_path(root, &p))
 }
 
+/// Optional LoRA adapter GGUF for the draft student (`semif.adapter` or `ERESHKIGAL_ADAPTER`).
+/// Applied to draft (+ tandem CPU draft) only — never to `gguf_verify`.
+pub fn semif_adapter_path(root: &Path) -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("ERESHKIGAL_ADAPTER") {
+        if !p.trim().is_empty() {
+            return Some(resolve_semif_path(root, p.trim()));
+        }
+    }
+    semif_str(root, "adapter").map(|p| resolve_semif_path(root, &p))
+}
+
+/// LoRA adapter scale (`ERESHKIGAL_ADAPTER_SCALE` then `semif.adapter_scale`, default 1.0).
+pub fn semif_adapter_scale(root: &Path) -> f32 {
+    if let Ok(s) = std::env::var("ERESHKIGAL_ADAPTER_SCALE") {
+        if let Ok(v) = s.trim().parse::<f32>() {
+            if v.is_finite() && v > 0.0 {
+                return v;
+            }
+        }
+    }
+    load_config(root)
+        .and_then(|cfg| {
+            cfg.get("semif")
+                .and_then(|m| m.get("adapter_scale"))
+                .and_then(|v| v.as_f64())
+                .map(|f| f as f32)
+        })
+        .filter(|v| v.is_finite() && *v > 0.0)
+        .unwrap_or(1.0)
+}
+
+/// Post-hoc temperature for calibrated probabilities (`semif.temperature`, default 1.0).
+/// Argmax-invariant; set via grouped OOF fit.
+pub fn semif_temperature(root: &Path) -> f64 {
+    if let Ok(s) = std::env::var("ERESHKIGAL_TEMPERATURE") {
+        if let Ok(v) = s.trim().parse::<f64>() {
+            if v.is_finite() && v > 0.0 {
+                return v;
+            }
+        }
+    }
+    load_config(root)
+        .and_then(|cfg| {
+            cfg.get("semif")
+                .and_then(|m| m.get("temperature"))
+                .and_then(|v| v.as_f64())
+        })
+        .filter(|v| v.is_finite() && *v > 0.0)
+        .unwrap_or(1.0)
+}
+
 #[cfg(any(test, feature = "ereshkigal"))]
 pub fn semif_tokenizer_source(root: &Path) -> String {
     semif_str(root, "tokenizer_source").unwrap_or_else(|| "Qwen/Qwen3-0.6B".into())
@@ -453,7 +504,8 @@ pub fn semif_n_seq_max(root: &Path) -> u32 {
                 .and_then(|m| m.get("n_seq_max"))
                 .and_then(Value::as_u64)
         })
-        .map(|n| n.clamp(1, 8) as u32)
+        // Shared/wavefront suffix batching needs room (production pin 32).
+        .map(|n| n.clamp(1, 64) as u32)
         .unwrap_or(1)
 }
 
@@ -784,10 +836,12 @@ mod tests {
         assert_eq!(semif_debias(&dir), "adaptive");
         assert!((semif_adaptive_margin_min(&dir) - 0.15).abs() < 1e-9);
         assert_eq!(semif_n_seq_max(&dir), 1);
+        assert!((semif_adapter_scale(&dir) - 1.0).abs() < 1e-6);
+        assert!((semif_temperature(&dir) - 1.0).abs() < 1e-12);
         assert_eq!(semif_tandem(&dir), cfg!(feature = "ereshkigal-vulkan"));
         fs::write(
             dir.join(".wordkeep/config.json"),
-            r#"{"semif":{"enabled":false,"backend":"torch","debias":"permute","tandem":false,"adaptive":{"qhat":0.2,"margin_min":0.25}}}"#,
+            r#"{"semif":{"enabled":false,"backend":"torch","debias":"permute","tandem":false,"adapter_scale":1.5,"temperature":0.8,"adaptive":{"qhat":0.2,"margin_min":0.25}}}"#,
         )
         .unwrap();
         assert!(!semif_enabled(&dir));
@@ -796,6 +850,42 @@ mod tests {
         assert!(!semif_tandem(&dir));
         assert!((semif_adaptive_qhat(&dir) - 0.2).abs() < 1e-9);
         assert!((semif_adaptive_margin_min(&dir) - 0.25).abs() < 1e-9);
+        assert!((semif_adapter_scale(&dir) - 1.5).abs() < 1e-6);
+        assert!((semif_temperature(&dir) - 0.8).abs() < 1e-12);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn semif_n_seq_max_allows_shared_wavefront_size() {
+        let dir = tmp("n_seq");
+        fs::write(
+            dir.join(".wordkeep/config.json"),
+            r#"{"semif":{"n_seq_max":32}}"#,
+        )
+        .unwrap();
+        assert_eq!(semif_n_seq_max(&dir), 32);
+        fs::write(
+            dir.join(".wordkeep/config.json"),
+            r#"{"semif":{"n_seq_max":99}}"#,
+        )
+        .unwrap();
+        assert_eq!(semif_n_seq_max(&dir), 64); // clamp ceiling
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn semif_adapter_scale_env_overrides_config() {
+        let dir = tmp("adapter_scale_env");
+        fs::write(
+            dir.join(".wordkeep/config.json"),
+            r#"{"semif":{"adapter_scale":1.25}}"#,
+        )
+        .unwrap();
+        // SAFETY: test-only env mutation; serial under cargo's default test harness for this module.
+        std::env::set_var("ERESHKIGAL_ADAPTER_SCALE", "0.75");
+        assert!((semif_adapter_scale(&dir) - 0.75).abs() < 1e-6);
+        std::env::remove_var("ERESHKIGAL_ADAPTER_SCALE");
+        assert!((semif_adapter_scale(&dir) - 1.25).abs() < 1e-6);
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -912,6 +1002,25 @@ mod tests {
         )
         .unwrap();
         assert_eq!(test_filter_hint(&dir, "unit"), "ctest -R \"[unit]\"");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn semif_adapter_env_overrides_config() {
+        let dir = tmp("adapter_env");
+        fs::write(
+            dir.join(".wordkeep/config.json"),
+            r#"{"semif":{"adapter":".wordkeep/models/from-config.gguf"}}"#,
+        )
+        .unwrap();
+        // Clear env so config is visible, then override.
+        std::env::remove_var("ERESHKIGAL_ADAPTER");
+        let from_cfg = semif_adapter_path(&dir).expect("config adapter");
+        assert!(from_cfg.ends_with("from-config.gguf"));
+        std::env::set_var("ERESHKIGAL_ADAPTER", ".wordkeep/models/from-env.gguf");
+        let from_env = semif_adapter_path(&dir).expect("env adapter");
+        assert!(from_env.ends_with("from-env.gguf"));
+        std::env::remove_var("ERESHKIGAL_ADAPTER");
         let _ = fs::remove_dir_all(&dir);
     }
 

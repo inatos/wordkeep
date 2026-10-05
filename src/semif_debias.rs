@@ -3,7 +3,7 @@
 //! Letter-to-content remap uses `orig = (i + k) % n` after rotating option order
 //! (Zheng-style). `(i - k)` is the verified wrong mapping.
 
-use crate::semif::{softmax_labeled, DecisionRequest, OptionSpec, Scorer};
+use crate::semif::{softmax_labeled, DecisionRequest, Scorer};
 use crate::semif_cascade;
 
 /// Average softmax over `cycles` cyclic rotations of option order.
@@ -29,14 +29,21 @@ pub fn permute_from_identity(
     }
     let cycles = cycles.max(1).min(n);
     let mut acc = vec![0.0; n];
+    // Prebuild rotation index tables — avoid cloning option strings for k=0.
     for k in 0..cycles {
         let probs = if k == 0 {
             softmax_labeled(identity_raw)
         } else {
-            let mut rotated = req.clone();
-            rotated.options = (0..n)
-                .map(|i| req.options[(i + k) % n].clone())
-                .collect::<Vec<OptionSpec>>();
+            let mut rotated = DecisionRequest {
+                id: req.id.clone(),
+                state: req.state.clone(),
+                question: req.question.clone(),
+                options: Vec::with_capacity(n),
+            };
+            // Index permutation only: options[(i+k)%n] → slot i.
+            for i in 0..n {
+                rotated.options.push(req.options[(i + k) % n].clone());
+            }
             softmax_labeled(&scorer.score_one(&rotated)?)
         };
         for (i, (_id, p)) in probs.iter().enumerate() {

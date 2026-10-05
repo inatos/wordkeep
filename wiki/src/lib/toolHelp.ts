@@ -152,7 +152,7 @@ export const ERESHKIGAL_COLUMN_HELP = {
   id: 'Decision id from the request, or the kind when no id was recorded.',
   chosen: 'Highest-probability option letter/label after scoring (and permute remap when enabled).',
   scorer: 'Which scorer wrote the row: ereshkigal (GGUF) or heuristic.',
-  us: 'Wall time for that score call in microseconds.',
+  us: 'Wall time for that score call in milliseconds.',
   cascade:
     'draft = 0.6B only; cascade-draft = conformal singleton commit; cascade-verify = 4B pass; cascade-skipped = no verify GGUF; error = score failed; — = not cascaded.',
   fallback: 'Row recorded because GGUF/feature was unavailable. knowledge_search keeps BM25 order.',

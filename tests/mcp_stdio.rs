@@ -392,6 +392,72 @@ fn decree_check_lints_ereshkigal_std() {
     let v: Value = serde_json::from_str(&text).expect("json");
     assert_eq!(v["ok"], true, "{text}");
     assert!(v["decrees"].as_u64().unwrap_or(0) >= 1, "{text}");
+
+    let lint = s.tool_text(
+        "decree",
+        json!({ "method": "lint", "lib": lib.display().to_string() }),
+    );
+    let lint_v: Value = serde_json::from_str(&lint).expect("lint json");
+    assert_eq!(lint_v["ok"], true, "{lint}");
+
+    let schema = s.tool_text(
+        "decree",
+        json!({ "method": "schema", "lib": lib.display().to_string() }),
+    );
+    let schema_v: Value = serde_json::from_str(&schema).expect("schema json");
+    assert_eq!(schema_v["ok"], true, "{schema}");
+    assert!(schema_v.get("schema").is_some(), "{schema}");
+}
+
+#[test]
+fn decree_stats_when_serve_bin_available() {
+    let lib = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../ereshkigal/decrees");
+    if !lib.is_dir() {
+        return;
+    }
+    let esk = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../ereshkigal");
+    let bin = [
+        esk.join("target-vulkan/release/ereshkigal"),
+        esk.join("target/release/ereshkigal"),
+        esk.join("target/debug/ereshkigal"),
+    ]
+    .into_iter()
+    .find(|p| p.is_file());
+    let Some(bin) = bin else {
+        return;
+    };
+    // Child inherits env — set before Server::start.
+    let prev = std::env::var_os("ERESHKIGAL_BIN");
+    std::env::set_var("ERESHKIGAL_BIN", &bin);
+    let mut s = Server::start();
+    let resp = s.call(json!({
+        "jsonrpc": "2.0", "id": 99, "method": "tools/call",
+        "params": {
+            "name": "decree",
+            "arguments": { "method": "stats", "lib": lib.display().to_string() }
+        }
+    }));
+    match prev {
+        Some(v) => std::env::set_var("ERESHKIGAL_BIN", v),
+        None => std::env::remove_var("ERESHKIGAL_BIN"),
+    }
+    if resp["result"]["isError"] == json!(true) {
+        // Soft-skip when the serve child cannot spawn in this environment.
+        eprintln!("decree stats soft-skip: {resp}");
+        return;
+    }
+    let text = resp["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or("")
+        .to_string();
+    let v: Value = serde_json::from_str(&text).expect("json");
+    assert!(
+        v.get("decrees").is_some() || v.get("error").is_some(),
+        "{text}"
+    );
+    if v.get("error").is_none() {
+        assert!(v["decrees"].as_u64().unwrap_or(0) >= 1, "{text}");
+    }
 }
 
 #[test]

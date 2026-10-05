@@ -5,10 +5,30 @@ All notable changes to wordkeep are documented here. The project follows
 
 ## [Unreleased]
 
+### Fixed
+
+- `write_status` read-merges prior `semif-status.json` extras so empty
+  `resolve_scorer` refreshes no longer wipe `cpu_draft_loaded` / `cold_load_ms` /
+  `n_gpu_layers_used` / `warm`.
+- `semif.n_seq_max` clamp raised **8 → 64** so the production pin of **32** (shared /
+  wavefront parallel suffixes) is honored.
+- LoRA student no longer flips shared-state meta “mentioned?” rows after a short
+  continue-train on train-only `mention` gold (holdout stays frozen).
+
+### Added (SemIf post-gate)
+
+- Runtime `semif.adapter_scale` / `ERESHKIGAL_ADAPTER_SCALE` (sweep winner **1.5**) and
+  `semif.temperature` (grouped OOF plumbing; applied **1.0**).
+- Batch `semantic_decide` **wavefront** (draft `score_batch` → debias → CPU → verify).
+- `scripts/adapter_shared_bench.sh` — adapter shared vs direct microbench (`n_seq_max=32`).
+- Expanded frozen holdout (n=16 / gold n=59); student holdout BA **0.9048** @ scale 1.5.
+- Ereshkigal dashboard Recent calls column **Wall Time** in ms (wire still `timing_us`).
+- `semif-status.json` surfaces `n_seq_max`, `adapter_scale`, and `temperature`.
+
 ### Changed (SemIf → Ereshkigal)
 
 - Optional `--features ereshkigal` path-deps `tools/ereshkigal/ereshkigal-core`
-  (git submodule). `ereshkigal-lang` is always linked for `decree` check/lint.
+  (git submodule). `ereshkigal-lang` is always linked for `decree` check/lint/schema.
   Local Betwixt launchers enable it with embeddings/daslang/dashboard (Vulkan when an ICD exists).
 - Production backend is GGUF letter logits (`direct-options-v1`), conformal cascade,
   **adaptive** permute, Vulkan draft + CPU escalate + 4B verify (tandem).

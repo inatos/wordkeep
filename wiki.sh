@@ -292,7 +292,9 @@ ui_has_ereshkigal_view() {
   grep -q 'knowledge_search semif:true reorders BM25' "$WK/wiki/dist"/assets/*.js 2>/dev/null \
     && grep -q 'When the SemIf call was recorded' "$WK/wiki/dist"/assets/*.js 2>/dev/null \
     && grep -q 'Wordkeep 7-row p50' "$WK/wiki/dist"/assets/*.js 2>/dev/null \
-    && grep -q 'Scorer mix' "$WK/wiki/dist"/assets/*.js 2>/dev/null
+    && grep -q 'Scorer mix' "$WK/wiki/dist"/assets/*.js 2>/dev/null \
+    && grep -q 'Wall Time' "$WK/wiki/dist"/assets/*.js 2>/dev/null \
+    && grep -q 'Wall time for that score call in milliseconds' "$WK/wiki/dist"/assets/*.js 2>/dev/null
 }
 
 ui_has_tool_help() {

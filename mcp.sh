@@ -104,5 +104,16 @@ if [[ -f "$CFG" ]] && command -v python3 >/dev/null 2>&1; then
       echo "[wordkeep:mcp] warning: gguf_verify pin missing: $VERIFY_ABS — cascade-verify will skip until the 4B file is present." >&2
     fi
   fi
+  ADAPTER_REL="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("semif",{}).get("adapter") or "")' "$CFG" 2>/dev/null || true)"
+  if [[ -n "${ADAPTER_REL:-}" ]]; then
+    if [[ "$ADAPTER_REL" = /* ]]; then
+      ADAPTER_ABS="$ADAPTER_REL"
+    else
+      ADAPTER_ABS="$ROOT/$ADAPTER_REL"
+    fi
+    if [[ ! -e "$ADAPTER_ABS" ]]; then
+      echo "[wordkeep:mcp] warning: semif.adapter pin missing: $ADAPTER_ABS — draft loads without LoRA until the adapter GGUF is present." >&2
+    fi
+  fi
 fi
 exec "$BIN" "$@"

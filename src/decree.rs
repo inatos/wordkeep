@@ -63,10 +63,18 @@ pub fn dispatch(root: &Path, args: &Value) -> Result<String, String> {
             ereshkigal_lang::lint::lint_library(&library).map_err(|e| e.to_string())?;
             json!({"ok": true, "lib": lib.display().to_string()})
         }
+        "schema" => {
+            let schema = ereshkigal_lang::library_schema_json().map_err(|e| e.to_string())?;
+            json!({
+                "ok": true,
+                "lib": lib.display().to_string(),
+                "schema": serde_json::from_str::<Value>(&schema).unwrap_or(json!(schema)),
+            })
+        }
         "stats" | "run" | "test" | "decide" => rpc(root, &lib, method, args)?,
         other => {
             return Err(format!(
-                "unknown decree method {other}; use check, lint, run, test, decide, stats"
+                "unknown decree method {other}; use check, lint, schema, run, test, decide, stats"
             ))
         }
     };
@@ -168,7 +176,7 @@ mod tests {
     }
 
     #[test]
-    fn check_and_lint_std_decrees() {
+    fn check_lint_and_schema_std_decrees() {
         let crate_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let lib = crate_dir.join("../ereshkigal/decrees");
         if !lib.is_dir() {
@@ -184,6 +192,12 @@ mod tests {
         assert!(text.contains("\"ok\": true"), "{text}");
         let lint = dispatch(&root, &json!({"method": "lint"})).unwrap();
         assert!(lint.contains("\"ok\": true"), "{lint}");
+        let schema = dispatch(&root, &json!({"method": "schema"})).unwrap();
+        assert!(schema.contains("\"ok\": true"), "{schema}");
+        assert!(
+            schema.contains("decree") || schema.contains("schema"),
+            "{schema}"
+        );
         let _ = fs::remove_dir_all(&root);
     }
 }

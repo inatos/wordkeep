@@ -25,7 +25,10 @@ run/test/decide/stats use a resident `ereshkigal serve --stdio` child.
     "tandem": true,
     "adaptive": { "qhat": 0.1, "margin_min": 0.15 },
     "knowledge_debias": "none",
-    "n_seq_max": 1,
+    "n_seq_max": 32,
+    "adapter": ".wordkeep/models/qwen3-0.6b-lora-dev.gguf",
+    "adapter_scale": 1.5,
+    "temperature": 1.0,
     "gguf": ".wordkeep/models/Qwen3-0.6B-Q8_0.gguf",
     "gguf_verify": ".wordkeep/models/Qwen3.5-4B-Q4_K_M.gguf",
     "cascade": { "routing": "conformal", "qhat": 0.1 },
@@ -55,12 +58,33 @@ run/test/decide/stats use a resident `ereshkigal serve --stdio` child.
   Vulkan draft → adaptive → conformal singleton → CPU draft escalate → 4B verify.
   `cascade_source`: `cascade-draft` | `cascade-adaptive` | `cascade-cpu` |
   `cascade-verify` | `cascade-skipped`.
+- **Lazy verify:** prefetch / `ensure_loaded` warms **draft (+ tandem CPU draft)
+  only**. The 4B `gguf_verify` loads on the first escalate that needs it
+  (`gguf_verify_loaded: false` until then; `gguf_verify_lazy: true` when pinned).
+  First `cascade-verify` pays cold 4B load; repeats stay warm. On a 1080 Ti, keep
+  **at most one** Wordkeep MCP (wiki does not hold GGUF) or verify OOMs →
+  `cascade-skipped`. Helper: `tools/ereshkigal/scripts/tandem_verify_bench.sh`.
+- **Adapter:** `semif.adapter` / `ERESHKIGAL_ADAPTER` attaches LoRA on draft (+ CPU
+  draft) only — verify stays bare. `adapter_scale` (env `ERESHKIGAL_ADAPTER_SCALE`,
+  default 1.0; pinned **1.5** after holdout sweep) is runtime-only.
+- **Temperature:** `semif.temperature` divides option logits before softmax
+  (argmax-invariant). Fit via grouped OOF on train; when OOF collapses to the
+  0.05 floor, keep **1.0** and report ECE@T1. `calibrated: true` only when T≠1.
+- **Batch wavefront:** `semantic_decide` `{state, batch:[…]}` draft-scores all
+  rows (`score_batch` / shared suffixes when `mode: shared`), applies debias,
+  compacts conformal residuals, then CPU → verify waves before scattering.
+- **`n_seq_max`:** production pin **32** (config clamp ceiling **64** — older builds
+  silently capped at 8). Shared vs direct adapter microbench:
+  `tools/ereshkigal/scripts/adapter_shared_bench.sh`. Status JSON exposes
+  `n_seq_max` / `adapter_scale` / `temperature`. Larger `n_seq_max` can hit
+  `NoKvCacheSlot` on knowledge rerank; retrieval falls back to BM25.
 - llama.cpp allows one backend init per process. `ereshkigal-core` shares a
   process-global leaked `LlamaBackend` so tandem CPU draft and `gguf_verify` can
   load after the GPU draft (without this, the second load fails
   `BackendAlreadyInitialized`).
 - `n_gpu_layers` is attempted then CPU (`0`) if Vulkan/GPU init fails.
-- Paths are gitignored; override with `ERESHKIGAL_GGUF` / `ERESHKIGAL_GGUF_VERIFY`.
+- Paths are gitignored; override with `ERESHKIGAL_GGUF` / `ERESHKIGAL_GGUF_VERIFY`
+  / `ERESHKIGAL_ADAPTER` / `ERESHKIGAL_ADAPTER_SCALE`.
 
 ## Decree binary resolve
 
@@ -87,33 +111,47 @@ Distinct from embedding `semantic` (requires `--features embeddings`).
 
 Wiki **Dashboard → Ereshkigal** (`?tab=dashboard&view=ereshkigal`) is always in
 the Dashboard tablist. Status should show `cold_load_ms`, `n_gpu_layers_used`,
-`cpu_draft_loaded`, `tandem`, and a `cascade_histogram`. Bakeoff captions are
-Vulkan-aware (CPU 1e-6 vs Vulkan smoke). MCP start **prefetches** GGUF so the
-first agent decide is warm. If those load fields are missing, a later empty
-`write_status` on `resolve_scorer` overwrote extras — engines are still proven
-by `cascade_source` on live decides.
+`cpu_draft_loaded`, `tandem`, and a `cascade_histogram`. Recent-calls **Wall Time**
+shows `round(timing_us/1000)` with an `ms` suffix (wire format stays `timing_us`).
+Bakeoff captions are Vulkan-aware (CPU 1e-6 vs Vulkan smoke). MCP start
+**prefetches** GGUF so the first agent decide is warm. `write_status` read-merges
+prior extras, so `cpu_draft_loaded` / `cold_load_ms` survive empty resolve
+refreshes. Engines are still proven by `cascade_source` on live decides.
 
 ## Measured latency (GTX 1080 Ti, 2026-10-05)
 
 Live MCP after prefetch + adaptive + shared backend. Do not mix with CPU 1e-6
-A/B rows or sandbox permute p50 (those can be CPU fallback).
+A/B rows or sandbox permute p50 (those can be CPU fallback). **Lazy verify**
+(2026-10-05 later): prefetch warms draft+tandem only; first `cascade-verify`
+pays cold 4B load. Sole MCP + ≥~2.5 GiB free VRAM required or verify OOMs →
+`cascade-skipped`. Helper: `tools/ereshkigal/scripts/tandem_verify_bench.sh`.
 
 | Probe | cascade | timing |
 | --- | --- | ---: |
 | Cold MCP (load + first) | cascade-draft | ~2365 ms |
 | Sharp, post-prefetch | cascade-draft | 111–168 ms |
 | Sharp, KV-warm repeat | cascade-draft | **3.8 ms** |
-| Uncertain 5-way, first 4B | cascade-verify | ~3059 ms |
-| Uncertain 5-way, 2nd | cascade-verify | **11 ms** |
+| Escalate→4B, first (lazy load) | cascade-verify | **~11978 ms** |
+| Escalate→4B, warm repeat | cascade-verify | **12.2 ms** |
 
-Escalate cost is front-loaded: quality on unsure rows, cheap repeats. Full
-tables: [.wordkeep/notes/ereshkigal-semif-benchmarks.md](../../.wordkeep/notes/ereshkigal-semif-benchmarks.md).
+Escalate cost is front-loaded: quality on unsure rows, cheap repeats. Prefetch
+`cold_load_ms` ≈6 s covers draft+tandem only (`gguf_verify_loaded: false` until
+first escalate). Full tables:
+[.wordkeep/notes/ereshkigal-semif-benchmarks.md](../../.wordkeep/notes/ereshkigal-semif-benchmarks.md).
+JSON: `tools/ereshkigal/results/quality/tandem_verify_bench.json`.
 
-## Quality track (dev gold)
+## Quality track (dev gold + LoRA adapter)
 
 Labeled folds live in `tools/ereshkigal/fixtures/dev_gold.jsonl` (**not**
-authored144). Optimizer: `scripts/optimize_dev_gold.sh`. LoRA scaffold:
-`scripts/lora_dev_gold.sh` — report BA/ECE; do not claim 1e-6.
+authored144; n≥30, currently 52). Optimizer: `scripts/optimize_dev_gold.sh`.
+LoRA: `scripts/lora_dev_gold.sh` — strict split, SemIf prompts, BA/ECE gate
+**0.75** before convert. Gated adapter GGUF:
+`.wordkeep/models/qwen3-0.6b-lora-dev.gguf` via `scripts/convert_lora_gguf.sh`.
+
+Draft load honors `semif.adapter` / `ERESHKIGAL_ADAPTER` (scale 1.0); verify stays
+bare. `semif-score --adapter` for offline parity. Latest gated holdout:
+student BA **1.0** / ECE 0.099; PEFT↔GGUF argmax agreement **100%**. Do not claim
+1e-6.
 
 ## Fixtures
 
