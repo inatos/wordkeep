@@ -39,6 +39,11 @@ pub mod repo_map;
 mod runs;
 mod runtime;
 mod semif;
+mod semif_cascade;
+mod semif_debias;
+#[cfg(feature = "ereshkigal")]
+mod semif_gguf;
+mod semif_telemetry;
 mod session_pressure;
 mod shrift;
 mod stats;

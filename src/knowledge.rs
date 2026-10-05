@@ -4,8 +4,8 @@
 //! with Okapi BM25. Zero dependencies, fully deterministic, no model download - a
 //! strong offline baseline. With `--features embeddings`, the BM25 head is reranked
 //! by a small local embedding model (see embed.rs); BM25 stays the fallback.
-//! Pass `semif:true` to optionally rerank the BM25 head with the SemIf heuristic
-//! scorer ([`crate::semif`]). `knowledge_answer` builds an extractive synthesis +
+//! Pass `semif:true` to optionally rerank the BM25 head with the SemIf scorer
+//! ([`crate::semif`]; heuristic or Ereshkigal GGUF). `knowledge_answer` builds an extractive synthesis +
 //! citations from the same pipeline.
 
 use serde_json::{json, Value};

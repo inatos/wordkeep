@@ -1,0 +1,104 @@
+[
+  {
+    "bm25": [
+      "tools/wordkeep/docs/tools.md",
+      "docs/designs/semif-wordkeep.md",
+      "tools/wordkeep/docs/semif.md",
+      "docs/designs/semif-wordkeep.md",
+      "docs/designs/semif-wordkeep.md"
+    ],
+    "query": "SemIf semantic_decide option probabilities",
+    "semif": [
+      "tools/wordkeep/docs/tools.md",
+      "docs/designs/semif-wordkeep.md",
+      "tools/wordkeep/docs/semif.md",
+      "docs/designs/semif-wordkeep.md",
+      "docs/designs/semif-wordkeep.md"
+    ]
+  },
+  {
+    "bm25": [
+      "tools/wordkeep/docs/tools.md",
+      "tools/wordkeep/docs/designs/izakaya.md",
+      "tools/wordkeep/docs/designs/izakaya.md",
+      "tools/wordkeep/docs/designs/izakaya.md",
+      "tools/wordkeep/docs/configuration.md"
+    ],
+    "query": "Izakaya check in lease",
+    "semif": [
+      "tools/wordkeep/docs/tools.md",
+      "tools/wordkeep/docs/designs/izakaya.md",
+      "tools/wordkeep/docs/designs/izakaya.md",
+      "tools/wordkeep/docs/designs/izakaya.md",
+      "tools/wordkeep/docs/configuration.md"
+    ]
+  },
+  {
+    "bm25": [
+      "docs/polish/2026-03-10_M17_Polish_BuildOpt.md",
+      "docs/designs/daslang.md",
+      "docs/architecture/runtime-ecs.md",
+      "docs/editor.md",
+      "docs/designs/_design.md"
+    ],
+    "query": "Flecs ECS module grouping",
+    "semif": [
+      "docs/polish/2026-03-10_M17_Polish_BuildOpt.md",
+      "docs/designs/daslang.md",
+      "docs/architecture/runtime-ecs.md",
+      "docs/editor.md",
+      "docs/designs/_design.md"
+    ]
+  },
+  {
+    "bm25": [
+      "tools/wordkeep/docs/semif.md",
+      "tools/wordkeep/docs/tools.md",
+      "tools/wordkeep/docs/semif.md",
+      "docs/designs/semif-wordkeep.md",
+      "docs/designs/semif-wordkeep.md"
+    ],
+    "query": "knowledge_search BM25 retrieval",
+    "semif": [
+      "tools/wordkeep/docs/semif.md",
+      "tools/wordkeep/docs/tools.md",
+      "tools/wordkeep/docs/semif.md",
+      "docs/designs/semif-wordkeep.md",
+      "docs/designs/semif-wordkeep.md"
+    ]
+  },
+  {
+    "bm25": [
+      "tools/wordkeep/docs/designs/izakaya.md",
+      "tools/wordkeep/docs/designs/wiki.md",
+      "tools/wordkeep/docs/semif.md",
+      "tools/wordkeep/docs/designs/runtime_memory_health.md",
+      "tools/wordkeep/docs/onboarding.md"
+    ],
+    "query": "wiki dashboard telemetry savings.json",
+    "semif": [
+      "tools/wordkeep/docs/designs/izakaya.md",
+      "tools/wordkeep/docs/designs/wiki.md",
+      "tools/wordkeep/docs/semif.md",
+      "tools/wordkeep/docs/designs/runtime_memory_health.md",
+      "tools/wordkeep/docs/onboarding.md"
+    ]
+  },
+  {
+    "bm25": [
+      "docs/designs/physics/umibouyo.md",
+      "docs/designs/mavericks/ghilli/ghilli.md",
+      "tools/wordkeep/docs/designs/runtime_memory_health.md",
+      "docs/designs/athanor.md",
+      "docs/designs/ggpo_design.md"
+    ],
+    "query": "rollback determinism snapshot",
+    "semif": [
+      "docs/designs/physics/umibouyo.md",
+      "docs/designs/mavericks/ghilli/ghilli.md",
+      "tools/wordkeep/docs/designs/runtime_memory_health.md",
+      "docs/designs/athanor.md",
+      "docs/designs/ggpo_design.md"
+    ]
+  }
+]

@@ -33,6 +33,8 @@ export const TOOL_HELP: Record<string, string> = {
   knowledge_search: 'BM25 search over docs/rules/notes (pages via continuation).',
   knowledge_answer: 'Extractive answer + citations from the same BM25 index.',
   knowledge_upsert: 'Write or update a markdown knowledge section.',
+  semantic_decide:
+    'Score unstructured state + question against typed options (letter logits). Backend is heuristic or Ereshkigal GGUF.',
 
   // Perf / runtime
   trace_summary: 'Hottest Tracy zones (or vs a baseline).',
@@ -119,6 +121,43 @@ export const CHART_HELP = {
     'Watermarks and risk signals: peak saves, slow tools, low-yield rate, and net-negative distill.',
   tools:
     'Per-tool lifetime stats. Click a column header to sort; hover a tool name for what it does.',
+} as const;
+
+/** Dashboard → Ereshkigal (status cards, charts, call/bakeoff tables). */
+export const ERESHKIGAL_HELP = {
+  status:
+    'Last MCP heartbeat: backend, serving mode, GGUF paths. Charts in this section are live SemIf call mix from /api/semif (refreshes every 2s).',
+  backend:
+    'Configured scorer: ereshkigal (GGUF letter logits) or heuristic. Missing GGUF on decide is an error, not a silent heuristic score.',
+  mode: 'Serving path: direct (one option), serial (one-at-a-time), or shared (batched prefix).',
+  debias:
+    'Option-order correction. permute remaps letters (i+k)%n and averages; pride is opt-in PriDe; none leaves raw logits.',
+  gpu: 'n_gpu_layers requested (99 = offload all). Used value may be 0 after CPU fallback if Vulkan/GPU init failed.',
+  gguf: 'Whether the draft GGUF actually loaded in this MCP process.',
+  checkpoint: 'Draft GGUF path (and optional 4B verify GGUF for conformal cascade).',
+  latency:
+    'Per-call score latency in milliseconds (ring of recent decide/rerank rows). Hover the sparkline for id and ms.',
+  mix: 'Share of recent rows: GGUF (ereshkigal scorer), heuristic/other, or fallback/error (feature off, missing GGUF, cascade error).',
+  cascade:
+    'Conformal cascade source counts: draft (no verify), cascade-draft (0.6B committed), cascade-verify (4B), cascade-skipped (no verify GGUF), error, none.',
+  calls:
+    'Recent semantic_decide and knowledge_search semif:true rows (newest first). Hover a column header for the term; click to sort.',
+  bakeoff:
+    '1080 Ti same-GGUF: 0.6B 144/144, bartowski 4B 3/3 @ 1e-2, Wordkeep 7-row p50. Published BF16 is a different checkpoint.',
+} as const;
+
+export const ERESHKIGAL_COLUMN_HELP = {
+  when: 'When the SemIf call was recorded (unix seconds). Newest first until you press a column.',
+  kind: 'decide = semantic_decide. rerank = knowledge_search semif:true reorders BM25 (does not replace retrieval).',
+  id: 'Decision id from the request, or the kind when no id was recorded.',
+  chosen: 'Highest-probability option letter/label after scoring (and permute remap when enabled).',
+  scorer: 'Which scorer wrote the row: ereshkigal (GGUF) or heuristic.',
+  us: 'Wall time for that score call in microseconds.',
+  cascade:
+    'draft = 0.6B only; cascade-draft = conformal singleton commit; cascade-verify = 4B pass; cascade-skipped = no verify GGUF; error = score failed; — = not cascaded.',
+  fallback: 'Row recorded because GGUF/feature was unavailable. knowledge_search keeps BM25 order.',
+  number: 'Bakeoff headline (accuracy or BA). Hover the caption for what was actually compared.',
+  caption: 'What the number measures — do not mix 0.6B parity, 4B llama.cpp Δp, unsloth Q4, and SemIf BF16.',
 } as const;
 
 export const OUTCOME_HELP: Record<string, string> = {

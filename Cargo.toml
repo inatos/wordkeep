@@ -34,6 +34,10 @@ daslang = ["dep:tree-sitter-language"]
 # subcommand. Pulls ratatui (+ its bundled crossterm backend) - NOT in the
 # default build, so the MCP server binary stays lean.
 dashboard = ["dep:ratatui"]
+# Optional Ereshkigal GGUF letter-logit scorer (llama.cpp). Default cargo test
+# stays heuristic-only; local Betwixt launchers pass this feature.
+ereshkigal = ["dep:ereshkigal-core"]
+ereshkigal-vulkan = ["ereshkigal", "ereshkigal-core/vulkan"]
 
 [dependencies]
 serde_json = "1"
@@ -41,6 +45,7 @@ sha2 = "0.10"
 walkdir = "2"
 fs2 = "0.4"
 wordkeep-knowledge = { path = "crates/wordkeep-knowledge" }
+ereshkigal-core = { git = "https://github.com/inatos/ereshkigal", optional = true }
 tree-sitter = "0.25"
 tree-sitter-cpp = "0.23"
 fastembed = { version = "4", optional = true }

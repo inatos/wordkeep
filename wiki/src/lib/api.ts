@@ -402,6 +402,42 @@ export function fetchIzakaya() {
   return getJson<IzakayaPayload>(`${API_BASE}/izakaya`);
 }
 
+export type SemifEvent = {
+  ts?: number;
+  id?: string;
+  chosen?: string;
+  scorer?: string;
+  timing_us?: number;
+  fallback?: boolean;
+  cascade_source?: string;
+  kind?: string;
+};
+
+export type SemifBakeoff = { value?: string; caption?: string };
+
+export type SemifPayload = {
+  available?: boolean;
+  page_visible?: boolean;
+  status?: Record<string, unknown> & {
+    backend?: string;
+    mode?: string;
+    debias?: string;
+    n_gpu_layers?: number;
+    n_gpu_layers_used?: number;
+    gguf?: string;
+    gguf_verify?: string;
+    gguf_loaded?: boolean;
+    load_error?: string;
+    cargo_feature?: boolean;
+  };
+  events?: SemifEvent[];
+  bakeoff?: SemifBakeoff[];
+};
+
+export function fetchSemif() {
+  return getJson<SemifPayload>(`${API_BASE}/semif`);
+}
+
 export type ShriftIdea = {
   slug: string;
   title: string;

@@ -5,6 +5,7 @@ mod indexer;
 mod izakaya;
 mod meili;
 mod runtime;
+mod semif;
 mod shrift;
 mod telemetry;
 mod web;

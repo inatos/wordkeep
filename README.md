@@ -196,7 +196,9 @@ opt-in (`--features daslang`).
 cargo build --release --features embeddings   # semantic rerank for knowledge_search
 cargo build --release --features daslang      # vendored Daslang grammar
 cargo run --features dashboard -- dashboard   # live stats terminal UI
-# GUI alternative (no dashboard feature needed): wordkeep-wiki serve → Dashboard tab
+cargo build --release --features ereshkigal   # GGUF letter-logit SemIf (llama.cpp)
+# Local Betwixt: embeddings,daslang,dashboard,ereshkigal (+ ereshkigal-vulkan if ICD)
+# GUI: wordkeep-wiki serve → Dashboard → Ereshkigal when the MCP feature is on
 ```
 
 Default build is offline and deterministic (BM25 only, no ONNX).

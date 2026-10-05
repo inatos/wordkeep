@@ -269,7 +269,19 @@ pub fn semif_enabled(root: &Path) -> bool {
         .unwrap_or(true)
 }
 
-/// SemIf scorer backend name (default `"heuristic"`). Unknown names fall back in `semif::resolve_scorer`.
+/// Default backend when `semif.backend` is omitted.
+pub fn default_semif_backend() -> String {
+    #[cfg(feature = "ereshkigal")]
+    {
+        "ereshkigal".into()
+    }
+    #[cfg(not(feature = "ereshkigal"))]
+    {
+        "heuristic".into()
+    }
+}
+
+/// SemIf scorer backend name. Unknown names fall back in `semif::resolve_scorer`.
 pub fn semif_backend(root: &Path) -> String {
     load_config(root)
         .and_then(|cfg| {
@@ -278,7 +290,141 @@ pub fn semif_backend(root: &Path) -> String {
                 .and_then(Value::as_str)
                 .map(|s| s.to_string())
         })
-        .unwrap_or_else(|| "heuristic".into())
+        .unwrap_or_else(default_semif_backend)
+}
+
+fn semif_str(root: &Path, key: &str) -> Option<String> {
+    load_config(root).and_then(|cfg| {
+        cfg.get("semif")
+            .and_then(|m| m.get(key))
+            .and_then(Value::as_str)
+            .map(|s| s.to_string())
+    })
+}
+
+/// Serving mode: `direct` | `serial` | `shared`.
+pub fn semif_mode(root: &Path) -> String {
+    semif_str(root, "mode").unwrap_or_else(|| "shared".into())
+}
+
+/// Debias: `none` | `permute` | `pride`.
+pub fn semif_debias(root: &Path) -> String {
+    semif_str(root, "debias").unwrap_or_else(|| "permute".into())
+}
+
+/// Draft GGUF path (`semif.gguf` or `ERESHKIGAL_GGUF`).
+pub fn semif_gguf_path(root: &Path) -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("ERESHKIGAL_GGUF") {
+        if !p.trim().is_empty() {
+            return Some(resolve_semif_path(root, p.trim()));
+        }
+    }
+    semif_str(root, "gguf").map(|p| resolve_semif_path(root, &p))
+}
+
+/// Verify GGUF path for conformal cascade.
+pub fn semif_gguf_verify_path(root: &Path) -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("ERESHKIGAL_GGUF_VERIFY") {
+        if !p.trim().is_empty() {
+            return Some(resolve_semif_path(root, p.trim()));
+        }
+    }
+    semif_str(root, "gguf_verify").map(|p| resolve_semif_path(root, &p))
+}
+
+pub fn semif_tokenizer_source(root: &Path) -> String {
+    semif_str(root, "tokenizer_source").unwrap_or_else(|| "Qwen/Qwen3-0.6B".into())
+}
+
+pub fn semif_tokenizer_revision(root: &Path) -> String {
+    semif_str(root, "tokenizer_revision")
+        .unwrap_or_else(|| "c1899de289a04d12100db370d81485cdf75e47ca".into())
+}
+
+pub fn semif_n_gpu_layers(root: &Path) -> u32 {
+    load_config(root)
+        .and_then(|cfg| {
+            cfg.get("semif")
+                .and_then(|m| m.get("n_gpu_layers"))
+                .and_then(Value::as_u64)
+        })
+        .unwrap_or(99) as u32
+}
+
+pub fn semif_threads(root: &Path) -> i32 {
+    load_config(root)
+        .and_then(|cfg| {
+            cfg.get("semif")
+                .and_then(|m| m.get("threads"))
+                .and_then(Value::as_u64)
+        })
+        .map(|n| n as i32)
+        .unwrap_or(0)
+}
+
+pub fn semif_cascade_routing(root: &Path) -> String {
+    load_config(root)
+        .and_then(|cfg| {
+            cfg.get("semif")
+                .and_then(|m| m.get("cascade"))
+                .and_then(|c| c.get("routing"))
+                .and_then(Value::as_str)
+                .map(|s| s.to_string())
+        })
+        .unwrap_or_else(|| "conformal".into())
+}
+
+pub fn semif_cascade_qhat(root: &Path) -> f64 {
+    load_config(root)
+        .and_then(|cfg| {
+            cfg.get("semif")
+                .and_then(|m| m.get("cascade"))
+                .and_then(|c| c.get("qhat"))
+                .and_then(Value::as_f64)
+        })
+        .unwrap_or(0.1)
+}
+
+pub fn semif_knowledge_cascade(root: &Path) -> bool {
+    load_config(root)
+        .and_then(|cfg| {
+            cfg.get("semif")
+                .and_then(|m| m.get("knowledge_cascade"))
+                .and_then(Value::as_bool)
+        })
+        .unwrap_or(false)
+}
+
+/// Debias for `knowledge_search semif:true`. Default `none` (one forward).
+/// Decide still uses [`semif_debias`]. Set `knowledge_debias: permute` to match decide.
+pub fn semif_knowledge_debias(root: &Path) -> String {
+    semif_str(root, "knowledge_debias").unwrap_or_else(|| "none".into())
+}
+
+/// llama.cpp sequences. Wordkeep scores `direct` one seq at a time; `n_seq_max>1`
+/// shrinks per-seq KV on some backends and caused `NoKvCacheSlot` on knowledge heads.
+pub fn semif_n_seq_max(root: &Path) -> u32 {
+    load_config(root)
+        .and_then(|cfg| {
+            cfg.get("semif")
+                .and_then(|m| m.get("n_seq_max"))
+                .and_then(Value::as_u64)
+        })
+        .map(|n| n.clamp(1, 8) as u32)
+        .unwrap_or(1)
+}
+
+pub fn semif_decrees_path(root: &Path) -> Option<PathBuf> {
+    semif_str(root, "decrees").map(|p| resolve_semif_path(root, &p))
+}
+
+fn resolve_semif_path(root: &Path, p: &str) -> PathBuf {
+    let path = PathBuf::from(p);
+    if path.is_absolute() {
+        path
+    } else {
+        root.join(path)
+    }
 }
 
 fn izakaya_u64(root: &Path, key: &str, default: u64) -> u64 {
@@ -554,7 +700,9 @@ mod tests {
     fn semif_defaults_and_overrides() {
         let dir = tmp("semif");
         assert!(semif_enabled(&dir));
-        assert_eq!(semif_backend(&dir), "heuristic");
+        assert_eq!(semif_backend(&dir), default_semif_backend());
+        assert_eq!(semif_knowledge_debias(&dir), "none");
+        assert_eq!(semif_n_seq_max(&dir), 1);
         fs::write(
             dir.join(".wordkeep/config.json"),
             r#"{"semif":{"enabled":false,"backend":"torch"}}"#,

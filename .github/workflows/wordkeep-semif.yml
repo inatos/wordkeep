@@ -1,0 +1,39 @@
+name: wordkeep-semif-gguf
+
+on:
+  push:
+    paths:
+      - "src/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/wordkeep-semif.yml"
+  pull_request:
+    paths:
+      - "src/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/wordkeep-semif.yml"
+
+jobs:
+  heuristic:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --locked --lib semif::
+        working-directory: .
+
+  ereshkigal-compile:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Compile llama.cpp adapter
+        run: cargo test --locked --features ereshkigal --lib semif_cascade:: semif_debias::
+        working-directory: .
+      - name: Optional 0.6B smoke
+        if: ${{ env.ERESHKIGAL_GGUF != '' }}
+        env:
+          ERESHKIGAL_GGUF: ${{ secrets.ERESHKIGAL_GGUF_PATH }}
+        run: cargo test --locked --features ereshkigal --lib semif::gguf -- --ignored --nocapture
+        working-directory: .

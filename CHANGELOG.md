@@ -5,6 +5,15 @@ All notable changes to wordkeep are documented here. The project follows
 
 ## [Unreleased]
 
+### Changed (SemIf → Ereshkigal)
+
+- Optional `--features ereshkigal` git-deps [ereshkigal-core](https://github.com/inatos/ereshkigal).
+  Local Betwixt launchers enable it with embeddings/daslang/dashboard (Vulkan when an ICD exists).
+- Production backend is GGUF letter logits (`direct-options-v1`), conformal cascade,
+  permute `(i+k)%n` debias, shared-prefix batch. Heuristic is explicit/`--no-default-features` only.
+- Wiki Dashboard **Ereshkigal** page (`GET /api/semif`) with 1080 Ti same-GGUF bakeoff captions.
+- Missing GGUF does not silently score as heuristic.
+
 ### Added (SemIf semantic decisions)
 
 - **MCP tool** `semantic_decide`: SemIf/OpenJev-style `state` + runtime `question` +

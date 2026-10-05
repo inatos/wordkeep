@@ -97,6 +97,7 @@ pub(crate) async fn serve(
         .route("/api/search-telemetry/click", post(search_click))
         .route("/api/stats", get(stats))
         .route("/api/dashboard", get(dashboard_api))
+        .route("/api/semif", get(semif_api))
         .route("/api/izakaya", get(izakaya_api))
         .route("/api/shrift", get(shrift_api).post(shrift_upsert_api))
         .route("/api/shrift/touch", post(shrift_touch_api))
@@ -512,6 +513,12 @@ async fn stats() -> ApiResult {
 
 async fn dashboard_api() -> ApiResult {
     crate::dashboard::build()
+        .map(Json)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error))
+}
+
+async fn semif_api() -> ApiResult {
+    crate::semif::build()
         .map(Json)
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error))
 }

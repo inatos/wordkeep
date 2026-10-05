@@ -54,6 +54,7 @@
   import type { BarDatum, DonutDatum, SparkPoint } from './lib/charts/utils';
   import RuntimeHealth from './lib/RuntimeHealth.svelte';
   import IzakayaBoard from './lib/IzakayaBoard.svelte';
+  import EreshkigalBoard from './lib/EreshkigalBoard.svelte';
   import ShriftBoard from './lib/ShriftBoard.svelte';
 
   type Tab = 'search' | 'reader' | 'dashboard' | 'health' | 'shrift';
@@ -85,7 +86,7 @@
 
   let tab = $state<Tab>('search');
   let healthView = $state<'runtime' | 'knowledge'>('runtime');
-  let dashView = $state<'telemetry' | 'izakaya'>('telemetry');
+  let dashView = $state<'telemetry' | 'izakaya' | 'ereshkigal'>('telemetry');
   let dashQuery = $state('');
   let urlReady = $state(false);
   let query = $state('');
@@ -279,6 +280,7 @@
     if (tab === 'health' && healthView !== 'knowledge') url.searchParams.set('view', healthView);
     else if (tab === 'health') url.searchParams.set('view', 'knowledge');
     else if (tab === 'dashboard' && dashView === 'izakaya') url.searchParams.set('view', 'izakaya');
+    else if (tab === 'dashboard' && dashView === 'ereshkigal') url.searchParams.set('view', 'ereshkigal');
     else url.searchParams.delete('view');
     if (tab === 'dashboard' && dashQuery.trim()) url.searchParams.set('dq', dashQuery.trim());
     else if (tab === 'shrift' && dashQuery.trim()) url.searchParams.set('dq', dashQuery.trim());
@@ -455,6 +457,7 @@
     const view = params.get('view');
     if (view === 'runtime' || view === 'knowledge') healthView = view;
     if (view === 'izakaya') dashView = 'izakaya';
+    if (view === 'ereshkigal') dashView = 'ereshkigal';
     const dq = params.get('dq');
     if (dq) dashQuery = dq;
     if (path) {
@@ -1341,6 +1344,8 @@
   class:resizing
   class:sidebar-collapsed={sidebarCollapsed}
   style={`--sidebar-width:${sidebarWidth}px;--content-zoom:${contentZoom}`}
+  role="group"
+  aria-label="Wiki workspace"
   ontouchstart={onShellTouchStart}
   ontouchmove={onShellTouchMove}
   ontouchend={onShellTouchEnd}
@@ -2585,7 +2590,7 @@
                 stroke-linejoin="round"
               /></svg
             >
-            {dashView === 'izakaya' ? 'Izakaya' : 'MCP telemetry'}
+            {dashView === 'izakaya' ? 'Izakaya' : dashView === 'ereshkigal' ? 'Ereshkigal' : 'MCP telemetry'}
           </h2>
           <button
             class="icon-btn"
@@ -2623,6 +2628,11 @@
             class:active={dashView === 'izakaya'}
             onclick={() => (dashView = 'izakaya')}>Izakaya</button
           >
+          <button
+            class="subview-btn"
+            class:active={dashView === 'ereshkigal'}
+            onclick={() => (dashView = 'ereshkigal')}>Ereshkigal</button
+          >
         </div>
 
         <label class="dash-filter">
@@ -2631,7 +2641,9 @@
             type="search"
             placeholder={dashView === 'izakaya'
               ? 'Filter agents, journal, claims, and izakaya calls…'
-              : 'Filter tools, calls, and health signals…'}
+              : dashView === 'ereshkigal'
+                ? 'Filter Ereshkigal calls, cascade, scorers…'
+                : 'Filter tools, calls, and health signals…'}
             aria-label={dashView === 'izakaya' ? 'Filter Izakaya data and telemetry' : 'Filter MCP telemetry'}
             title="Space-separated substrings. Applies to charts and tables on this page. Empty shows everything."
           />
@@ -2643,6 +2655,8 @@
             activity={dashboard?.activity ?? []}
             query={dashQuery}
           />
+        {:else if dashView === 'ereshkigal'}
+          <EreshkigalBoard query={dashQuery} />
         {:else if dashboardError}
           <p class="muted">Dashboard unavailable: <code>{dashboardError}</code></p>
         {:else if !dashboard}

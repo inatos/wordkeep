@@ -194,6 +194,10 @@ izakaya_ok() {
   [[ "$(http_code /api/izakaya)" == "200" ]]
 }
 
+semif_api_ok() {
+  [[ "$(http_code /api/semif)" == "200" ]]
+}
+
 ui_has_runtime_view() {
   # Built SPA must include the Runtime/Knowledge Health subview.
   grep -q 'Health — Runtime' "$WK/wiki/dist"/assets/*.js 2>/dev/null \
@@ -206,6 +210,14 @@ ui_has_izakaya_view() {
     && grep -q 'Izakaya charts' "$WK/wiki/dist"/assets/*.js 2>/dev/null \
     && grep -q 'dash-table' "$WK/wiki/dist"/assets/*.js 2>/dev/null \
     && grep -q 'active-first' "$WK/wiki/dist"/assets/*.js 2>/dev/null
+}
+
+ui_has_ereshkigal_view() {
+  # Bump unique phrases when EreshkigalBoard layout/help changes need a dist rebuild.
+  grep -q 'knowledge_search semif:true reorders BM25' "$WK/wiki/dist"/assets/*.js 2>/dev/null \
+    && grep -q 'When the SemIf call was recorded' "$WK/wiki/dist"/assets/*.js 2>/dev/null \
+    && grep -q 'Wordkeep 7-row p50' "$WK/wiki/dist"/assets/*.js 2>/dev/null \
+    && grep -q 'Scorer mix' "$WK/wiki/dist"/assets/*.js 2>/dev/null
 }
 
 ui_has_tool_help() {
@@ -233,7 +245,7 @@ rebuild_ui_dist() {
 }
 
 ensure_ui_dist() {
-  if ui_has_runtime_view && ui_has_local_base && ui_has_izakaya_view && ui_has_tool_help; then
+  if ui_has_runtime_view && ui_has_local_base && ui_has_izakaya_view && ui_has_tool_help && ui_has_ereshkigal_view; then
     return 0
   fi
   if ! ui_has_local_base && [[ -f "$WK/wiki/dist/index.html" ]]; then
@@ -242,15 +254,17 @@ ensure_ui_dist() {
     echo "[wordkeep:wiki] wiki/dist is stale (no Runtime Health UI)"
   elif ! ui_has_izakaya_view; then
     echo "[wordkeep:wiki] wiki/dist is stale (no Izakaya dashboard page)"
+  elif ! ui_has_ereshkigal_view; then
+    echo "[wordkeep:wiki] wiki/dist is stale (no Ereshkigal dashboard page)"
   elif ! ui_has_tool_help; then
     echo "[wordkeep:wiki] wiki/dist is stale (TOOL_HELP hover strings missing)"
   fi
   rebuild_ui_dist || return 1
-  ui_has_runtime_view && ui_has_local_base && ui_has_izakaya_view && ui_has_tool_help
+  ui_has_runtime_view && ui_has_local_base && ui_has_izakaya_view && ui_has_tool_help && ui_has_ereshkigal_view
 }
 
 healthy() {
-  ui_up && dashboard_ok && izakaya_ok && runtime_ok && runtime_attach_ok && ui_has_runtime_view && ui_has_izakaya_view && ui_has_tool_help && ui_has_local_base
+  ui_up && dashboard_ok && izakaya_ok && semif_api_ok && runtime_ok && runtime_attach_ok && ui_has_runtime_view && ui_has_izakaya_view && ui_has_ereshkigal_view && ui_has_tool_help && ui_has_local_base
 }
 
 alive_pid() {
