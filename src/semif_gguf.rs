@@ -10,23 +10,29 @@ use std::time::Instant;
 
 struct Live {
     draft: Mutex<ereshkigal_core::score::Scorer>,
-    /// Same draft GGUF with `n_gpu_layers=0` for accuracy escalate (tandem).
-    cpu_draft: Option<Mutex<ereshkigal_core::score::Scorer>>,
+    /// Same draft GGUF at `n_gpu_layers=0`; loaded on first cascade-cpu (VRAM).
+    tandem_cfg: Option<EscalateCfg>,
+    /// `None` = not attempted; `Some(Ok)` = loaded; `Some(Err)` = failed once.
+    cpu_draft: Mutex<Option<Result<Mutex<ereshkigal_core::score::Scorer>, String>>>,
     /// Verify GGUF path + load knobs; engine is loaded on first escalate (VRAM).
-    verify_cfg: Option<VerifyCfg>,
+    verify_cfg: Option<EscalateCfg>,
     /// `None` = not attempted; `Some(Ok)` = loaded; `Some(Err)` = failed once.
     verify: Mutex<Option<Result<Mutex<ereshkigal_core::score::Scorer>, String>>>,
     n_gpu_layers_used: u32,
+    /// Tandem cascade configured (CPU draft may still be lazy / unloaded).
     tandem: bool,
+    max_prompt_tokens: usize,
 }
 
-struct VerifyCfg {
+/// Escalate engine knobs (tandem CPU draft or 4B verify). Always `n_seq=1`.
+struct EscalateCfg {
     path: std::path::PathBuf,
     tok_src: String,
     tok_rev: String,
     threads: i32,
     gpu: u32,
-    n_seq: u32,
+    adapter: Option<std::path::PathBuf>,
+    adapter_scale: f32,
 }
 
 static SLOT: Mutex<Option<Result<Arc<Live>, String>>> = Mutex::new(None);
@@ -55,6 +61,7 @@ fn load_one(
     threads: i32,
     n_gpu_layers: u32,
     n_seq_max: u32,
+    max_prompt_tokens: usize,
     adapter: Option<&Path>,
     adapter_scale: f32,
 ) -> Result<(ereshkigal_core::score::Scorer, u32), String> {
@@ -64,7 +71,7 @@ fn load_one(
             gguf: gguf.to_path_buf(),
             tokenizer_source: tokenizer_source.to_string(),
             tokenizer_revision: tokenizer_revision.to_string(),
-            max_prompt_tokens: 4096,
+            max_prompt_tokens: max_prompt_tokens.max(256),
             threads: if threads <= 0 { 4 } else { threads },
             n_gpu_layers: layers,
             n_seq_max: n_seq_max.max(1),
@@ -109,6 +116,7 @@ fn load_live(root: &Path) -> Result<Live, String> {
     let threads = config::semif_threads(root);
     let gpu = config::semif_n_gpu_layers(root);
     let n_seq = config::semif_n_seq_max(root);
+    let max_prompt = config::semif_max_prompt_tokens(root);
     let tandem = config::semif_tandem(root) && gpu > 0;
     let adapter_path = config::semif_adapter_path(root).and_then(|p| {
         if p.is_file() {
@@ -130,29 +138,23 @@ fn load_live(root: &Path) -> Result<Live, String> {
         threads,
         gpu,
         n_seq,
+        max_prompt,
         adapter_ref,
         adapter_scale,
     ) {
         Ok((draft, used_layers)) => {
-            let cpu_draft = if tandem && used_layers > 0 {
-                match load_one(
-                    &gguf,
-                    &tok_src,
-                    &tok_rev,
+            // Prefetch GPU draft only. Tandem CPU + verify stay lazy — Vulkan-linked
+            // llama.cpp still reserves ~1.8 GiB at n_gpu_layers=0, which doubled VRAM.
+            let tandem_cfg = if tandem && used_layers > 0 {
+                Some(EscalateCfg {
+                    path: gguf.clone(),
+                    tok_src: tok_src.clone(),
+                    tok_rev: tok_rev.clone(),
                     threads,
-                    0,
-                    n_seq,
-                    adapter_ref,
+                    gpu: 0,
+                    adapter: adapter_path.clone(),
                     adapter_scale,
-                ) {
-                    Ok((s, _)) => Some(Mutex::new(s)),
-                    Err(e) => {
-                        eprintln!(
-                            "[wordkeep] tandem CPU draft load failed ({e}); continuing GPU-only"
-                        );
-                        None
-                    }
-                }
+                })
             } else {
                 None
             };
@@ -162,18 +164,20 @@ fn load_live(root: &Path) -> Result<Live, String> {
                     return None;
                 }
                 let (v_src, v_rev) = verify_tokenizer(p, &tok_src, &tok_rev);
-                Some(VerifyCfg {
+                Some(EscalateCfg {
                     path: p.clone(),
                     tok_src: v_src,
                     tok_rev: v_rev,
                     threads,
-                    gpu,
-                    n_seq,
+                    gpu: used_layers, // match draft offload; n_seq forced to 1 at load
+                    adapter: None,
+                    adapter_scale: 1.0,
                 })
             });
+            let tandem_live = tandem_cfg.is_some();
             eprintln!(
-                "[wordkeep] semif engines: gpu_layers={used_layers} tandem={} verify={} adapter={}",
-                cpu_draft.is_some(),
+                "[wordkeep] semif engines: gpu_layers={used_layers} n_seq={n_seq} max_prompt={max_prompt} tandem={} verify={} adapter={}",
+                if tandem_live { "lazy" } else { "false" },
                 if verify_cfg.is_some() {
                     "lazy"
                 } else {
@@ -182,7 +186,6 @@ fn load_live(root: &Path) -> Result<Live, String> {
                 adapter_path.is_some()
             );
             let cold_ms = t0.elapsed().as_millis() as u64;
-            let tandem_live = tandem && cpu_draft.is_some();
             semif_telemetry::write_status(
                 root,
                 json!({
@@ -193,8 +196,11 @@ fn load_live(root: &Path) -> Result<Live, String> {
                     "adapter": adapter_path.as_ref().map(|p| p.display().to_string()),
                     "adapter_scale": adapter_scale,
                     "n_gpu_layers_used": used_layers,
+                    "n_seq_max": n_seq,
+                    "max_prompt_tokens": max_prompt,
                     "tandem": tandem_live,
-                    "cpu_draft_loaded": cpu_draft.is_some(),
+                    "cpu_draft_loaded": false,
+                    "cpu_draft_lazy": tandem_live,
                     "cold_load_ms": cold_ms,
                     "warm": false,
                     "load_error": null,
@@ -205,11 +211,13 @@ fn load_live(root: &Path) -> Result<Live, String> {
             }
             Ok(Live {
                 draft: Mutex::new(draft),
-                cpu_draft,
+                tandem_cfg,
+                cpu_draft: Mutex::new(None),
                 verify_cfg,
                 verify: Mutex::new(None),
                 n_gpu_layers_used: used_layers,
                 tandem: tandem_live,
+                max_prompt_tokens: max_prompt,
             })
         }
         Err(e) => {
@@ -240,13 +248,20 @@ fn ensure_arc(root: &Path) -> Result<Arc<Live>, String> {
             if let Ok(mut w) = WARM.lock() {
                 if !*w {
                     *w = true;
+                    let cpu_loaded = live
+                        .cpu_draft
+                        .lock()
+                        .ok()
+                        .and_then(|g| g.as_ref().map(|r| r.is_ok()))
+                        .unwrap_or(false);
                     semif_telemetry::write_status(
                         root,
                         json!({
                             "warm": true,
                             "n_gpu_layers_used": live.n_gpu_layers_used,
                             "tandem": live.tandem,
-                            "cpu_draft_loaded": live.cpu_draft.is_some(),
+                            "cpu_draft_loaded": cpu_loaded,
+                            "cpu_draft_lazy": live.tandem_cfg.is_some(),
                         }),
                     );
                 }
@@ -420,11 +435,77 @@ fn try_commit_labeled(bundle: &mut ScoreBundle, qhat: f64, source: &str) -> bool
     commit
 }
 
-fn score_cpu_row(live: &Live, req: &DecisionRequest) -> Result<Option<ScoreBundle>, String> {
+fn ensure_cpu_draft(
+    live: &Live,
+    root: &Path,
+) -> Result<Option<()>, String> {
     if !live.tandem {
         return Ok(None);
     }
-    let Some(cpu) = &live.cpu_draft else {
+    let mut g = live.cpu_draft.lock().map_err(|e| e.to_string())?;
+    if g.is_none() {
+        let Some(cfg) = &live.tandem_cfg else {
+            return Ok(None);
+        };
+        eprintln!(
+            "[wordkeep] lazy-loading tandem CPU draft {}",
+            cfg.path.display()
+        );
+        // n_seq_max=1: escalate is single-row; avoids a second fat KV on Vulkan.
+        match load_one(
+            &cfg.path,
+            &cfg.tok_src,
+            &cfg.tok_rev,
+            cfg.threads,
+            cfg.gpu,
+            1,
+            live.max_prompt_tokens,
+            cfg.adapter.as_deref(),
+            cfg.adapter_scale,
+        ) {
+            Ok((s, _)) => {
+                eprintln!("[wordkeep] tandem CPU draft loaded (n_seq=1)");
+                *g = Some(Ok(Mutex::new(s)));
+                semif_telemetry::write_status(
+                    root,
+                    json!({
+                        "cpu_draft_loaded": true,
+                        "cpu_draft_lazy": true,
+                        "cpu_draft_error": null,
+                    }),
+                );
+            }
+            Err(e) => {
+                eprintln!("[wordkeep] tandem CPU draft load failed ({e}); cascade-cpu disabled");
+                *g = Some(Err(e.clone()));
+                semif_telemetry::write_status(
+                    root,
+                    json!({
+                        "cpu_draft_loaded": false,
+                        "cpu_draft_lazy": true,
+                        "cpu_draft_error": e,
+                    }),
+                );
+                return Ok(None);
+            }
+        }
+    }
+    match g.as_ref().expect("cpu_draft slot filled") {
+        Ok(_) => Ok(Some(())),
+        Err(_) => Ok(None),
+    }
+}
+
+fn score_cpu_row(
+    live: &Live,
+    root: &Path,
+    req: &DecisionRequest,
+) -> Result<Option<ScoreBundle>, String> {
+    if ensure_cpu_draft(live, root)?.is_none() {
+        return Ok(None);
+    }
+    let g = live.cpu_draft.lock().map_err(|e| e.to_string())?;
+    let Some(Ok(cpu)) = g.as_ref() else {
         return Ok(None);
     };
     let row = to_row(req);
@@ -475,7 +556,7 @@ pub fn escalate_residuals(
     let live = ensure_arc(root)?;
     let mut need_verify: Vec<usize> = Vec::with_capacity(residual.len());
     for &i in residual {
-        match score_cpu_row(&live, &reqs[i])? {
+        match score_cpu_row(&live, root, &reqs[i])? {
             Some(mut cpu_b) => {
                 if try_commit_labeled(&mut cpu_b, qhat, "cascade-cpu") {
                     bundles[i] = cpu_b;
@@ -523,13 +604,15 @@ fn score_with_verify(
             "[wordkeep] lazy-loading gguf_verify {}",
             cfg.path.display()
         );
+        // n_seq_max=1: verify is single-row; never size a 4B KV for draft wavefront.
         match load_one(
             &cfg.path,
             &cfg.tok_src,
             &cfg.tok_rev,
             cfg.threads,
             cfg.gpu,
-            cfg.n_seq,
+            1,
+            live.max_prompt_tokens,
             None, // verify stays bare — LoRA targets draft 0.6B only
             1.0,
         ) {

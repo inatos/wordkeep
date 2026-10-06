@@ -116,4 +116,57 @@ if [[ -f "$CFG" ]] && command -v python3 >/dev/null 2>&1; then
     fi
   fi
 fi
+
+# Reap rebuilt-but-still-running MCP binaries (Cursor often leaves (deleted) exe
+# maps holding multi-GiB Vulkan KV after cargo rebuild).
+wordkeep_reap_stale_bins() {
+  local root="$1" pid exe cmd
+  for pid in $(pgrep -x wordkeep 2>/dev/null || true); do
+    [[ "$pid" == "$$" ]] && continue
+    exe=$(readlink "/proc/$pid/exe" 2>/dev/null || true)
+    [[ "$exe" == *"(deleted)"* ]] || continue
+    cmd=$(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null || true)
+    [[ "$cmd" == *"--root ${root}"* || "$cmd" == *"--root ${root} "* || "$cmd" == *" ${root}"* ]] || continue
+    echo "[wordkeep:mcp] reaping stale deleted-binary wordkeep pid=$pid" >&2
+    kill "$pid" 2>/dev/null || true
+  done
+}
+
+# One Vulkan SemIf draft per workspace: a second Cursor window/MCP used to each
+# prefetch n_gpu_layers=99 + n_seq_max=32 (~2–4 GiB VRAM) and starve the 1080 Ti
+# (Spectacle EGL_BAD_CONTEXT, game OOMs). Loser stays off GGUF (heuristic) by default.
+wordkeep_acquire_semif_gpu_lease() {
+  local root="$1"
+  local lockdir="$root/.wordkeep"
+  local lockfile="$lockdir/semif-gpu.lock"
+  mkdir -p "$lockdir"
+  # FD 9 must survive exec so the lease stays held for the MCP lifetime.
+  exec 9>"$lockfile" || {
+    echo "[wordkeep:mcp] warning: could not open $lockfile — SemIf GPU lease skipped" >&2
+    return 0
+  }
+  if flock -n 9; then
+    echo $$ >"$lockdir/semif-gpu.pid" 2>/dev/null || true
+    echo "[wordkeep:mcp] SemIf GPU lease acquired (pid $$)" >&2
+  else
+    local holder
+    holder=$(cat "$lockdir/semif-gpu.pid" 2>/dev/null || echo unknown)
+    # Vulkan-linked llama.cpp still reserves ~1–2 GiB at n_gpu_layers=0. Keep the
+    # loser off GGUF entirely (heuristic SemIf) unless the user opts into CPU GGUF.
+    if [[ "${WORDKEEP_SEMIF_ALLOW_CPU_GGUF:-0}" == "1" ]]; then
+      echo "[wordkeep:mcp] SemIf GPU lease held by pid ${holder} — WORDKEEP_SEMIF_ALLOW_CPU_GGUF=1; forcing ERESHKIGAL_N_GPU_LAYERS=0" >&2
+      export ERESHKIGAL_N_GPU_LAYERS=0
+    else
+      echo "[wordkeep:mcp] SemIf GPU lease held by pid ${holder} — forcing WORDKEEP_SEMIF_BACKEND=heuristic (no GGUF/VRAM). Set WORDKEEP_SEMIF_ALLOW_CPU_GGUF=1 for CPU GGUF." >&2
+      export WORDKEEP_SEMIF_BACKEND=heuristic
+    fi
+    exec 9>&-
+  fi
+}
+
+wordkeep_reap_stale_bins "$ROOT"
+# Brief settle so a reaped holder's flock can release before we contend.
+sleep 0.2
+wordkeep_acquire_semif_gpu_lease "$ROOT"
+
 exec "$BIN" "$@"

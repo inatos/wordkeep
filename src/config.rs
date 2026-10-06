@@ -282,7 +282,17 @@ pub fn default_semif_backend() -> String {
 }
 
 /// SemIf scorer backend name. Unknown names fall back in `semif::resolve_scorer`.
+/// `WORDKEEP_SEMIF_BACKEND` / `ERESHKIGAL_BACKEND` override config (mcp.sh uses this to
+/// keep a second Cursor MCP off Vulkan GGUF entirely).
 pub fn semif_backend(root: &Path) -> String {
+    for key in ["WORDKEEP_SEMIF_BACKEND", "ERESHKIGAL_BACKEND"] {
+        if let Ok(s) = std::env::var(key) {
+            let t = s.trim();
+            if !t.is_empty() {
+                return t.to_string();
+            }
+        }
+    }
     load_config(root)
         .and_then(|cfg| {
             cfg.get("semif")
@@ -433,6 +443,12 @@ pub fn semif_tokenizer_revision(root: &Path) -> String {
 }
 
 pub fn semif_n_gpu_layers(root: &Path) -> u32 {
+    // Launcher (`mcp.sh`) forces `0` when another MCP already holds the SemIf GPU lease.
+    if let Ok(s) = std::env::var("ERESHKIGAL_N_GPU_LAYERS") {
+        if let Ok(v) = s.trim().parse::<u32>() {
+            return v;
+        }
+    }
     load_config(root)
         .and_then(|cfg| {
             cfg.get("semif")
@@ -496,17 +512,44 @@ pub fn semif_knowledge_debias(root: &Path) -> String {
 
 /// llama.cpp sequences. Wordkeep scores `direct` one seq at a time; `n_seq_max>1`
 /// shrinks per-seq KV on some backends and caused `NoKvCacheSlot` on knowledge heads.
+/// Production pin is **8** (knowledge head=5 + margin); larger batches serial-fall-back
+/// in ereshkigal `score_shared`. Benches may still pass `N_SEQ_MAX=32`.
 #[cfg(any(test, feature = "ereshkigal"))]
 pub fn semif_n_seq_max(root: &Path) -> u32 {
+    if let Ok(s) = std::env::var("ERESHKIGAL_N_SEQ_MAX") {
+        if let Ok(v) = s.trim().parse::<u64>() {
+            return v.clamp(1, 64) as u32;
+        }
+    }
     load_config(root)
         .and_then(|cfg| {
             cfg.get("semif")
                 .and_then(|m| m.get("n_seq_max"))
                 .and_then(Value::as_u64)
         })
-        // Shared/wavefront suffix batching needs room (production pin 32).
         .map(|n| n.clamp(1, 64) as u32)
         .unwrap_or(1)
+}
+
+/// Max prompt tokens for the draft context (`semif.max_prompt_tokens`, default 1024).
+/// ereshkigal-core pads +64 for n_ctx. Escalate engines (CPU draft / verify) use the same.
+#[cfg(any(test, feature = "ereshkigal"))]
+pub fn semif_max_prompt_tokens(root: &Path) -> usize {
+    if let Ok(s) = std::env::var("ERESHKIGAL_MAX_PROMPT_TOKENS") {
+        if let Ok(v) = s.trim().parse::<usize>() {
+            if v >= 256 {
+                return v.min(8192);
+            }
+        }
+    }
+    load_config(root)
+        .and_then(|cfg| {
+            cfg.get("semif")
+                .and_then(|m| m.get("max_prompt_tokens"))
+                .and_then(Value::as_u64)
+        })
+        .map(|n| (n as usize).clamp(256, 8192))
+        .unwrap_or(1024)
 }
 
 pub fn semif_decrees_path(root: &Path) -> Option<PathBuf> {
@@ -858,6 +901,7 @@ mod tests {
     #[test]
     fn semif_n_seq_max_allows_shared_wavefront_size() {
         let dir = tmp("n_seq");
+        std::env::remove_var("ERESHKIGAL_N_SEQ_MAX");
         fs::write(
             dir.join(".wordkeep/config.json"),
             r#"{"semif":{"n_seq_max":32}}"#,
@@ -870,6 +914,26 @@ mod tests {
         )
         .unwrap();
         assert_eq!(semif_n_seq_max(&dir), 64); // clamp ceiling
+        std::env::set_var("ERESHKIGAL_N_SEQ_MAX", "8");
+        assert_eq!(semif_n_seq_max(&dir), 8);
+        std::env::remove_var("ERESHKIGAL_N_SEQ_MAX");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn semif_max_prompt_tokens_defaults_and_overrides() {
+        let dir = tmp("max_prompt");
+        std::env::remove_var("ERESHKIGAL_MAX_PROMPT_TOKENS");
+        assert_eq!(semif_max_prompt_tokens(&dir), 1024);
+        fs::write(
+            dir.join(".wordkeep/config.json"),
+            r#"{"semif":{"max_prompt_tokens":2048}}"#,
+        )
+        .unwrap();
+        assert_eq!(semif_max_prompt_tokens(&dir), 2048);
+        std::env::set_var("ERESHKIGAL_MAX_PROMPT_TOKENS", "512");
+        assert_eq!(semif_max_prompt_tokens(&dir), 512);
+        std::env::remove_var("ERESHKIGAL_MAX_PROMPT_TOKENS");
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -886,6 +950,39 @@ mod tests {
         assert!((semif_adapter_scale(&dir) - 0.75).abs() < 1e-6);
         std::env::remove_var("ERESHKIGAL_ADAPTER_SCALE");
         assert!((semif_adapter_scale(&dir) - 1.25).abs() < 1e-6);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn semif_n_gpu_layers_env_overrides_config() {
+        let dir = tmp("n_gpu_env");
+        fs::write(
+            dir.join(".wordkeep/config.json"),
+            r#"{"semif":{"n_gpu_layers":99}}"#,
+        )
+        .unwrap();
+        // SAFETY: test-only env mutation; serial under cargo's default test harness for this module.
+        std::env::set_var("ERESHKIGAL_N_GPU_LAYERS", "0");
+        assert_eq!(semif_n_gpu_layers(&dir), 0);
+        std::env::remove_var("ERESHKIGAL_N_GPU_LAYERS");
+        assert_eq!(semif_n_gpu_layers(&dir), 99);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn semif_backend_env_overrides_config() {
+        let dir = tmp("backend_env");
+        fs::write(
+            dir.join(".wordkeep/config.json"),
+            r#"{"semif":{"backend":"ereshkigal"}}"#,
+        )
+        .unwrap();
+        // SAFETY: test-only env mutation; serial under cargo's default test harness for this module.
+        std::env::remove_var("ERESHKIGAL_BACKEND");
+        std::env::set_var("WORDKEEP_SEMIF_BACKEND", "heuristic");
+        assert_eq!(semif_backend(&dir), "heuristic");
+        std::env::remove_var("WORDKEEP_SEMIF_BACKEND");
+        assert_eq!(semif_backend(&dir), "ereshkigal");
         let _ = fs::remove_dir_all(&dir);
     }
 

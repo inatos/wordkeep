@@ -25,7 +25,8 @@ run/test/decide/stats use a resident `ereshkigal serve --stdio` child.
     "tandem": true,
     "adaptive": { "qhat": 0.1, "margin_min": 0.15 },
     "knowledge_debias": "none",
-    "n_seq_max": 32,
+    "n_seq_max": 8,
+    "max_prompt_tokens": 1024,
     "adapter": ".wordkeep/models/qwen3-0.6b-lora-dev.gguf",
     "adapter_scale": 1.5,
     "temperature": 1.0,
@@ -53,17 +54,22 @@ run/test/decide/stats use a resident `ereshkigal serve --stdio` child.
   Keep `none` / `permute` / `pride` as explicit overrides. Retrieval
   `semif:true` stays on `knowledge_debias: none` (one forward; 5 clipped
   candidates).
-- **Tandem:** when `tandem: true` and GPU layers are live, Wordkeep keeps a second
-  draft engine at `n_gpu_layers=0`. Cascade order:
+- **Tandem:** when `tandem: true` and GPU layers are live, Wordkeep can escalate to
+  a second draft engine at `n_gpu_layers=0` (`n_seq_max=1`). Cascade order:
   Vulkan draft → adaptive → conformal singleton → CPU draft escalate → 4B verify.
   `cascade_source`: `cascade-draft` | `cascade-adaptive` | `cascade-cpu` |
   `cascade-verify` | `cascade-skipped`.
-- **Lazy verify:** prefetch / `ensure_loaded` warms **draft (+ tandem CPU draft)
-  only**. The 4B `gguf_verify` loads on the first escalate that needs it
-  (`gguf_verify_loaded: false` until then; `gguf_verify_lazy: true` when pinned).
-  First `cascade-verify` pays cold 4B load; repeats stay warm. On a 1080 Ti, keep
-  **at most one** Wordkeep MCP (wiki does not hold GGUF) or verify OOMs →
-  `cascade-skipped`. Helper: `tools/ereshkigal/scripts/tandem_verify_bench.sh`.
+- **Lazy escalate engines:** prefetch / `ensure_loaded` warms the **GPU draft only**.
+  Tandem CPU draft and 4B `gguf_verify` load on first need (`cpu_draft_loaded` /
+  `gguf_verify_loaded` false until then; both `*_lazy: true` when pinned). Escalate
+  engines always use `n_seq_max=1`. On a 1080 Ti, keep **at most one GPU SemIf**
+  (wiki does not hold GGUF) or verify OOMs → `cascade-skipped`. `mcp.sh` enforces
+  this with a workspace flock on `.wordkeep/semif-gpu.lock`: the first MCP gets
+  Vulkan `n_gpu_layers`; further MCPs get `WORDKEEP_SEMIF_BACKEND=heuristic` so they
+  do **not** load GGUF (Vulkan-linked llama.cpp still reserves ~1–2 GiB VRAM even at
+  `n_gpu_layers=0`). Opt into CPU GGUF on losers with `WORDKEEP_SEMIF_ALLOW_CPU_GGUF=1`.
+  Stale `(deleted)` wordkeep binaries are reaped on start. Helper:
+  `tools/ereshkigal/scripts/tandem_verify_bench.sh`.
 - **Adapter:** `semif.adapter` / `ERESHKIGAL_ADAPTER` attaches LoRA on draft (+ CPU
   draft) only — verify stays bare. `adapter_scale` (env `ERESHKIGAL_ADAPTER_SCALE`,
   default 1.0; pinned **1.5** after holdout sweep) is runtime-only.
@@ -73,18 +79,23 @@ run/test/decide/stats use a resident `ereshkigal serve --stdio` child.
 - **Batch wavefront:** `semantic_decide` `{state, batch:[…]}` draft-scores all
   rows (`score_batch` / shared suffixes when `mode: shared`), applies debias,
   compacts conformal residuals, then CPU → verify waves before scattering.
-- **`n_seq_max`:** production pin **32** (config clamp ceiling **64** — older builds
-  silently capped at 8). Shared vs direct adapter microbench:
-  `tools/ereshkigal/scripts/adapter_shared_bench.sh`. Status JSON exposes
-  `n_seq_max` / `adapter_scale` / `temperature`. Larger `n_seq_max` can hit
-  `NoKvCacheSlot` on knowledge rerank; retrieval falls back to BM25.
+- **`n_seq_max`:** production pin **8** (knowledge head=5 + margin; clamp ceiling
+  **64**). Batches larger than `n_seq_max` serial-fall-back in ereshkigal
+  `score_shared`. Microbench may still pass `N_SEQ_MAX=32` /
+  `ERESHKIGAL_N_SEQ_MAX=32`: `tools/ereshkigal/scripts/adapter_shared_bench.sh`.
+  Status JSON exposes `n_seq_max` / `max_prompt_tokens` / `adapter_scale` /
+  `temperature`. Larger `n_seq_max` inflates Vulkan KV VRAM.
+- **`max_prompt_tokens`:** production pin **1024** (ereshkigal-core n_ctx = +64).
+  Env `ERESHKIGAL_MAX_PROMPT_TOKENS`.
 - llama.cpp allows one backend init per process. `ereshkigal-core` shares a
   process-global leaked `LlamaBackend` so tandem CPU draft and `gguf_verify` can
   load after the GPU draft (without this, the second load fails
   `BackendAlreadyInitialized`).
 - `n_gpu_layers` is attempted then CPU (`0`) if Vulkan/GPU init fails.
 - Paths are gitignored; override with `ERESHKIGAL_GGUF` / `ERESHKIGAL_GGUF_VERIFY`
-  / `ERESHKIGAL_ADAPTER` / `ERESHKIGAL_ADAPTER_SCALE`.
+  / `ERESHKIGAL_ADAPTER` / `ERESHKIGAL_ADAPTER_SCALE` / `ERESHKIGAL_N_GPU_LAYERS`
+  / `ERESHKIGAL_N_SEQ_MAX` / `ERESHKIGAL_MAX_PROMPT_TOKENS`
+  / `WORDKEEP_SEMIF_BACKEND` (or `ERESHKIGAL_BACKEND`).
 
 ## Decree binary resolve
 
@@ -122,7 +133,7 @@ refreshes. Engines are still proven by `cascade_source` on live decides.
 
 Live MCP after prefetch + adaptive + shared backend. Do not mix with CPU 1e-6
 A/B rows or sandbox permute p50 (those can be CPU fallback). **Lazy verify**
-(2026-10-05 later): prefetch warms draft+tandem only; first `cascade-verify`
+(2026-10-06): prefetch warms GPU draft only (lazy tandem/verify); first `cascade-verify`
 pays cold 4B load. Sole MCP + ≥~2.5 GiB free VRAM required or verify OOMs →
 `cascade-skipped`. Helper: `tools/ereshkigal/scripts/tandem_verify_bench.sh`.
 

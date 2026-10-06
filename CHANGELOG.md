@@ -7,11 +7,18 @@ All notable changes to wordkeep are documented here. The project follows
 
 ### Fixed
 
+- Sole SemIf VRAM: prefetch GPU draft only (lazy tandem CPU + verify); escalate
+  engines use `n_seq_max=1`. Production pin `n_seq_max` **8**, `max_prompt_tokens`
+  **1024**. Env: `ERESHKIGAL_N_SEQ_MAX`, `ERESHKIGAL_MAX_PROMPT_TOKENS`.
+- SemIf GPU lease in `mcp.sh`: one Vulkan GGUF prefetch per workspace; further
+  Cursor MCPs use heuristic SemIf (Vulkan-linked `n_gpu_layers=0` still reserved
+  ~1.8 GiB). Reap stale `(deleted)` wordkeep binaries. Env:
+  `ERESHKIGAL_N_GPU_LAYERS`, `WORDKEEP_SEMIF_BACKEND`, `WORDKEEP_SEMIF_ALLOW_CPU_GGUF`.
 - `write_status` read-merges prior `semif-status.json` extras so empty
   `resolve_scorer` refreshes no longer wipe `cpu_draft_loaded` / `cold_load_ms` /
   `n_gpu_layers_used` / `warm`.
-- `semif.n_seq_max` clamp raised **8 → 64** so the production pin of **32** (shared /
-  wavefront parallel suffixes) is honored.
+- `semif.n_seq_max` clamp raised **8 → 64** (benches may still use 32 via env;
+  production pin is **8** for 1080 Ti VRAM).
 - LoRA student no longer flips shared-state meta “mentioned?” rows after a short
   continue-train on train-only `mention` gold (holdout stays frozen).
 
