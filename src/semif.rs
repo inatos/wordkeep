@@ -282,21 +282,53 @@ impl Scorer for RemoteCopperScorer {
         "copper-semif-v1"
     }
     fn score_one(&self, req: &DecisionRequest) -> Result<Vec<(String, f64)>, String> {
-        // Encode request locally with the same FNV layout as copper SemifScoreWorker,
-        // then invoke copper-cli semif for a smoke path; for multi-option fidelity we
-        // map CLI PASS into heuristic ranks when copper-cli only prints status.
-        // Prefer aeron for rich JSON; copper path uses heuristic overlay if CLI lacks JSON.
-        let _ = &self.config;
-        let h = HeuristicScorer;
-        let mut scores = h.score_one(req)?;
-        // Tag remote-copper path: slight bias toward first option when copper env set
-        // (real score vector lands when copper-cli gains JSON decide emit).
-        if let Some((_, s)) = scores.first_mut() {
-            *s += 0.01;
+        let opts = req
+            .options
+            .iter()
+            .map(|o| o.id.as_str())
+            .collect::<Vec<_>>()
+            .join(",");
+        let bin = std::env::var("COPPER_CLI")
+            .unwrap_or_else(|_| "tools/copper/target/release/copper-cli".into());
+        let out = std::process::Command::new(&bin)
+            .args([
+                "--config",
+                &self.config,
+                "semif",
+                "--json",
+                "--option-ids",
+                &opts,
+            ])
+            .output()
+            .map_err(|e| format!("copper-cli spawn: {e}"))?;
+        if !out.status.success() {
+            // Cap-stripped / serve down → heuristic with clear stderr.
+            eprintln!(
+                "[wordkeep] remote-copper failed ({}); heuristic fallback",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            return HeuristicScorer.score_one(req);
         }
-        let sum: f64 = scores.iter().map(|(_, v)| *v).sum::<f64>().max(1e-9);
-        for (_, v) in &mut scores {
-            *v /= sum;
+        let v: serde_json::Value = serde_json::from_slice(&out.stdout)
+            .map_err(|e| format!("copper semif json: {e}"))?;
+        let arr = v
+            .as_array()
+            .ok_or_else(|| "copper semif: expected array".to_string())?;
+        let mut scores = Vec::new();
+        for item in arr {
+            let id = item
+                .get(0)
+                .and_then(|x| x.as_str())
+                .ok_or("bad score id")?
+                .to_string();
+            let s = item
+                .get(1)
+                .and_then(|x| x.as_f64())
+                .ok_or("bad score val")?;
+            scores.push((id, s));
+        }
+        if scores.is_empty() {
+            return Err("copper semif: empty scores".into());
         }
         Ok(scores)
     }
