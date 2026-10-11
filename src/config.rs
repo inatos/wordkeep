@@ -270,15 +270,11 @@ pub fn semif_enabled(root: &Path) -> bool {
 }
 
 /// Default backend when `semif.backend` is omitted.
+///
+/// `auto` = healthy Copper → healthy Aeron → ereshkigal GGUF → heuristic
+/// (resolved in `semif::resolve_scorer`). Explicit `WORDKEEP_SEMIF_BACKEND` wins.
 pub fn default_semif_backend() -> String {
-    #[cfg(feature = "ereshkigal")]
-    {
-        "ereshkigal".into()
-    }
-    #[cfg(not(feature = "ereshkigal"))]
-    {
-        "heuristic".into()
-    }
+    "auto".into()
 }
 
 /// SemIf scorer backend name. Unknown names fall back in `semif::resolve_scorer`.

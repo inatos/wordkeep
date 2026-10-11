@@ -5,7 +5,7 @@
 
 mod model;
 mod policy;
-mod presence;
+pub(crate) mod presence;
 mod profiles;
 mod replay;
 mod store;

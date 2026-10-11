@@ -15,6 +15,7 @@ mod coeffects;
 mod commit_scope;
 mod config;
 mod continuation;
+mod copper_health;
 #[cfg(feature = "dashboard")]
 mod dashboard;
 mod dead_code;
@@ -48,6 +49,7 @@ mod semif_telemetry;
 mod session_pressure;
 mod shrift;
 mod stats;
+mod task_lan;
 mod symbol_context;
 mod symbol_def;
 mod symbol_diff;

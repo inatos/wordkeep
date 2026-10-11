@@ -41,12 +41,18 @@ run/test/decide/stats use a resident `ereshkigal serve --stdio` child.
 }
 ```
 
-- **Without** `--features ereshkigal`, the crate default backend is `heuristic`.
-- **With** the feature, the default backend is `ereshkigal`. Missing GGUF is an
-  error on `semantic_decide` (not a silent heuristic score). `knowledge_search`
-  `semif:true` keeps BM25 order and records a fallback event.
+- Default / config `backend: auto` resolves **healthy Copper → healthy Aeron →
+  ereshkigal GGUF → heuristic**. Explicit `WORDKEEP_SEMIF_BACKEND` /
+  `ERESHKIGAL_BACKEND` always wins (mcp.sh still pins losers to `heuristic`).
+- **Without** `--features ereshkigal`, auto falls through to `heuristic` when
+  remotes are down. Pin `ereshkigal` in config/env for local-only GGUF.
+- Missing GGUF with explicit `ereshkigal` is an error on `semantic_decide` (not a
+  silent heuristic score). `knowledge_search` `semif:true` keeps BM25 order and
+  records a fallback event.
 - `backend: heuristic` remains for air-gapped tests. Unknown names (e.g. `torch`)
   still fall back to the heuristic with `fallback: true`.
+- Copper blips: `RemoteCopperScorer` retries with exponential backoff, then
+  marks cooldown + heuristic fallback (telemetry `kind=copper_blip`).
 - Heuristic `prompt_sha256` hashes the STATE/QUESTION/OPTIONS recipe. GGUF hashes
   `direct-options-v1`. Do not compare hashes across backends.
 - **Debias:** `adaptive` (default) runs identity first and only cyclic-permutes when

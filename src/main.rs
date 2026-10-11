@@ -59,6 +59,11 @@
 //!   * artifact_index   - metadata index over configured artifact roots
 //!   * session_pressure - heuristic context-pressure signal
 //!   * commit_scope     - read-only git dirty-path grouping
+//!   * task_submit      - Palaestra LAN job via run_job.sh + Izakaya GPU lease
+//!   * task_status      - LAN task status + log tail
+//!   * task_fetch       - list pulled artifacts under .cache/palaestra/remote/
+//!   * task_cancel      - best-effort kill + release GPU lease
+//!   * copper_status    - Copper peer health glance (not job SoT)
 //!
 //! Languages: C/C++, GLSL, Rust, Python, C#, and TypeScript via tree-sitter (GLSL
 //! through tree-sitter-glsl, a tree-sitter-c fork sharing the C node kinds;
@@ -82,6 +87,7 @@ mod coeffects;
 mod commit_scope;
 mod config;
 mod continuation;
+mod copper_health;
 #[cfg(feature = "dashboard")]
 mod dashboard;
 mod dead_code;
@@ -116,6 +122,7 @@ mod semif_telemetry;
 mod session_pressure;
 mod shrift;
 mod stats;
+mod task_lan;
 mod symbol_context;
 mod symbol_def;
 mod symbol_diff;
@@ -279,6 +286,7 @@ fn main() {
     let root_commit_scope = root.clone();
     let root_profile_upsert = root.clone();
     let root_prefetch = root.clone();
+    let root_task_lan = root.clone();
     let root_izakaya = root;
 
     let mut raw_tools = vec![
@@ -1539,6 +1547,7 @@ fn main() {
             handler: Box::new(move |args| profile_upsert::run(&root_profile_upsert, args)),
         },
     ];
+    raw_tools.extend(task_lan::mcp_tools(root_task_lan));
     raw_tools.extend(izakaya::mcp_tools(root_izakaya));
 
     stats::init_registry(raw_tools.iter().map(|t| t.name).collect());

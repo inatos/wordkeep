@@ -8,11 +8,11 @@
 //!
 //! Host-agnostic MCP tooling — not a host application runtime.
 
-use crate::{config, semif_debias, semif_telemetry, stats};
+use crate::{config, copper_health, semif_debias, semif_telemetry, stats};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 const SCORER_NAME: &str = "heuristic";
@@ -179,26 +179,97 @@ pub fn resolve_scorer(root: &Path) -> ResolvedScorer {
     resolve_scorer_ex(root, true)
 }
 
+fn copper_scorer(root: &Path) -> RemoteCopperScorer {
+    RemoteCopperScorer {
+        config: std::env::var("COPPER_CONFIG").unwrap_or_else(|_| {
+            root.join("tools/copper/copper.toml")
+                .display()
+                .to_string()
+        }),
+        root: root.to_path_buf(),
+    }
+}
+
+fn aeron_scorer(root: &Path) -> RemoteAeronScorer {
+    RemoteAeronScorer {
+        config: std::env::var("AERON_CONFIG").unwrap_or_else(|_| {
+            root.join("tools/aeron/aeron.toml").display().to_string()
+        }),
+    }
+}
+
+/// Auto resolve: healthy Copper → healthy Aeron → ereshkigal → heuristic.
+fn resolve_auto(root: &Path, for_decide: bool) -> ResolvedScorer {
+    if copper_health::prefer_copper(root) {
+        eprintln!("[wordkeep] semif backend auto → remote-copper (peer healthy)");
+        semif_telemetry::record_event(serde_json::json!({
+            "kind": "backend_resolve",
+            "backend": "remote-copper",
+            "via": "auto",
+        }));
+        return ResolvedScorer::Ready(Box::new(copper_scorer(root)), false);
+    }
+    if copper_health::prefer_aeron(root) {
+        eprintln!("[wordkeep] semif backend auto → remote-aeron (Copper down/cooldown)");
+        semif_telemetry::record_event(serde_json::json!({
+            "kind": "backend_resolve",
+            "backend": "remote-aeron",
+            "via": "auto",
+        }));
+        return ResolvedScorer::Ready(Box::new(aeron_scorer(root)), false);
+    }
+    #[cfg(feature = "ereshkigal")]
+    {
+        return match resolve_ereshkigal(root, for_decide) {
+            ResolvedScorer::Ready(s, u) => {
+                eprintln!("[wordkeep] semif backend auto → ereshkigal (local GGUF)");
+                semif_telemetry::record_event(serde_json::json!({
+                    "kind": "backend_resolve",
+                    "backend": "ereshkigal",
+                    "via": "auto",
+                }));
+                ResolvedScorer::Ready(s, u)
+            }
+            ResolvedScorer::Unavailable(e) => {
+                eprintln!(
+                    "[wordkeep] semif backend auto → heuristic (ereshkigal unavailable: {e})"
+                );
+                semif_telemetry::record_event(serde_json::json!({
+                    "kind": "backend_resolve",
+                    "backend": "heuristic",
+                    "via": "auto",
+                    "reason": e,
+                }));
+                ResolvedScorer::Ready(Box::new(HeuristicScorer), true)
+            }
+        };
+    }
+    #[cfg(not(feature = "ereshkigal"))]
+    {
+        let _ = for_decide;
+        eprintln!("[wordkeep] semif backend auto → heuristic (no ereshkigal feature)");
+        semif_telemetry::record_event(serde_json::json!({
+            "kind": "backend_resolve",
+            "backend": "heuristic",
+            "via": "auto",
+        }));
+        ResolvedScorer::Ready(Box::new(HeuristicScorer), false)
+    }
+}
+
 fn resolve_scorer_ex(root: &Path, for_decide: bool) -> ResolvedScorer {
     semif_telemetry::write_status(root, serde_json::json!({}));
     let backend = config::semif_backend(root);
     match backend.as_str() {
+        "auto" => resolve_auto(root, for_decide),
         "heuristic" | "" => ResolvedScorer::Ready(Box::new(HeuristicScorer), false),
         "ereshkigal" | "gguf" => resolve_ereshkigal(root, for_decide),
-        "remote-aeron" | "aeron" => ResolvedScorer::Ready(
-            Box::new(RemoteAeronScorer {
-                config: std::env::var("AERON_CONFIG")
-                    .unwrap_or_else(|_| "tools/aeron/aeron.toml".into()),
-            }),
-            false,
-        ),
-        "remote-copper" | "copper" => ResolvedScorer::Ready(
-            Box::new(RemoteCopperScorer {
-                config: std::env::var("COPPER_CONFIG")
-                    .unwrap_or_else(|_| "tools/copper/copper.toml".into()),
-            }),
-            false,
-        ),
+        "remote-aeron" | "aeron" => {
+            ResolvedScorer::Ready(Box::new(aeron_scorer(root)), false)
+        }
+        "remote-copper" | "copper" => {
+            ResolvedScorer::Ready(Box::new(copper_scorer(root)), false)
+        }
         other => {
             eprintln!("[wordkeep] semif backend {other:?} unavailable; using heuristic");
             ResolvedScorer::Ready(Box::new(HeuristicScorer), true)
@@ -272,6 +343,7 @@ impl Scorer for RemoteAeronScorer {
 /// Lane L: SemIf via Copper `semif-score` worker (needs elevated copper serve).
 pub struct RemoteCopperScorer {
     pub config: String,
+    pub root: PathBuf,
 }
 
 impl Scorer for RemoteCopperScorer {
@@ -288,49 +360,119 @@ impl Scorer for RemoteCopperScorer {
             .map(|o| o.id.as_str())
             .collect::<Vec<_>>()
             .join(",");
-        let bin = std::env::var("COPPER_CLI")
-            .unwrap_or_else(|_| "tools/copper/target/release/copper-cli".into());
-        let out = std::process::Command::new(&bin)
-            .args([
-                "--config",
-                &self.config,
-                "semif",
-                "--json",
-                "--option-ids",
-                &opts,
-            ])
-            .output()
-            .map_err(|e| format!("copper-cli spawn: {e}"))?;
-        if !out.status.success() {
-            // Cap-stripped / serve down → heuristic with clear stderr.
-            eprintln!(
-                "[wordkeep] remote-copper failed ({}); heuristic fallback",
-                String::from_utf8_lossy(&out.stderr)
-            );
-            return HeuristicScorer.score_one(req);
+        let bin = std::env::var("COPPER_CLI").unwrap_or_else(|_| {
+            let rel = self.root.join("tools/copper/target/release/copper-cli");
+            if rel.is_file() {
+                rel.display().to_string()
+            } else {
+                "tools/copper/target/release/copper-cli".into()
+            }
+        });
+
+        // Caps missing → do not hot-loop AF_PACKET.
+        if let Some(h) = copper_health::read_cached(&self.root) {
+            if !h.can_probe() {
+                eprintln!(
+                    "[wordkeep] remote-copper caps={}; heuristic fallback (no ping spin)",
+                    h.caps
+                );
+                semif_telemetry::record_event(serde_json::json!({
+                    "kind": "copper_blip",
+                    "backend": "remote-copper",
+                    "fallback": "heuristic",
+                    "reason": "caps_missing",
+                }));
+                return HeuristicScorer.score_one(req);
+            }
         }
-        let v: serde_json::Value = serde_json::from_slice(&out.stdout)
-            .map_err(|e| format!("copper semif json: {e}"))?;
-        let arr = v
-            .as_array()
-            .ok_or_else(|| "copper semif: expected array".to_string())?;
-        let mut scores = Vec::new();
-        for item in arr {
-            let id = item
-                .get(0)
-                .and_then(|x| x.as_str())
-                .ok_or("bad score id")?
-                .to_string();
-            let s = item
-                .get(1)
-                .and_then(|x| x.as_f64())
-                .ok_or("bad score val")?;
-            scores.push((id, s));
+
+        let mut last_err = String::new();
+        for attempt in 0u32..4 {
+            let out = match std::process::Command::new(&bin)
+                .args([
+                    "--config",
+                    &self.config,
+                    "semif",
+                    "--json",
+                    "--option-ids",
+                    &opts,
+                ])
+                .current_dir(&self.root)
+                .output()
+            {
+                Ok(o) => o,
+                Err(e) => {
+                    last_err = format!("copper-cli spawn: {e}");
+                    if attempt + 1 < 4 {
+                        copper_health::backoff_sleep(attempt);
+                        continue;
+                    }
+                    break;
+                }
+            };
+            if out.status.success() {
+                let v: serde_json::Value = match serde_json::from_slice(&out.stdout) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        last_err = format!("copper semif json: {e}");
+                        if attempt + 1 < 4 {
+                            copper_health::backoff_sleep(attempt);
+                            continue;
+                        }
+                        break;
+                    }
+                };
+                let arr = match v.as_array() {
+                    Some(a) => a,
+                    None => {
+                        last_err = "copper semif: expected array".into();
+                        break;
+                    }
+                };
+                let mut scores = Vec::new();
+                for item in arr {
+                    let id = item
+                        .get(0)
+                        .and_then(|x| x.as_str())
+                        .ok_or("bad score id")?
+                        .to_string();
+                    let s = item
+                        .get(1)
+                        .and_then(|x| x.as_f64())
+                        .ok_or("bad score val")?;
+                    scores.push((id, s));
+                }
+                if scores.is_empty() {
+                    last_err = "copper semif: empty scores".into();
+                    if attempt + 1 < 4 {
+                        copper_health::backoff_sleep(attempt);
+                        continue;
+                    }
+                    break;
+                }
+                copper_health::clear_cooldown(&self.root);
+                return Ok(scores);
+            }
+            last_err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            if last_err.is_empty() {
+                last_err = format!("exit {}", out.status);
+            }
+            if attempt + 1 < 4 {
+                copper_health::backoff_sleep(attempt);
+            }
         }
-        if scores.is_empty() {
-            return Err("copper semif: empty scores".into());
-        }
-        Ok(scores)
+
+        copper_health::mark_down_cooldown(&self.root);
+        eprintln!(
+            "[wordkeep] remote-copper failed after backoff ({last_err}); heuristic fallback"
+        );
+        semif_telemetry::record_event(serde_json::json!({
+            "kind": "copper_blip",
+            "backend": "remote-copper",
+            "fallback": "heuristic",
+            "reason": last_err,
+        }));
+        HeuristicScorer.score_one(req)
     }
 }
 
