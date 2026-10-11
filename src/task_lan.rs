@@ -1,5 +1,9 @@
 //! Palaestra LAN task delegation — Wordkeep MCP wrappers around
 //! `tools/palaestra/remote/run_job.sh` with an Izakaya GPU lease (`gpu-3080ti`).
+//!
+//! Folds `progress.json` (GPU vitals + phase/pct) into the task record for
+//! Courier telemetry. Terminal transitions fire `notify-send` + Courier
+//! `task.done` / `task.fail`. Courier remains notify-only; `task_*` is SoT.
 
 use serde_json::{json, Value};
 use std::fs;
@@ -15,12 +19,15 @@ use crate::stats;
 
 const GPU_AGENT: &str = "gpu-3080ti";
 const GPU_CLAIM_PATH: &str = "tools/palaestra/remote";
+/// Display-only: heartbeat older than this → `stalled` hint (never auto-fail).
+const PROGRESS_STALE_DEFAULT_SEC: u64 = 45;
 
 static ACTIVE: Mutex<Option<ActiveTask>> = Mutex::new(None);
 
 struct ActiveTask {
     task_id: String,
     child: Child,
+    last_progress_phase: Option<String>,
 }
 
 fn tasks_dir(root: &Path) -> PathBuf {
@@ -115,26 +122,29 @@ fn mirror_craft_receipt(root: &Path, rec: &Value) {
 fn job_lane(job: &str) -> &'static str {
     match job {
         // Live / micro workers — Copper wire + optional Copper worker.
-        "identity-tmlp" | "cuda-smoke" | "arte-art-pose" => "L",
+        "identity-tmlp" | "cuda-smoke" | "arte-art-pose" | "deepseek-ocr" => "L",
         // Overnight / heavy — task_* SoT + SSH executor (Copper notify only).
         "train-stub" | "hunyuan-img2mesh" | "lift-stub" => "J",
         _ => "J",
     }
 }
 
-fn courier_notify_submit(root: &Path, task_id: &str, job: &str, transport: &str) {
-    if transport != "copper" && transport != "aeron" {
-        return;
-    }
+fn courier_post(
+    root: &Path,
+    kind: &str,
+    body: &str,
+    task_id: &str,
+    transport: &str,
+) {
     let dir = root.join(".cache/palaestra/courier");
     let _ = fs::create_dir_all(&dir);
-    let id = format!("{}-task-submit", now_secs());
+    let id = format!("{}-{}", now_secs(), kind.replace('.', "-"));
     let doc = json!({
         "id": id,
         "from": "wordkeep-task",
-        "to": "peer",
-        "kind": "task.submit",
-        "body": format!("task_submit {task_id} job={job} transport={transport}"),
+        "to": "desktop",
+        "kind": kind,
+        "body": body,
         "paths": [],
         "created_unix": now_secs(),
         "transport": transport,
@@ -145,6 +155,112 @@ fn courier_notify_submit(root: &Path, task_id: &str, job: &str, transport: &str)
     let _ = fs::write(
         dir.join(format!("{id}.json")),
         serde_json::to_string_pretty(&doc).unwrap_or_else(|_| "{}".into()),
+    );
+}
+
+fn courier_notify_submit(root: &Path, task_id: &str, job: &str, transport: &str) {
+    if transport != "copper" && transport != "aeron" {
+        return;
+    }
+    courier_post(
+        root,
+        "task.submit",
+        &format!("task_submit {task_id} job={job} transport={transport}"),
+        task_id,
+        transport,
+    );
+}
+
+/// Desktop notification on terminal transitions only (done/failed/cancelled).
+fn desktop_notify(title: &str, body: &str) {
+    let _ = Command::new("notify-send")
+        .args(["--app-name=BetwixtCourier", "--urgency=normal", title, body])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
+fn read_progress_json(root: &Path, job: &str) -> Option<Value> {
+    let path = remote_dir(root, job).join("progress.json");
+    let raw = fs::read_to_string(&path).ok()?;
+    serde_json::from_str(&raw).ok()
+}
+
+fn progress_is_stale(progress: &Value) -> bool {
+    let Some(hb) = progress.get("heartbeat_at").and_then(Value::as_u64) else {
+        return false;
+    };
+    let stale_after = progress
+        .get("stale_after_sec")
+        .and_then(Value::as_u64)
+        .unwrap_or(PROGRESS_STALE_DEFAULT_SEC);
+    now_secs().saturating_sub(hb) > stale_after
+}
+
+/// Fold progress.json into the task record. Returns current phase (if any).
+/// Stale heartbeats set `stalled: true` as a display hint — never change status.
+fn fold_progress(root: &Path, rec: &mut Value) -> Option<String> {
+    let job = rec.get("job").and_then(Value::as_str)?.to_string();
+    let progress = read_progress_json(root, &job)?;
+    let phase = progress
+        .get("phase")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let stale = progress_is_stale(&progress);
+    if let Some(obj) = rec.as_object_mut() {
+        obj.insert("progress".into(), progress);
+        obj.insert("stalled".into(), json!(stale));
+        // Display hint only — never flip status based on stalled heartbeat.
+        if stale {
+            obj.insert(
+                "stalled_note".into(),
+                json!("heartbeat stale (display hint; task_* status unchanged)"),
+            );
+        } else {
+            obj.remove("stalled_note");
+        }
+    }
+    phase
+}
+
+fn notify_terminal(root: &Path, rec: &Value, status: &str) {
+    let task_id = rec
+        .get("task_id")
+        .and_then(Value::as_str)
+        .unwrap_or("?");
+    let job = rec.get("job").and_then(Value::as_str).unwrap_or("?");
+    let transport = rec
+        .get("transport")
+        .and_then(Value::as_str)
+        .unwrap_or("none");
+    let (kind, title) = match status {
+        "done" => ("task.done", "Courier task done"),
+        "failed" => ("task.fail", "Courier task failed"),
+        "cancelled" => ("task.fail", "Courier task cancelled"),
+        _ => return,
+    };
+    let body = format!("{status}: {task_id} job={job}");
+    courier_post(root, kind, &body, task_id, transport);
+    desktop_notify(title, &body);
+}
+
+fn notify_phase_change(root: &Path, rec: &Value, phase: &str) {
+    let task_id = rec
+        .get("task_id")
+        .and_then(Value::as_str)
+        .unwrap_or("?");
+    let job = rec.get("job").and_then(Value::as_str).unwrap_or("?");
+    let transport = rec
+        .get("transport")
+        .and_then(Value::as_str)
+        .unwrap_or("none");
+    // Phase-change only (throttled by caller comparing last phase).
+    courier_post(
+        root,
+        "task.progress",
+        &format!("phase={phase} task={task_id} job={job}"),
+        task_id,
+        transport,
     );
 }
 
@@ -256,11 +372,9 @@ fn poll_active(root: &Path) {
                     .and_then(Value::as_str)
                     .unwrap_or("")
                     .to_string();
+                let terminal = if status.success() { "done" } else { "failed" };
                 if let Some(obj) = rec.as_object_mut() {
-                    obj.insert(
-                        "status".into(),
-                        json!(if status.success() { "done" } else { "failed" }),
-                    );
+                    obj.insert("status".into(), json!(terminal));
                     obj.insert("exit_code".into(), json!(code));
                     obj.insert("finished_at".into(), json!(now_secs()));
                     obj.insert(
@@ -268,15 +382,47 @@ fn poll_active(root: &Path) {
                         json!(tail_log(&remote_dir(root, &job).join("run.log"), 40)),
                     );
                 }
+                let _ = fold_progress(root, &mut rec);
                 let _ = write_task(root, &task_id, &rec);
                 mirror_craft_receipt(root, &rec);
+                notify_terminal(root, &rec, terminal);
                 if !lease.is_empty() {
                     release_gpu_lease(root, &lease);
                 }
             }
             *guard = None;
         }
-        Ok(None) => {}
+        Ok(None) => {
+            // Still running — fold live progress; Courier on phase change only.
+            let task_id = active.task_id.clone();
+            if let Ok(mut rec) = read_task(root, &task_id) {
+                let job = rec
+                    .get("job")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                if !job.is_empty() {
+                    if let Some(obj) = rec.as_object_mut() {
+                        obj.insert(
+                            "log_tail".into(),
+                            json!(tail_log(&remote_dir(root, &job).join("run.log"), 40)),
+                        );
+                    }
+                }
+                if let Some(phase) = fold_progress(root, &mut rec) {
+                    let changed = active.last_progress_phase.as_deref() != Some(phase.as_str());
+                    if changed {
+                        // Skip terminal phases here — handled on child exit.
+                        if phase != "done" && phase != "failed" && phase != "cancelled" {
+                            notify_phase_change(root, &rec, &phase);
+                        }
+                        active.last_progress_phase = Some(phase);
+                    }
+                }
+                let _ = write_task(root, &task_id, &rec);
+                mirror_craft_receipt(root, &rec);
+            }
+        }
         Err(_) => {
             *guard = None;
         }
@@ -361,11 +507,9 @@ pub fn submit(root: &Path, args: &Value) -> Result<String, String> {
     if wait {
         let status = child.wait().map_err(|e| e.to_string())?;
         let code = status.code().unwrap_or(-1);
+        let terminal = if status.success() { "done" } else { "failed" };
         if let Some(obj) = rec.as_object_mut() {
-            obj.insert(
-                "status".into(),
-                json!(if status.success() { "done" } else { "failed" }),
-            );
+            obj.insert("status".into(), json!(terminal));
             obj.insert("exit_code".into(), json!(code));
             obj.insert("finished_at".into(), json!(now_secs()));
             obj.insert(
@@ -373,8 +517,10 @@ pub fn submit(root: &Path, args: &Value) -> Result<String, String> {
                 json!(tail_log(&out_dir.join("run.log"), 40)),
             );
         }
+        let _ = fold_progress(root, &mut rec);
         write_task(root, &task_id, &rec)?;
         mirror_craft_receipt(root, &rec);
+        notify_terminal(root, &rec, terminal);
         release_gpu_lease(root, &lease_id);
         return Ok(serde_json::to_string_pretty(&rec).unwrap_or_else(|_| "{}".into()));
     }
@@ -383,6 +529,7 @@ pub fn submit(root: &Path, args: &Value) -> Result<String, String> {
     *guard = Some(ActiveTask {
         task_id: task_id.clone(),
         child,
+        last_progress_phase: None,
     });
     mirror_craft_receipt(root, &rec);
     Ok(serde_json::to_string_pretty(&rec).unwrap_or_else(|_| "{}".into()))
@@ -407,6 +554,8 @@ pub fn status(root: &Path, args: &Value) -> Result<String, String> {
             }
         }
     }
+    let _ = fold_progress(root, &mut rec);
+    let _ = write_task(root, &task_id, &rec);
     mirror_craft_receipt(root, &rec);
     Ok(serde_json::to_string_pretty(&rec).unwrap_or_else(|_| "{}".into()))
 }
@@ -486,7 +635,9 @@ pub fn cancel(root: &Path, args: &Value) -> Result<String, String> {
         obj.insert("finished_at".into(), json!(now_secs()));
         obj.insert("killed".into(), json!(killed));
     }
+    let _ = fold_progress(root, &mut rec);
     write_task(root, &task_id, &rec)?;
+    notify_terminal(root, &rec, "cancelled");
     if !lease.is_empty() {
         release_gpu_lease(root, &lease);
     }
@@ -500,7 +651,7 @@ pub fn mcp_tools(root: PathBuf) -> Vec<mcp::Tool> {
               "task_submit",
               "Submit a Palaestra LAN job via tools/palaestra/remote/run_job.sh. Acquires Izakaya GPU lease (gpu-3080ti). Uses Copper/Aeron wire when healthy for submit/notify; task_* remains SoT; SSH still executes heavy bodies. Args: job (required), wait (bool, default true).",
               json!({"type":"object","properties":{
-                  "job":{"type":"string","description":"Job name under tools/palaestra/remote/jobs/<job>.sh (Lane L: identity-tmlp/cuda-smoke/arte-art-pose; Lane J: train-stub/hunyuan-img2mesh/lift-stub)"},
+                  "job":{"type":"string","description":"Job name under tools/palaestra/remote/jobs/<job>.sh (Lane L: identity-tmlp/cuda-smoke/arte-art-pose/deepseek-ocr; Lane J: train-stub/hunyuan-img2mesh/lift-stub)"},
                   "wait":{"type":"boolean","description":"Wait for completion (default true). false spawns background."}
               },"required":["job"]}),
           ),
@@ -617,7 +768,7 @@ mod tests {
         fs::create_dir_all(root.join(".wordkeep")).unwrap();
         std::env::set_var("XDG_CACHE_HOME", &cache);
         std::env::set_var("WORDKEEP_IZAKAYA_NOW", "2000");
-        // Minimal run_job.sh that writes an artifact for identity-tmlp.
+        // Minimal run_job.sh that writes an artifact + progress.json for identity-tmlp.
         let run = root.join("tools/palaestra/remote/run_job.sh");
         fs::write(
             &run,
@@ -631,6 +782,19 @@ mkdir -p "$OUT" "$ROOT/.cache/palaestra/jobs/$JOB"
 echo ok > "$OUT/run.log"
 echo fixture > "$OUT/identity.tmlp"
 echo fixture > "$ROOT/.cache/palaestra/jobs/$JOB/identity.tmlp"
+NOW=$(date +%s)
+cat > "$OUT/progress.json" <<EOF
+{
+  "phase": "done",
+  "pct": 100,
+  "eta_sec": 0,
+  "job": "$JOB",
+  "heartbeat_at": $NOW,
+  "stale_after_sec": 45,
+  "gpu": {"util": 12.0, "temp": 45.0, "vram_used_mib": 100, "vram_total_mib": 12288, "power_w": 40, "fan": 30, "available": true}
+}
+EOF
+cp -f "$OUT/progress.json" "$ROOT/.cache/palaestra/jobs/$JOB/progress.json"
 "#,
         )
         .unwrap();
@@ -670,6 +834,77 @@ echo fixture > "$ROOT/.cache/palaestra/jobs/$JOB/identity.tmlp"
         assert_eq!(receipt["palaestra_task_id"], task_id);
         let fetch = fetch(&root, &json!({"job": "identity-tmlp", "task_id": task_id})).unwrap();
         assert!(fetch.contains("identity.tmlp"));
+        // progress folded + terminal Courier notify
+        assert_eq!(v["progress"]["phase"], "done");
+        assert_eq!(v["progress"]["pct"], 100.0);
+        assert_eq!(v["stalled"], false);
+        let courier_dir = root.join(".cache/palaestra/courier");
+        let terminal: Vec<_> = fs::read_dir(&courier_dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().contains("task-done"))
+            .collect();
+        assert!(
+            !terminal.is_empty(),
+            "expected task.done Courier post under {}",
+            courier_dir.display()
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn fold_progress_marks_stale_without_flipping_status() {
+        let (_g, root) = isolated("stale");
+        let job = "identity-tmlp";
+        let out = remote_dir(&root, job);
+        fs::create_dir_all(&out).unwrap();
+        let old = now_secs().saturating_sub(120);
+        fs::write(
+            out.join("progress.json"),
+            serde_json::to_string_pretty(&json!({
+                "phase": "train",
+                "pct": 40,
+                "job": job,
+                "heartbeat_at": old,
+                "stale_after_sec": 45,
+                "gpu": {"util": 90.0, "available": true}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let mut rec = json!({
+            "task_id": "t-stale",
+            "job": job,
+            "status": "running",
+        });
+        let phase = fold_progress(&root, &mut rec);
+        assert_eq!(phase.as_deref(), Some("train"));
+        assert_eq!(rec["status"], "running"); // never auto-fail
+        assert_eq!(rec["stalled"], true);
+        assert!(rec.get("stalled_note").is_some());
+        assert_eq!(rec["progress"]["pct"], 40.0);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn notify_terminal_posts_task_fail() {
+        let (_g, root) = isolated("fail-notify");
+        let rec = json!({
+            "task_id": "t-fail",
+            "job": "identity-tmlp",
+            "transport": "none",
+            "status": "failed",
+        });
+        notify_terminal(&root, &rec, "failed");
+        let courier_dir = root.join(".cache/palaestra/courier");
+        let posts: Vec<_> = fs::read_dir(&courier_dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .collect();
+        assert!(!posts.is_empty());
+        let body = fs::read_to_string(&posts[0]).unwrap();
+        assert!(body.contains("task.fail") || body.contains("\"kind\": \"task.fail\""));
         let _ = fs::remove_dir_all(&root);
     }
 }
