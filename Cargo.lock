@@ -4576,6 +4576,7 @@ dependencies = [
  "ereshkigal-lang",
  "fastembed",
  "fs2",
+ "image",
  "ratatui",
  "serde_json",
  "sha2",

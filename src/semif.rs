@@ -199,16 +199,61 @@ fn aeron_scorer(root: &Path) -> RemoteAeronScorer {
 }
 
 /// Auto resolve: healthy Copper → healthy Aeron → ereshkigal → heuristic.
+/// Optical Compression Tier policy tip for decrees / agents (text decide stays SoT).
+pub fn optical_policy_hint(root: &Path, estimated_ratio: f64, is_code_signature: bool) -> Value {
+    let max_ratio = config::optical_max_ratio(root).unwrap_or(crate::optical::MAX_RATIO_DEFAULT);
+    let allow = crate::optical::policy_allows_optical(max_ratio, estimated_ratio, is_code_signature);
+    // Cache-only — never block MCP on copper_health.sh / aeron ping.
+    let peer = copper_health::prefer_copper_cached(root);
+    let choice = if is_code_signature {
+        "exact"
+    } else if estimated_ratio > max_ratio {
+        "exact"
+    } else if allow {
+        "optical"
+    } else {
+        "exact"
+    };
+    let v = serde_json::json!({
+        "kind": "optical_policy",
+        "choice": choice,
+        "max_ratio": max_ratio,
+        "estimated_ratio": estimated_ratio,
+        "is_code_signature": is_code_signature,
+        "peer_healthy": peer,
+        "decree": "oct_use_optical",
+        "default_on": config::optical_default_enabled(root),
+    });
+    eprintln!(
+        "[wordkeep] optical policy → {choice} (ratio={estimated_ratio:.2} max={max_ratio:.1} peer={peer})"
+    );
+    semif_telemetry::record_event(v.clone());
+    v
+}
+
 fn resolve_auto(root: &Path, for_decide: bool) -> ResolvedScorer {
-    if copper_health::prefer_copper(root) {
-        eprintln!("[wordkeep] semif backend auto → remote-copper (peer healthy)");
-        semif_telemetry::record_event(serde_json::json!({
-            "kind": "backend_resolve",
-            "backend": "remote-copper",
-            "via": "auto",
-        }));
-        return ResolvedScorer::Ready(Box::new(copper_scorer(root)), false);
-    }
+      // Optical encode (DeepSeek-OCR) rides Copper/Aeron when healthy; SemIf scoring
+      // still resolves Copper → Aeron → GGUF → heuristic. Log OCT availability tip.
+      if config::optical_default_enabled(root)
+          || std::env::var("WORDKEEP_OPTICAL").map(|s| s == "1").unwrap_or(false)
+      {
+          let peer = copper_health::prefer_copper_cached(root);
+          semif_telemetry::record_event(serde_json::json!({
+              "kind": "optical_backend_tip",
+              "encode": if peer { "deepseek-ocr" } else { "glyph-ocr" },
+              "peer_healthy": peer,
+              "via": "auto",
+          }));
+      }
+      if copper_health::prefer_copper(root) {
+          eprintln!("[wordkeep] semif backend auto → remote-copper (peer healthy)");
+          semif_telemetry::record_event(serde_json::json!({
+              "kind": "backend_resolve",
+              "backend": "remote-copper",
+              "via": "auto",
+          }));
+          return ResolvedScorer::Ready(Box::new(copper_scorer(root)), false);
+      }
     if copper_health::prefer_aeron(root) {
         eprintln!("[wordkeep] semif backend auto → remote-aeron (Copper down/cooldown)");
         semif_telemetry::record_event(serde_json::json!({

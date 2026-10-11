@@ -141,6 +141,15 @@ export type DashboardSignal = {
   detail?: string | null;
 };
 
+export type DashboardOptical = {
+  calls?: number;
+  fallback_calls?: number;
+  avg_ratio?: number;
+  avg_precision?: number;
+  precision_samples?: number;
+  enabled_hint?: string;
+};
+
 export type DashboardPayload = {
   available: boolean;
   message?: string;
@@ -157,6 +166,8 @@ export type DashboardPayload = {
     reduction_pct: number;
     since_label?: string;
   };
+  /** Optical Compression Tier counters (split from text-path tools). */
+  optical?: DashboardOptical;
   tools?: DashboardTool[];
   activity?: DashboardActivity[];
   health?: { signals?: DashboardSignal[] };

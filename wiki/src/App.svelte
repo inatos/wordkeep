@@ -2707,6 +2707,26 @@
                 <h3>Tracking</h3>
                 <p class="metric"><code>{dashboard.overview?.since_label ?? '—'}</code></p>
               </article>
+              <article
+                class="card"
+                title="Optical Compression Tier (OCT): ratio/precision split from text-path savings. Opt-in via knowledge_search optical:true."
+              >
+                <h3>Optical</h3>
+                <p class="metric"
+                  ><code
+                    >{dashboard.optical?.calls ?? 0} calls · {(
+                      dashboard.optical?.avg_ratio ?? 0
+                    ).toFixed(1)}x · p={(
+                      dashboard.optical?.avg_precision ?? 0
+                    ).toFixed(2)}</code
+                  ></p
+                >
+                {#if (dashboard.optical?.fallback_calls ?? 0) > 0}
+                  <p class="muted" style="font-size:0.85em;margin:0.25rem 0 0">
+                    fallback {dashboard.optical?.fallback_calls}
+                  </p>
+                {/if}
+              </article>
             </div>
           </CollapsibleSection>
 

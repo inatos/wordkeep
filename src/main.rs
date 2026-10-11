@@ -106,6 +106,7 @@ mod lang;
 mod mas;
 mod mcp;
 mod module_map;
+mod optical;
 mod outline;
 mod profile_upsert;
 mod progress;
@@ -113,7 +114,6 @@ mod repo_map;
 mod runs;
 mod runtime;
 mod semif;
-#[cfg(feature = "ereshkigal")]
 mod semif_cascade;
 mod semif_debias;
 #[cfg(feature = "ereshkigal")]
@@ -816,6 +816,14 @@ fn main() {
                                   "description": "Rerank BM25 hits with embeddings (only when built with --features embeddings). Default true. Without embeddings, semantic:true soft-falls back to SemIf heuristic rerank." },
                     "semif": { "type": "boolean",
                                "description": "Rerank BM25 head with SemIf heuristic scorer (semantic_decide). Default false. Distinct from embedding semantic." },
+                    "optical": { "type": "boolean",
+                                 "description": "Opt-in Optical Compression Tier (OCT): render hit pages to PNG + OCR-decode skim (≤10×) with exact fallback. Default false until eval gate." },
+                    "optical_max_ratio": { "type": "number",
+                                           "description": "Max text/vision ratio for OCT (default 10). Cap 20; code signatures always exact." },
+                    "optical_mode": { "type": "string",
+                                      "description": "Force vision mode: tiny|small|base|large (DeepSeek-OCR native resolutions)." },
+                    "optical_gpu": { "type": "boolean",
+                                     "description": "Prefer Copper/Aeron deepseek-ocr job when peer healthy (default true); else glyph-OCR." },
                     "continuation": continuation::schema_prop()
                 },
                 "required": ["query"]

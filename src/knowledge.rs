@@ -252,7 +252,17 @@ fn retrieve(root: &Path, args: &Value) -> Result<Retrieval, String> {
 }
 
 pub fn search(root: &Path, args: &Value) -> Result<String, String> {
-    const FP_KEYS: &[&str] = &["query", "k", "roots", "include_defects", "semantic"];
+    const FP_KEYS: &[&str] = &[
+        "query",
+        "k",
+        "roots",
+        "include_defects",
+        "semantic",
+        "optical",
+        "optical_max_ratio",
+        "optical_mode",
+        "optical_gpu",
+    ];
     let k = args.get("k").and_then(Value::as_u64).unwrap_or(5).max(1) as usize;
     let budget = args
         .get("token_budget")
@@ -290,6 +300,7 @@ pub fn search(root: &Path, args: &Value) -> Result<String, String> {
     let mut used = out.len() / 4;
     let mut truncated_at: Option<usize> = None;
     let mut shown = 0usize;
+    let mut shown_hits: Vec<(String, String, String)> = Vec::new();
     for rank in start..end {
         let hit = &retrieval.hits[rank];
         let snippet = snippet_for(&hit.body, &retrieval.q_terms, 280);
@@ -309,6 +320,7 @@ pub fn search(root: &Path, args: &Value) -> Result<String, String> {
         used += block_tokens;
         shown += 1;
         out.push_str(&block);
+        shown_hits.push((hit.path.clone(), hit.heading.clone(), hit.body.clone()));
     }
     if let Some(rank) = truncated_at {
         let omitted = end.saturating_sub(rank);
@@ -321,6 +333,38 @@ pub fn search(root: &Path, args: &Value) -> Result<String, String> {
             &format!("+{omitted} further matches"),
         );
     }
+
+    // Opt-in Optical Compression Tier (OCT): PNG artifact + OCR-decoded skim.
+    let optical_policy = crate::optical::OpticalPolicy::from_args(root, args);
+    if optical_policy.enabled && !shown_hits.is_empty() {
+        let approx_chars: usize = shown_hits.iter().map(|(_, _, b)| b.len()).sum();
+        let est_ratio = crate::optical::compression_ratio(
+            (approx_chars as u64).div_ceil(4).max(1),
+            optical_policy
+                .mode
+                .unwrap_or(crate::optical::VisionMode::Base)
+                .vision_tokens(),
+        );
+        let _ = crate::semif::optical_policy_hint(root, est_ratio, false);
+        progress::tick(shown as u64, Some(end as u64), "knowledge_search: optical");
+        match crate::optical::compress_hits(root, &shown_hits, &optical_policy) {
+            Ok(bundle) => {
+                let section = crate::optical::format_optical_section(&bundle);
+                let section_tokens = section.len() / 4;
+                if used + section_tokens <= budget || shown == 0 {
+                    out.push_str(&section);
+                } else {
+                    out.push_str("\n---\noptical: omitted (token_budget); re-call with higher budget or optical:false\n");
+                }
+            }
+            Err(e) => {
+                out.push_str(&format!(
+                    "\n---\noptical: fallback exact (error: {e})\n"
+                ));
+            }
+        }
+    }
+
     progress::tick(shown as u64, Some(end as u64), "knowledge_search: done");
     stats::record(
         "knowledge_search",

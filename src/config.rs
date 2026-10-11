@@ -269,6 +269,42 @@ pub fn semif_enabled(root: &Path) -> bool {
         .unwrap_or(true)
 }
 
+/// Optical Compression Tier (OCT): default-off until the 10× eval gate promotes.
+/// Config: `optical.enabled` or env `WORDKEEP_OPTICAL=1`.
+pub fn optical_default_enabled(root: &Path) -> bool {
+    if let Ok(s) = std::env::var("WORDKEEP_OPTICAL") {
+        let t = s.trim();
+        if t == "1" || t.eq_ignore_ascii_case("true") || t.eq_ignore_ascii_case("on") {
+            return true;
+        }
+        if t == "0" || t.eq_ignore_ascii_case("false") || t.eq_ignore_ascii_case("off") {
+            return false;
+        }
+    }
+    load_config(root)
+        .and_then(|cfg| {
+            cfg.get("optical")
+                .and_then(|m| m.get("enabled"))
+                .and_then(Value::as_bool)
+        })
+        .unwrap_or(false)
+}
+
+/// Max text/vision compression ratio for promote-able optical skims (default 10).
+pub fn optical_max_ratio(root: &Path) -> Option<f64> {
+    if let Ok(s) = std::env::var("WORDKEEP_OPTICAL_MAX_RATIO") {
+        if let Ok(v) = s.trim().parse::<f64>() {
+            return Some(v.clamp(1.0, 20.0));
+        }
+    }
+    load_config(root).and_then(|cfg| {
+        cfg.get("optical")
+            .and_then(|m| m.get("max_ratio"))
+            .and_then(Value::as_f64)
+            .map(|v| v.clamp(1.0, 20.0))
+    })
+}
+
 /// Default backend when `semif.backend` is omitted.
 ///
 /// `auto` = healthy Copper → healthy Aeron → ereshkigal GGUF → heuristic
@@ -331,7 +367,6 @@ pub fn semif_tandem(root: &Path) -> bool {
 }
 
 /// Adaptive debias: conformal qhat used to decide whether extra permute cycles run.
-#[cfg(any(test, feature = "ereshkigal"))]
 pub fn semif_adaptive_qhat(root: &Path) -> f64 {
     load_config(root)
         .and_then(|cfg| {
@@ -344,7 +379,6 @@ pub fn semif_adaptive_qhat(root: &Path) -> f64 {
 }
 
 /// Adaptive debias: skip permute cycles when top1−top2 ≥ this margin.
-#[cfg(any(test, feature = "ereshkigal"))]
 pub fn semif_adaptive_margin_min(root: &Path) -> f64 {
     load_config(root)
         .and_then(|cfg| {
@@ -478,7 +512,6 @@ pub fn semif_cascade_routing(root: &Path) -> String {
         .unwrap_or_else(|| "conformal".into())
 }
 
-#[cfg(any(test, feature = "ereshkigal"))]
 pub fn semif_cascade_qhat(root: &Path) -> f64 {
     load_config(root)
         .and_then(|cfg| {
@@ -510,7 +543,6 @@ pub fn semif_knowledge_debias(root: &Path) -> String {
 /// shrinks per-seq KV on some backends and caused `NoKvCacheSlot` on knowledge heads.
 /// Production pin is **8** (knowledge head=5 + margin); larger batches serial-fall-back
 /// in ereshkigal `score_shared`. Benches may still pass `N_SEQ_MAX=32`.
-#[cfg(any(test, feature = "ereshkigal"))]
 pub fn semif_n_seq_max(root: &Path) -> u32 {
     if let Ok(s) = std::env::var("ERESHKIGAL_N_SEQ_MAX") {
         if let Ok(v) = s.trim().parse::<u64>() {

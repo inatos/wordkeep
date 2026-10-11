@@ -7,7 +7,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
 
@@ -137,14 +137,33 @@ fn run_refresh_script(root: &Path) {
     if !script.is_file() {
         return;
     }
-    let _ = Command::new("bash")
+    // Hard cap — a wedged copper_health.sh must not stall MCP tool calls (OCT / SemIf).
+    let mut child = match Command::new("bash")
         .arg(&script)
         .arg("--json")
         .arg("--no-notify")
         .current_dir(root)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
-        .status();
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break;
+            }
+        }
+    }
 }
 
 pub fn refresh(root: &Path, force: bool) -> Option<CopperHealth> {
@@ -205,6 +224,17 @@ pub fn prefer_copper(root: &Path) -> bool {
     h.can_probe() && h.peer_up()
 }
 
+/// Cache-only Copper glance — never spawns `copper_health.sh` (safe for OCT / hot MCP).
+pub fn prefer_copper_cached(root: &Path) -> bool {
+    if in_cooldown(root) {
+        return false;
+    }
+    let Some(h) = read_cached(root) else {
+        return false;
+    };
+    h.can_probe() && h.peer_up()
+}
+
 /// Probe Aeron with a short ping (best-effort; no status file yet).
 pub fn prefer_aeron(root: &Path) -> bool {
     let bin = std::env::var("AERON_CLI").unwrap_or_else(|_| {
@@ -223,14 +253,30 @@ pub fn prefer_aeron(root: &Path) -> bool {
     } else if !Path::new(&bin).is_file() {
         return false;
     }
-    Command::new(&bin)
+    let mut child = match Command::new(&bin)
         .args(["--config", &cfg, "ping", "--count", "1"])
         .current_dir(root)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) if Instant::now() < deadline => {
+                thread::sleep(Duration::from_millis(40));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+        }
+    }
 }
 
 pub fn backoff_sleep(attempt: u32) {

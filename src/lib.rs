@@ -34,6 +34,7 @@ mod lang;
 mod mas;
 mod mcp;
 mod module_map;
+pub mod optical;
 mod outline;
 mod profile_upsert;
 mod progress;

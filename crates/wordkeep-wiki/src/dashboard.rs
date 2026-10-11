@@ -115,6 +115,17 @@ pub(crate) fn build() -> Result<Value, String> {
         })
         .collect();
 
+    let optical = data.get("optical").cloned().unwrap_or_else(|| {
+        json!({
+            "calls": 0,
+            "fallback_calls": 0,
+            "avg_ratio": 0.0,
+            "avg_precision": 0.0,
+            "precision_samples": 0,
+            "enabled_hint": "Opt-in: knowledge_search optical:true (default off until 10× gate)."
+        })
+    });
+
     Ok(json!({
         "available": true,
         "path": path.display().to_string(),
@@ -133,6 +144,7 @@ pub(crate) fn build() -> Result<Value, String> {
             "since_label": elapsed(since, now),
             "now": now
         },
+        "optical": optical,
         "tools": tools,
         "activity": activity,
         "health": health_signals(&tools),

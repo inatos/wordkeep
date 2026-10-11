@@ -223,6 +223,56 @@ impl Event {
     }
 }
 
+/// Optical Compression Tier counters (split from text-path baselines).
+#[derive(Debug, Clone, Default)]
+struct OpticalAgg {
+    calls: u64,
+    fallback_calls: u64,
+    sum_ratio: f64,
+    sum_precision: f64,
+    precision_samples: u64,
+}
+
+impl OpticalAgg {
+    fn to_json(&self) -> Value {
+        let avg_ratio = if self.calls == 0 {
+            0.0
+        } else {
+            self.sum_ratio / self.calls as f64
+        };
+        let avg_precision = if self.precision_samples == 0 {
+            0.0
+        } else {
+            self.sum_precision / self.precision_samples as f64
+        };
+        json!({
+            "calls": self.calls,
+            "fallback_calls": self.fallback_calls,
+            "avg_ratio": avg_ratio,
+            "avg_precision": avg_precision,
+            "precision_samples": self.precision_samples,
+        })
+    }
+
+    fn from_value(v: &Value) -> Self {
+        Self {
+            calls: field(v, "calls"),
+            fallback_calls: field(v, "fallback_calls"),
+            sum_ratio: v
+                .get("avg_ratio")
+                .and_then(Value::as_f64)
+                .unwrap_or(0.0)
+                * field(v, "calls") as f64,
+            sum_precision: v
+                .get("avg_precision")
+                .and_then(Value::as_f64)
+                .unwrap_or(0.0)
+                * field(v, "precision_samples") as f64,
+            precision_samples: field(v, "precision_samples"),
+        }
+    }
+}
+
 struct Store {
     since: u64,
     tools: BTreeMap<String, Tool>,
@@ -232,6 +282,8 @@ struct Store {
     last_flush: Instant,
     /// Last workspace id written into savings.json (for the dashboard process).
     saved_workspace_id: String,
+    /// Optical Compression Tier telemetry (separate from text-path tools).
+    optical: OpticalAgg,
 }
 
 static STATS: OnceLock<Mutex<Store>> = OnceLock::new();
@@ -309,6 +361,7 @@ impl Store {
             pending_flush: 0,
             last_flush: Instant::now(),
             saved_workspace_id: String::new(),
+            optical: OpticalAgg::default(),
         }
     }
 
@@ -417,6 +470,9 @@ impl Store {
                 s.events.pop_front();
             }
         }
+        if let Some(opt) = o.get("optical") {
+            s.optical = OpticalAgg::from_value(opt);
+        }
         s
     }
 
@@ -450,6 +506,7 @@ impl Store {
             "workspace_id": wid,
             "tools": Value::Object(tools),
             "events": events,
+            "optical": self.optical.to_json(),
         });
         let dir = cache::dir();
         let _ = std::fs::create_dir_all(&dir);
@@ -461,6 +518,33 @@ impl Store {
             }
         }
     }
+}
+
+/// Record one Optical Compression Tier call (ratio + precision; split from text tools).
+pub fn record_optical(used_optical_path: bool, ratio: f64, precision: f64) {
+    if let Ok(mut s) = cell().lock() {
+        s.optical.calls += 1;
+        if !used_optical_path {
+            s.optical.fallback_calls += 1;
+        }
+        s.optical.sum_ratio += ratio;
+        if precision.is_finite() {
+            s.optical.sum_precision += precision;
+            s.optical.precision_samples += 1;
+        }
+        s.pending_flush += 1;
+        if s.needs_flush() {
+            s.flush_aggregates();
+        }
+    }
+}
+
+/// Snapshot optical aggregates for wiki / `stats` JSON.
+pub fn optical_json() -> Value {
+    cell()
+        .lock()
+        .map(|s| s.optical.to_json())
+        .unwrap_or_else(|_| json!({ "calls": 0 }))
 }
 
 fn tool_from_value(tv: &Value) -> Tool {
@@ -777,6 +861,7 @@ pub fn report(args: &Value) -> Result<String, String> {
     if reset {
         s.tools.clear();
         s.events.clear();
+        s.optical = OpticalAgg::default();
         s.since = now_secs();
         s.pending_flush = 0;
         s.save();
@@ -798,6 +883,18 @@ pub fn report(args: &Value) -> Result<String, String> {
         )
     } else {
         let mut text = render(s.since, now, &s.tools);
+        let opt = s.optical.to_json();
+        text.push_str(&format!(
+            "\noptical (OCT): calls={} fallback={} avg_ratio={:.2} avg_precision={:.3}\n",
+            opt.get("calls").and_then(Value::as_u64).unwrap_or(0),
+            opt.get("fallback_calls")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            opt.get("avg_ratio").and_then(Value::as_f64).unwrap_or(0.0),
+            opt.get("avg_precision")
+                .and_then(Value::as_f64)
+                .unwrap_or(0.0),
+        ));
         if insights {
             text.push_str(&render_insights(now, &s.tools, registry()));
         }
@@ -1078,6 +1175,7 @@ fn render_json(
         tr += t.returned_tokens;
     }
     let avoided = tb.saturating_sub(tr);
+    let optical = optical_json();
     let doc = json!({
         "version": 5,
         "label": "estimated context avoided",
@@ -1089,6 +1187,7 @@ fn render_json(
         "avoided_tokens": avoided,
         "reduction_pct": pct_precise(avoided, tb),
         "tools": Value::Object(tools_json),
+        "optical": optical,
         "percentiles": {
             "elapsed_us": {
                 "p50": p50,
