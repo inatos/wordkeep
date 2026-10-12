@@ -8,7 +8,8 @@
 //!
 //! Host-agnostic MCP tooling — not a host application runtime.
 
-use crate::{config, copper_health, semif_debias, semif_telemetry, stats};
+use crate::{config, copper_health, semif_debias, semif_telemetry, semif_visual, stats};
+use crate::semif_visual::VisualEvidence;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -37,6 +38,8 @@ pub struct DecisionRequest {
     pub state: String,
     pub question: String,
     pub options: Vec<OptionSpec>,
+    /// Typed visual evidence (PNG paths + hashes). Not stringified into `state`.
+    pub visual_evidence: Option<VisualEvidence>,
 }
 
 /// Per-option score in a decision response.
@@ -61,6 +64,10 @@ pub struct DecisionResult {
     pub fallback: bool,
     pub cascade_source: Option<String>,
     pub cascade_set_size: Option<usize>,
+    /// When set, vision/hybrid path abstained; `chosen` may still be text-scorer argmax
+    /// unless `abstain` is true (hard gate: clipped / missing / hash mismatch).
+    pub abstain: bool,
+    pub abstain_reason: Option<String>,
 }
 
 /// Inner scorer output (logits or already-normalized probabilities).
@@ -200,34 +207,55 @@ fn aeron_scorer(root: &Path) -> RemoteAeronScorer {
 
 /// Auto resolve: healthy Copper → healthy Aeron → ereshkigal → heuristic.
 /// Optical Compression Tier policy tip for decrees / agents (text decide stays SoT).
+/// Consults `oct_use_optical` routing: text | vision | hybrid | exact.
 pub fn optical_policy_hint(root: &Path, estimated_ratio: f64, is_code_signature: bool) -> Value {
     let max_ratio = config::optical_max_ratio(root).unwrap_or(crate::optical::MAX_RATIO_DEFAULT);
     let allow = crate::optical::policy_allows_optical(max_ratio, estimated_ratio, is_code_signature);
     // Cache-only — never block MCP on copper_health.sh / aeron ping.
     let peer = copper_health::prefer_copper_cached(root);
+    // Decree-shaped routing (heuristic stand-in until GGUF decree decide is wired).
     let choice = if is_code_signature {
         "exact"
     } else if estimated_ratio > max_ratio {
         "exact"
+    } else if allow && peer {
+        "hybrid"
     } else if allow {
-        "optical"
+        "optical" // glyph / local encode
     } else {
         "exact"
+    };
+    let modality = match choice {
+        "hybrid" => "hybrid",
+        "optical" => "vision",
+        "exact" => "exact",
+        _ => "text",
     };
     let v = serde_json::json!({
         "kind": "optical_policy",
         "choice": choice,
+        "modality": modality,
         "max_ratio": max_ratio,
         "estimated_ratio": estimated_ratio,
         "is_code_signature": is_code_signature,
         "peer_healthy": peer,
         "decree": "oct_use_optical",
+        "decree_options": ["optical", "exact", "fallback_exact", "vision", "hybrid", "text"],
         "default_on": config::optical_default_enabled(root),
+        "visual_logits": semif_visual::visual_logits_available(),
     });
     eprintln!(
-        "[wordkeep] optical policy → {choice} (ratio={estimated_ratio:.2} max={max_ratio:.1} peer={peer})"
+        "[wordkeep] optical policy → {choice}/{modality} (ratio={estimated_ratio:.2} max={max_ratio:.1} peer={peer})"
     );
     semif_telemetry::record_event(v.clone());
+    // Keep modality tip in the event stream for wiki / agents.
+    semif_telemetry::record_event(semif_visual::modality_tip(&DecisionRequest {
+        id: "optical-policy".into(),
+        state: format!("ratio={estimated_ratio}"),
+        question: "OCT modality?".into(),
+        options: vec![],
+        visual_evidence: None,
+    }));
     v
 }
 
@@ -587,15 +615,22 @@ fn score_with_policy(
     scorer: &dyn Scorer,
     req: &DecisionRequest,
 ) -> Result<ScoreBundle, String> {
-    let mut ident = apply_debias(root, scorer, req, scorer.score_detailed(req)?)?;
+    // Hybrid vision draft when typed visual_evidence is present.
+    let base = if req.visual_evidence.is_some() {
+        let (bundle, _abstained, _reason) = semif_visual::score_hybrid(root, scorer, req)?;
+        bundle
+    } else {
+        scorer.score_detailed(req)?
+    };
+    let ident = apply_debias(root, scorer, req, base)?;
     #[cfg(feature = "ereshkigal")]
     if scorer.name() == "ereshkigal" && config::semif_cascade_routing(root) == "conformal" {
-        ident = crate::semif_gguf::escalate_cascade(
+        return crate::semif_gguf::escalate_cascade(
             root,
             req,
             ident,
             config::semif_cascade_qhat(root),
-        )?;
+        );
     }
     Ok(ident)
 }
@@ -686,6 +721,48 @@ fn decide_one_at(
 ) -> DecisionResult {
     let prompt = render_prompt(req);
     let heuristic_hash = sha256_hex(&prompt);
+    // Hard abstain gates for vision evidence (clipped / missing / hash) — no silent argmax.
+    if let Some(ev) = &req.visual_evidence {
+        if ev.clipped {
+            return DecisionResult {
+                id: req.id.clone(),
+                options: Vec::new(),
+                chosen: String::new(),
+                prompt_sha256: heuristic_hash,
+                scorer: scorer.name().into(),
+                scorer_revision: scorer.revision().into(),
+                timing_us: 0,
+                calibrated: false,
+                fallback: true,
+                cascade_source: Some("visual-abstain:clipped".into()),
+                cascade_set_size: None,
+                abstain: true,
+                abstain_reason: Some("clipped".into()),
+            };
+        }
+        if let Err(e) = ev.verify_hashes() {
+            let reason = if e.contains("hash mismatch") {
+                "hash_mismatch"
+            } else {
+                "missing_source"
+            };
+            return DecisionResult {
+                id: req.id.clone(),
+                options: Vec::new(),
+                chosen: String::new(),
+                prompt_sha256: heuristic_hash,
+                scorer: scorer.name().into(),
+                scorer_revision: scorer.revision().into(),
+                timing_us: 0,
+                calibrated: false,
+                fallback: true,
+                cascade_source: Some(format!("visual-abstain:{reason}")),
+                cascade_set_size: None,
+                abstain: true,
+                abstain_reason: Some(reason.into()),
+            };
+        }
+    }
     let (bundle, fallback) = match root {
         Some(root) => match score_with_policy(root, scorer, req) {
             Ok(b) => (b, force_fallback),
@@ -703,6 +780,8 @@ fn decide_one_at(
                     fallback: true,
                     cascade_source: Some("error".into()),
                     cascade_set_size: None,
+                    abstain: false,
+                    abstain_reason: None,
                 };
             }
         },
@@ -743,6 +822,11 @@ fn decide_from_bundle(
     let heuristic_hash = sha256_hex(&render_prompt(req));
     let temperature = root.map(config::semif_temperature).unwrap_or(1.0);
     let (probs, calibrated) = apply_decision_temperature(&bundle, temperature);
+    let soft_abstain = bundle
+        .cascade_source
+        .as_deref()
+        .map(|s| s.starts_with("visual-abstain:") || s.contains("→exact") || s.contains("low_visual"))
+        .unwrap_or(false);
     let chosen = probs
         .iter()
         .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
@@ -773,13 +857,14 @@ fn decide_from_bundle(
             "chosen": chosen,
             "timing_us": timing_us,
             "warm": warm,
-            "fallback": fallback,
+            "fallback": fallback || soft_abstain,
             "calibrated": calibrated,
             "temperature": temperature,
             "scorer": scorer.name(),
             "cascade_source": bundle.cascade_source,
             "cascade_set_size": bundle.cascade_set_size,
             "kind": "decide",
+            "has_visual_evidence": req.visual_evidence.is_some(),
         }));
         let _ = root;
     }
@@ -792,9 +877,11 @@ fn decide_from_bundle(
         scorer_revision: scorer.revision().into(),
         timing_us,
         calibrated,
-        fallback,
+        fallback: fallback || soft_abstain,
         cascade_source: bundle.cascade_source,
         cascade_set_size: bundle.cascade_set_size,
+        abstain: false,
+        abstain_reason: None,
     }
 }
 
@@ -1025,6 +1112,7 @@ pub(crate) fn knowledge_rerank_request(
             question.to_string()
         },
         options,
+        visual_evidence: None,
     })
 }
 
@@ -1055,11 +1143,13 @@ fn parse_request_row(args: &Value, state_override: Option<&str>) -> Result<Decis
         return Err("question is required".into());
     }
     let options = parse_options(args.get("options"))?;
+    let visual_evidence = VisualEvidence::from_args(args)?;
     Ok(DecisionRequest {
         id,
         state,
         question,
         options,
+        visual_evidence,
     })
 }
 
@@ -1189,6 +1279,9 @@ fn result_to_json(r: &DecisionResult) -> Value {
         "fallback": r.fallback,
         "cascade_source": r.cascade_source,
         "cascade_set_size": r.cascade_set_size,
+        "abstain": r.abstain,
+        "abstain_reason": r.abstain_reason,
+        "visual_logits_available": semif_visual::visual_logits_available(),
     })
 }
 
@@ -1216,6 +1309,7 @@ mod tests {
                     description: "The evidence is insufficient to decide.".into(),
                 },
             ],
+            visual_evidence: None,
         }
     }
 

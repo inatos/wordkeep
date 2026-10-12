@@ -1093,6 +1093,170 @@ pub fn finalize(root: &Path, args: &Value) -> Result<String, String> {
     Ok(out)
 }
 
+/// Canonical chronological timeline from session entries (round, id).
+/// Exact spill Markdown paths are referenced via note_ref — never rewritten.
+fn format_timeline_corpus(s: &Session) -> (String, Vec<Value>) {
+    let mut entries: Vec<&Entry> = s.entries.iter().collect();
+    entries.sort_by(|a, b| (a.round, a.id).cmp(&(b.round, b.id)));
+    let mut corpus = String::new();
+    let mut order = Vec::new();
+    let mut last_round = u64::MAX;
+    for e in entries {
+        if e.round != last_round {
+            corpus.push_str(&format!("\n=== ROUND {} ===\n", e.round));
+            last_round = e.round;
+        }
+        corpus.push_str(&format!(
+            "[r{}/id{} {} {}]\n{}\n",
+            e.round, e.id, e.role, e.kind, e.summary
+        ));
+        for c in &e.claims {
+            corpus.push_str(&format!("  claim: {c}\n"));
+        }
+        for d in &e.decisions {
+            corpus.push_str(&format!("  decision: {d}\n"));
+        }
+        for q in &e.open_questions {
+            corpus.push_str(&format!("  q: {q}\n"));
+        }
+        if let Some(nr) = &e.note_ref {
+            corpus.push_str(&format!("  note_ref: {nr}\n"));
+        }
+        order.push(json!({
+            "id": e.id,
+            "round": e.round,
+            "role": e.role,
+            "kind": e.kind,
+            "note_ref": e.note_ref,
+        }));
+    }
+    (corpus, order)
+}
+
+/// Opt-in MAS timeline PNG + OCR skim. Exact session JSON / spill notes stay SoT.
+fn append_mas_optical(
+    root: &Path,
+    s: &Session,
+    args: &Value,
+    out: &mut String,
+) -> Result<(), String> {
+    let optical = args
+        .get("optical")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        || args
+            .get("timeline_png")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+    if !optical {
+        return Ok(());
+    }
+    let policy = crate::optical::OpticalPolicy::from_args(root, args);
+    let mode = policy
+        .mode
+        .unwrap_or(crate::optical::VisionMode::Base);
+    let (corpus, order) = format_timeline_corpus(s);
+    let out_dir = root.join(".cache/wordkeep/optical/mas");
+    let max_pages = args
+        .get("optical_max_pages")
+        .and_then(Value::as_u64)
+        .unwrap_or(4) as usize;
+    let (pages, clipped) = crate::optical::render_pages(
+        &corpus,
+        &out_dir,
+        mode,
+        Some(&format!("mas {}", s.session)),
+        max_pages,
+        "mas",
+    )?;
+
+    let mut decoded_parts = Vec::new();
+    let mut backends = Vec::new();
+    let mut png_paths = Vec::new();
+    for page in &pages {
+        png_paths.push(page.png_path.display().to_string());
+        let (text, backend, _receipt) =
+            crate::optical::ocr_decode_page(root, page, policy.prefer_gpu)?;
+        backends.push(backend);
+        decoded_parts.push(text);
+    }
+    let decoded = decoded_parts.join("\n--- page ---\n");
+    let backend = backends
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "glyph-ocr".into());
+
+    // Manifest — disposable derivative; session JSON + spill md remain immutable.
+    let session_file = session_path(root, &s.session)?;
+    let session_hash = {
+        use sha2::{Digest, Sha256};
+        let bytes = std::fs::read(&session_file).unwrap_or_default();
+        format!("{:x}", Sha256::digest(&bytes))
+    };
+    let mut spill_hashes = Vec::new();
+    for e in &s.entries {
+        if let Some(nr) = &e.note_ref {
+            let p = if Path::new(nr).is_absolute() {
+                PathBuf::from(nr)
+            } else {
+                root.join(nr)
+            };
+            if let Ok(bytes) = std::fs::read(&p) {
+                use sha2::{Digest, Sha256};
+                spill_hashes.push(json!({
+                    "note_ref": nr,
+                    "sha256": format!("{:x}", Sha256::digest(&bytes)),
+                }));
+            }
+        }
+    }
+    let manifest = json!({
+        "v": 1,
+        "session": s.session,
+        "session_path": session_file.display().to_string(),
+        "session_sha256": session_hash,
+        "updated": s.updated,
+        "clipped": clipped,
+        "entry_order": order,
+        "spill_hashes": spill_hashes,
+        "png_paths": png_paths,
+        "backend": backend,
+        "mode": mode.as_str(),
+    });
+    let manifest_path = out_dir.join(format!("mas_{}_timeline.json", s.session));
+    std::fs::write(
+        &manifest_path,
+        serde_json::to_string_pretty(&manifest).unwrap_or_default(),
+    )
+    .map_err(|e| format!("write mas timeline manifest: {e}"))?;
+
+    out.push_str("\n---\n");
+    out.push_str(&format!(
+        "mas_optical: backend={} pages={} clipped={} ratio≈{:.2}x\n",
+        backend,
+        pages.len(),
+        clipped,
+        pages.first().map(|p| p.ratio).unwrap_or(0.0)
+    ));
+    out.push_str(&format!("mas_manifest: {}\n", manifest_path.display()));
+    for p in &png_paths {
+        out.push_str(&format!("mas_png: {p}\n"));
+    }
+    out.push_str("mas_decode:\n");
+    out.push_str(&decoded);
+    if !decoded.ends_with('\n') {
+        out.push('\n');
+    }
+    // Exact SoT reminder — never treat OCR as authoritative.
+    out.push_str("mas_sot: session JSON + spill note_ref Markdown remain Source of Truth\n");
+    stats::record_optical_mas(
+        !clipped && backend == "deepseek-ocr",
+        pages.first().map(|p| p.ratio).unwrap_or(0.0),
+        1.0,
+    );
+    Ok(())
+}
+
 /// Build a paste-ready next-session prompt from MAS + defects + runs.
 /// Works for already-finalized sessions. May finalize + promote in one call.
 pub fn session_handoff(root: &Path, args: &Value) -> Result<String, String> {
@@ -1118,16 +1282,22 @@ pub fn session_handoff(root: &Path, args: &Value) -> Result<String, String> {
             "note_heading": optional_str(args, "note_heading"),
             "effects": optional_str(args, "effects"),
         });
-        return finalize(root, &fin_args);
+        let mut out = finalize(root, &fin_args)?;
+        // Optical skim after finalize still needs the loaded session.
+        if let Ok(Some(s)) = load_session(root, &session) {
+            let _ = append_mas_optical(root, &s, args, &mut out);
+        }
+        return Ok(out);
     }
 
     let s = load_session(root, &session)?.ok_or_else(|| format!("session {session} not found"))?;
     let prompt = format_handoff_prompt(root, &s, result.as_deref());
     let _ = session_pressure::mark_handoff(root);
-    let out = format!(
+    let mut out = format!(
         "session_handoff - session {session} status={}\n\n{}",
         s.status, prompt
     );
+    append_mas_optical(root, &s, args, &mut out)?;
     let session_file_tokens = session_path(root, &session)
         .ok()
         .and_then(|p| std::fs::metadata(p).ok().map(|m| m.len() / 4))
@@ -1146,6 +1316,16 @@ pub fn session_handoff(root: &Path, args: &Value) -> Result<String, String> {
         estimate_tokens(&out) as u64,
     );
     Ok(out)
+}
+
+/// VLM-first alias: same optical timeline bundle as `session_handoff` with optical forced on.
+pub fn mas_timeline(root: &Path, args: &Value) -> Result<String, String> {
+    let mut forced = args.clone();
+    if let Some(obj) = forced.as_object_mut() {
+        obj.insert("optical".into(), json!(true));
+        obj.insert("timeline_png".into(), json!(true));
+    }
+    session_handoff(root, &forced)
 }
 
 #[cfg(test)]

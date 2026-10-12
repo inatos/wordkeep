@@ -39,6 +39,7 @@ pub fn permute_from_identity(
                 state: req.state.clone(),
                 question: req.question.clone(),
                 options: Vec::with_capacity(n),
+                visual_evidence: None,
             };
             // Index permutation only: options[(i+k)%n] → slot i.
             for i in 0..n {
@@ -141,6 +142,7 @@ mod tests {
                     description: "unrelated zebra".into(),
                 },
             ],
+            visual_evidence: None,
         };
         let s = HeuristicScorer;
         let once = softmax_labeled(&s.score_one(&req).unwrap());
@@ -172,6 +174,7 @@ mod tests {
                     description: "option c".into(),
                 },
             ],
+            visual_evidence: None,
         };
         let s = HeuristicScorer;
         let ident = s.score_one(&req).unwrap();
@@ -195,6 +198,7 @@ mod tests {
                     description: "unrelated zebra".into(),
                 },
             ],
+            visual_evidence: None,
         };
         let s = HeuristicScorer;
         let ident = s.score_one(&req).unwrap();

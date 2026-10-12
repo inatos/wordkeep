@@ -227,6 +227,8 @@ impl Event {
 #[derive(Debug, Clone, Default)]
 struct OpticalAgg {
     calls: u64,
+    /// Subset of `calls` from `session_handoff` / `mas_timeline` optical skim.
+    mas_calls: u64,
     fallback_calls: u64,
     sum_ratio: f64,
     sum_precision: f64,
@@ -247,6 +249,7 @@ impl OpticalAgg {
         };
         json!({
             "calls": self.calls,
+            "mas_calls": self.mas_calls,
             "fallback_calls": self.fallback_calls,
             "avg_ratio": avg_ratio,
             "avg_precision": avg_precision,
@@ -257,6 +260,7 @@ impl OpticalAgg {
     fn from_value(v: &Value) -> Self {
         Self {
             calls: field(v, "calls"),
+            mas_calls: field(v, "mas_calls"),
             fallback_calls: field(v, "fallback_calls"),
             sum_ratio: v
                 .get("avg_ratio")
@@ -522,22 +526,39 @@ impl Store {
 
 /// Record one Optical Compression Tier call (ratio + precision; split from text tools).
 pub fn record_optical(used_optical_path: bool, ratio: f64, precision: f64) {
-    if let Ok(mut s) = cell().lock() {
-        s.optical.calls += 1;
-        if !used_optical_path {
-            s.optical.fallback_calls += 1;
-        }
-        s.optical.sum_ratio += ratio;
-        if precision.is_finite() {
-            s.optical.sum_precision += precision;
-            s.optical.precision_samples += 1;
-        }
-        s.pending_flush += 1;
-        if s.needs_flush() {
-            s.flush_aggregates();
-        }
-    }
-}
+      record_optical_inner(used_optical_path, ratio, precision, false);
+  }
+
+  /// Same as [`record_optical`] but marks a MAS timeline skim call.
+  pub fn record_optical_mas(used_optical_path: bool, ratio: f64, precision: f64) {
+      record_optical_inner(used_optical_path, ratio, precision, true);
+  }
+
+  fn record_optical_inner(
+      used_optical_path: bool,
+      ratio: f64,
+      precision: f64,
+      from_mas: bool,
+  ) {
+      if let Ok(mut s) = cell().lock() {
+          s.optical.calls += 1;
+          if from_mas {
+              s.optical.mas_calls += 1;
+          }
+          if !used_optical_path {
+              s.optical.fallback_calls += 1;
+          }
+          s.optical.sum_ratio += ratio;
+          if precision.is_finite() {
+              s.optical.sum_precision += precision;
+              s.optical.precision_samples += 1;
+          }
+          s.pending_flush += 1;
+          if s.needs_flush() {
+              s.flush_aggregates();
+          }
+      }
+  }
 
 /// Snapshot optical aggregates for wiki / `stats` JSON.
 pub fn optical_json() -> Value {
@@ -885,8 +906,9 @@ pub fn report(args: &Value) -> Result<String, String> {
         let mut text = render(s.since, now, &s.tools);
         let opt = s.optical.to_json();
         text.push_str(&format!(
-            "\noptical (OCT): calls={} fallback={} avg_ratio={:.2} avg_precision={:.3}\n",
+            "\noptical (OCT): calls={} mas={} fallback={} avg_ratio={:.2} avg_precision={:.3}\n",
             opt.get("calls").and_then(Value::as_u64).unwrap_or(0),
+            opt.get("mas_calls").and_then(Value::as_u64).unwrap_or(0),
             opt.get("fallback_calls")
                 .and_then(Value::as_u64)
                 .unwrap_or(0),

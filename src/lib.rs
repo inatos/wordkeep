@@ -47,6 +47,7 @@ mod semif_debias;
 #[cfg(feature = "ereshkigal")]
 mod semif_gguf;
 mod semif_telemetry;
+mod semif_visual;
 mod session_pressure;
 mod shrift;
 mod stats;

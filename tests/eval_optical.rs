@@ -5,9 +5,11 @@
 
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
+use serde_json::json;
 use wordkeep::optical::{
-    choose_mode, compression_ratio, decode_precision, glyph_ocr_decode, precision_at_ratio,
-    render_doc_page, VisionMode, PRECISION_GATE_10X,
+    assert_ocr_receipt, assert_task_done, choose_mode, compression_ratio, decode_precision,
+    glyph_ocr_decode, precision_at_ratio, render_doc_page, render_pages, VisionMode,
+    PRECISION_GATE_10X,
 };
 
 fn tmp(tag: &str) -> PathBuf {
@@ -115,4 +117,41 @@ fn eval_optical_mode_ladder_matches_deepseek_budgets() {
     assert_eq!(VisionMode::Large.vision_tokens(), 400);
     assert_eq!(choose_mode(640, 10.0), VisionMode::Tiny);
     assert_eq!(choose_mode(900, 10.0), VisionMode::Small);
+}
+
+#[test]
+fn eval_optical_stale_task_failure_rejected() {
+    // Failed child still returns Ok(JSON) from task_lan — OCT must reject.
+    let fail = r#"{"task_id":"x-deepseek-ocr","status":"failed","exit_code":23}"#;
+    assert!(assert_task_done(fail).is_err());
+    let stale_receipt = json!({
+        "job": "deepseek-ocr",
+        "backend": "sidecar",
+        "nonce": "old-nonce",
+    });
+    assert!(assert_ocr_receipt(&stale_receipt, "fresh-nonce")
+        .unwrap_err()
+        .contains("nonce"));
+}
+
+#[test]
+fn eval_optical_sidecar_receipt_not_mislabelled_as_gpu() {
+    let receipt = json!({
+        "job": "deepseek-ocr",
+        "backend": "sidecar",
+        "nonce": "n1",
+    });
+    let backend = assert_ocr_receipt(&receipt, "n1").unwrap();
+    assert_eq!(backend, "sidecar");
+    assert_ne!(backend, "deepseek-ocr");
+}
+
+#[test]
+fn eval_optical_pagination_clip_marker() {
+    let dir = tmp("clip");
+    let long = "alpha beta gamma delta\n".repeat(200);
+    let (pages, clipped) =
+        render_pages(&long, &dir, VisionMode::Tiny, Some("eval"), 1, "eval").unwrap();
+    assert!(clipped, "long corpus must clip at max_pages=1");
+    assert_eq!(pages.len(), 1);
 }

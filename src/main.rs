@@ -45,6 +45,7 @@
 //!   * mas_status       - recursion round bookkeeping and convergence hint
 //!   * mas_finalize     - finalize a session and optionally promote to knowledge notes
 //!   * session_handoff  - paste-ready next-session prime from MAS/defects/runs
+//!   * mas_timeline     - opt-in MAS timeline PNG + OCR skim (exact spill SoT)
 //!   * defect_upsert    - structured defect registry write
 //!   * defect_list      - list unresolved defects (eyeball_fail first)
 //!   * shrift_list      - list /shrift ideas (status/freshness/tag)
@@ -119,6 +120,7 @@ mod semif_debias;
 #[cfg(feature = "ereshkigal")]
 mod semif_gguf;
 mod semif_telemetry;
+mod semif_visual;
 mod session_pressure;
 mod shrift;
 mod stats;
@@ -270,6 +272,7 @@ fn main() {
     let root_mas_status = root.clone();
     let root_mas_finalize = root.clone();
     let root_session_handoff = root.clone();
+    let root_mas_timeline = root.clone();
     let root_defect_upsert = root.clone();
     let root_defect_list = root.clone();
     let root_shrift_list = root.clone();
@@ -896,10 +899,10 @@ fn main() {
         mcp::Tool {
             name: "semantic_decide",
             description: "SemIf-style semantic decision: unstructured state + runtime question + \
-                          typed options → option probabilities (no answer decoding). v1 uses a \
-                          deterministic heuristic scorer; configure via .wordkeep/config.json \
-                          semif.backend. Pass batch:[{question,options},…] with a shared state for \
-                          multi-criterion scoring. Returns JSON with chosen, probabilities, \
+                          typed options → option probabilities (no answer decoding). Optional \
+                          visual_evidence (protocol_version:1, png_paths, sha256, clipped) enables \
+                          hybrid vision draft with abstain on clipped/hash-mismatch; text scorer \
+                          remains SoT. Returns JSON with chosen, probabilities, abstain, \
                           prompt_sha256, timing_us, and fallback.",
             input_schema: json!({
                 "type": "object",
@@ -927,6 +930,18 @@ fn main() {
                         "type": "array",
                         "description": "Shared-state batch: each row has id/question/options; state is taken from the top-level state field.",
                         "items": { "type": "object" }
+                    },
+                    "visual_evidence": {
+                        "type": "object",
+                        "description": "Typed vision evidence (not stringified into state). Requires protocol_version:1.",
+                        "properties": {
+                            "protocol_version": { "type": "integer", "description": "Must be 1." },
+                            "png_paths": { "type": "array", "items": { "type": "string" } },
+                            "sha256": { "type": "array", "items": { "type": "string" } },
+                            "page_spans": { "type": "array", "items": { "type": "string" } },
+                            "provenance": { "type": "string" },
+                            "clipped": { "type": "boolean" }
+                        }
                     }
                 }
             }),
@@ -1267,7 +1282,8 @@ fn main() {
             description: "Format a deterministic, paste-ready next-session prime prompt from MAS \
                           state, unresolved defects, recent gate runs, anchors, commands, and \
                           constraints. Works for already-finalized sessions; may finalize+promote \
-                          in one call when finalize:true.",
+                          in one call when finalize:true. Opt-in optical/timeline_png appends a \
+                          MAS chronology PNG + OCR skim; session JSON + spill notes stay SoT.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -1279,11 +1295,39 @@ fn main() {
                     "note_heading": { "type": "string" },
                     "effects": { "type": "string",
                                  "enum": ["commit", "recover"],
-                                 "description": "When finalize:true and pending effect_session writes exist." }
+                                 "description": "When finalize:true and pending effect_session writes exist." },
+                    "optical": { "type": "boolean",
+                                 "description": "Opt-in MAS timeline PNG + OCR skim (default false)." },
+                    "timeline_png": { "type": "boolean",
+                                     "description": "Alias for optical:true (VLM-first clients)." },
+                    "optical_mode": { "type": "string",
+                                     "description": "tiny|small|base|large for timeline pages." },
+                    "optical_gpu": { "type": "boolean",
+                                    "description": "Prefer Copper deepseek-ocr for timeline decode." },
+                    "optical_max_pages": { "type": "integer",
+                                          "description": "Max timeline PNG pages (default 4)." }
                 },
                 "required": ["session"]
             }),
             handler: Box::new(move |args| mas::session_handoff(&root_session_handoff, args)),
+        },
+        mcp::Tool {
+            name: "mas_timeline",
+            description: "VLM-first MAS chronology: forces optical timeline PNG + OCR skim for a \
+                          session (same bundle as session_handoff with optical:true). Exact session \
+                          JSON and spill note_ref Markdown remain Source of Truth.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "session": { "type": "string", "description": "MAS session slug. Required." },
+                    "result": { "type": "string" },
+                    "optical_mode": { "type": "string" },
+                    "optical_gpu": { "type": "boolean" },
+                    "optical_max_pages": { "type": "integer" }
+                },
+                "required": ["session"]
+            }),
+            handler: Box::new(move |args| mas::mas_timeline(&root_mas_timeline, args)),
         },
         mcp::Tool {
             name: "defect_upsert",

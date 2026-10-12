@@ -10,7 +10,7 @@ use image::{Rgba, RgbaImage};
 use serde_json::{json, Value};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// DeepSeek-OCR native resolution modes → vision token budgets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -524,11 +524,127 @@ pub struct OpticalHitBundle {
     pub pages: Vec<RenderedPage>,
     pub decoded_text: String,
     pub backend: String,
+    /// Backend from job receipt (`deepseek-ocr` / `sidecar`); may differ from `backend` label.
+    pub receipt_backend: Option<String>,
     pub fallback: bool,
     pub fallback_reason: Option<String>,
     pub png_paths: Vec<String>,
     pub ratio: f64,
     pub precision: Option<f64>,
+    /// True when page render clipped the corpus (tail discarded).
+    pub clipped: bool,
+}
+
+/// Result of a Palaestra deepseek-ocr attempt (honest receipt backend).
+#[derive(Debug, Clone)]
+pub struct OcrTaskResult {
+    pub text: String,
+    pub backend: String,
+    pub nonce: String,
+}
+
+/// Fresh nonce for OCT artifacts / Palaestra receipt echo-through.
+pub fn fresh_nonce() -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    // Mix in pid so concurrent agents collide less.
+    format!("{nanos}-{}", std::process::id())
+}
+
+/// Paginate `text` into one or more rendered pages under `out_dir`.
+/// Single-column chronology; pages after the first are titled `title pN`.
+/// When clipped, the last page ends with `...(truncated)` and `clipped` is true.
+pub fn render_pages(
+    text: &str,
+    out_dir: &Path,
+    mode: VisionMode,
+    title: Option<&str>,
+    max_pages: usize,
+    file_prefix: &str,
+) -> Result<(Vec<RenderedPage>, bool), String> {
+    fs::create_dir_all(out_dir).map_err(|e| e.to_string())?;
+    let edge = mode.edge_px();
+    let margin = 8u32;
+    let cols = ((edge.saturating_sub(margin * 2)) / CELL_W).max(1);
+    let rows = ((edge.saturating_sub(margin * 2)) / CELL_H).max(1);
+    let body_rows = rows.saturating_sub(2).max(1); // leave room for title + blank
+
+    let mut wrapped: Vec<String> = Vec::new();
+    for raw in text.lines() {
+        let sanitized: String = raw
+            .chars()
+            .map(|c| if (0x20..=0x7e).contains(&(c as u8)) { c } else { '?' })
+            .collect();
+        if sanitized.is_empty() {
+            wrapped.push(String::new());
+            continue;
+        }
+        let mut rest = sanitized.as_str();
+        while !rest.is_empty() {
+            let take = rest.chars().take(cols as usize).collect::<String>();
+            let n = take.len();
+            wrapped.push(take);
+            rest = &rest[n..];
+        }
+    }
+
+    let max_pages = max_pages.max(1);
+    let mut pages = Vec::new();
+    let mut offset = 0usize;
+    let mut clipped = false;
+    let mut page_idx = 0usize;
+    while offset < wrapped.len() && page_idx < max_pages {
+        let end = (offset + body_rows as usize).min(wrapped.len());
+        let chunk = &wrapped[offset..end];
+        let more = end < wrapped.len();
+        let will_clip = more && page_idx + 1 >= max_pages;
+        let mut page_body = chunk.join("\n");
+        if will_clip {
+            page_body.push_str("\n...(truncated)");
+            clipped = true;
+        }
+        let page_title = match title {
+            Some(t) if page_idx == 0 => t.to_string(),
+            Some(t) => format!("{t} p{}", page_idx + 1),
+            None => format!("page {}", page_idx + 1),
+        };
+        let nonce = fresh_nonce();
+        let png = out_dir.join(format!("{file_prefix}_{nonce}.png"));
+        let page = render_doc_page(&page_body, &png, mode, Some(&page_title))?;
+        pages.push(page);
+        offset = end;
+        page_idx += 1;
+        if !more {
+            break;
+        }
+    }
+    if offset < wrapped.len() {
+        clipped = true;
+    }
+    Ok((pages, clipped))
+}
+
+/// Decode a rendered page: GPU OCR when preferred+peer, else glyph OCR.
+pub fn ocr_decode_page(
+    root: &Path,
+    page: &RenderedPage,
+    prefer_gpu: bool,
+) -> Result<(String, String /* backend */, Option<String> /* receipt */), String> {
+    let peer_ready = copper_health::prefer_copper_cached(root);
+    if prefer_gpu && peer_ready {
+        match try_deepseek_ocr_task(root, &page.png_path) {
+            Ok(r) => Ok((r.text, r.backend.clone(), Some(r.backend))),
+            Err(e) => {
+                let text = glyph_ocr_decode(&page.png_path, page.cols, page.rows)?;
+                Ok((text, "glyph-ocr".into(), Some(format!("gpu-err:{e}"))))
+            }
+        }
+    } else {
+        let text = glyph_ocr_decode(&page.png_path, page.cols, page.rows)?;
+        Ok((text, "glyph-ocr".into(), None))
+    }
 }
 
 /// Build optical skim for knowledge hits. Falls back to concatenating exact text.
@@ -542,11 +658,13 @@ pub fn compress_hits(
             pages: Vec::new(),
             decoded_text: String::new(),
             backend: "none".into(),
+            receipt_backend: None,
             fallback: true,
             fallback_reason: Some("no hits".into()),
             png_paths: Vec::new(),
             ratio: 0.0,
             precision: None,
+            clipped: false,
         });
     }
 
@@ -571,6 +689,7 @@ pub fn compress_hits(
             pages: Vec::new(),
             decoded_text: corpus,
             backend: "exact-text".into(),
+            receipt_backend: None,
             fallback: true,
             fallback_reason: Some(format!(
                 "ratio {ratio:.1}x exceeds max {:.1}x — exact fallback",
@@ -579,26 +698,49 @@ pub fn compress_hits(
             png_paths: Vec::new(),
             ratio,
             precision: Some(1.0),
+            clipped: false,
         });
     }
 
     let out_dir = root.join(".cache/wordkeep/optical");
-    fs::create_dir_all(&out_dir).map_err(|e| e.to_string())?;
-    let stamp = Instant::now().elapsed().as_nanos();
-    let png = out_dir.join(format!("knowledge_{stamp}.png"));
-    let page = render_doc_page(&corpus, &png, mode, Some("knowledge_search"))?;
+    let (pages, clipped) = render_pages(
+        &corpus,
+        &out_dir,
+        mode,
+        Some("knowledge_search"),
+        1,
+        "knowledge",
+    )?;
+    let page = pages
+        .first()
+        .ok_or_else(|| "render_pages produced no page".to_string())?
+        .clone();
 
     let mut backend = "glyph-ocr".to_string();
+    let mut receipt_backend = None;
     let mut fallback = false;
     let mut fallback_reason = None;
+    if clipped {
+        fallback = true;
+        fallback_reason = Some("page clipped — exact text attached for omitted tail".into());
+    }
 
     // Cache-only peer glance — never stall MCP on copper_health.sh / aeron ping.
     let peer_ready = copper_health::prefer_copper_cached(root);
     let mut decoded = if policy.prefer_gpu && peer_ready {
         match try_deepseek_ocr_task(root, &page.png_path) {
-            Ok(text) => {
-                backend = "deepseek-ocr".into();
-                text
+            Ok(r) => {
+                // Honest label: sidecar is not GPU OCR.
+                backend = r.backend.clone();
+                receipt_backend = Some(r.backend.clone());
+                if r.backend != "deepseek-ocr" {
+                    fallback = true;
+                    fallback_reason = Some(format!(
+                        "receipt backend={} (not deepseek-ocr)",
+                        r.backend
+                    ));
+                }
+                r.text
             }
             Err(e) => {
                 fallback = true;
@@ -624,8 +766,15 @@ pub fn compress_hits(
         decoded = page.text.clone();
         backend = format!("{backend}+exact");
     }
+    if clipped {
+        // Attach full corpus so clipped skim never silently drops SoT.
+        decoded = corpus.clone();
+        backend = format!("{backend}+exact");
+    }
 
-    stats::record_optical(!fallback || backend.contains("deepseek"), page.ratio, precision);
+    // Only count as GPU optical success when receipt says deepseek-ocr and no fallback.
+    let gpu_ok = !fallback && backend == "deepseek-ocr";
+    stats::record_optical(gpu_ok, page.ratio, precision);
 
     Ok(OpticalHitBundle {
         png_paths: vec![page.png_path.display().to_string()],
@@ -634,45 +783,120 @@ pub fn compress_hits(
         pages: vec![page],
         decoded_text: decoded,
         backend,
+        receipt_backend,
         fallback,
         fallback_reason,
+        clipped,
     })
 }
 
-fn try_deepseek_ocr_task(root: &Path, png: &Path) -> Result<String, String> {
-    // Submit Palaestra job; when the job script is a stub or fails, propagate Err.
+/// Parse task_submit JSON and reject failed / non-done jobs (stale-guard).
+pub fn assert_task_done(reply: &str) -> Result<Value, String> {
+    let v: Value = serde_json::from_str(reply)
+        .map_err(|e| format!("task reply not JSON: {e}"))?;
+    let status = v
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let exit = v.get("exit_code").and_then(Value::as_i64).unwrap_or(-1);
+    if status != "done" || exit != 0 {
+        return Err(format!(
+            "deepseek-ocr task not done (status={status} exit_code={exit})"
+        ));
+    }
+    Ok(v)
+}
+
+/// Validate receipt.json against expected nonce/job; reject empty backend.
+pub fn assert_ocr_receipt(receipt: &Value, expected_nonce: &str) -> Result<String, String> {
+    let job = receipt.get("job").and_then(Value::as_str).unwrap_or("");
+    if job != "deepseek-ocr" {
+        return Err(format!("receipt job mismatch: {job}"));
+    }
+    let nonce = receipt
+        .get("nonce")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if nonce != expected_nonce {
+        return Err(format!(
+            "receipt nonce mismatch: got {nonce:?} want {expected_nonce:?}"
+        ));
+    }
+    let backend = receipt
+        .get("backend")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    if backend.is_empty() || backend == "empty" {
+        return Err(format!("receipt backend rejected: {backend:?}"));
+    }
+    Ok(backend)
+}
+
+fn try_deepseek_ocr_task(root: &Path, png: &Path) -> Result<OcrTaskResult, String> {
+    let nonce = fresh_nonce();
     let args = json!({
         "job": "deepseek-ocr",
         "wait": true,
     });
     let job_in = root.join(".cache/palaestra/jobs/deepseek-ocr");
     fs::create_dir_all(&job_in).map_err(|e| e.to_string())?;
+
+    // Clear prior finals so a failed job cannot leave a stale decoded.txt readable.
+    let _ = fs::remove_file(job_in.join("decoded.txt"));
+    let _ = fs::remove_file(job_in.join("receipt.json"));
+
     let dest = job_in.join("input.png");
-    fs::copy(png, &dest).map_err(|e| format!("copy input: {e}"))?;
+    let dest_tmp = job_in.join("input.png.tmp");
+    fs::copy(png, &dest_tmp).map_err(|e| format!("copy input tmp: {e}"))?;
+    fs::rename(&dest_tmp, &dest).map_err(|e| format!("rename input: {e}"))?;
+
     let sidecar = png.with_extension("page.json");
-    if sidecar.is_file() {
-        let _ = fs::copy(&sidecar, job_in.join("page.json"));
-        let _ = fs::copy(&sidecar, job_in.join("input.page.json"));
+    if !sidecar.is_file() {
+        return Err("missing page.json sidecar for GPU OCR staging".into());
     }
-    let _ = fs::write(job_in.join("input.path"), dest.display().to_string());
+    fs::copy(&sidecar, job_in.join("page.json")).map_err(|e| format!("copy page.json: {e}"))?;
+    fs::copy(&sidecar, job_in.join("input.page.json"))
+        .map_err(|e| format!("copy input.page.json: {e}"))?;
+    fs::write(job_in.join("input.nonce"), &nonce).map_err(|e| format!("write nonce: {e}"))?;
+    fs::write(job_in.join("input.path"), dest.display().to_string())
+        .map_err(|e| format!("write input.path: {e}"))?;
 
     let reply = task_lan::submit(root, &args)?;
+    let _task = assert_task_done(&reply)?;
+
+    let receipt_path = job_in.join("receipt.json");
+    let remote_receipt = root.join(".cache/palaestra/remote/deepseek-ocr/receipt.json");
+    let receipt_src = if receipt_path.is_file() {
+        receipt_path.clone()
+    } else if remote_receipt.is_file() {
+        remote_receipt
+    } else {
+        return Err("deepseek-ocr finished without receipt.json".into());
+    };
+    let receipt_raw = fs::read_to_string(&receipt_src).map_err(|e| e.to_string())?;
+    let receipt: Value =
+        serde_json::from_str(&receipt_raw).map_err(|e| format!("receipt JSON: {e}"))?;
+    let backend = assert_ocr_receipt(&receipt, &nonce)?;
+
     let decoded = job_in.join("decoded.txt");
-    if decoded.is_file() {
-        let text = fs::read_to_string(&decoded).map_err(|e| e.to_string())?;
-        if !text.trim().is_empty() {
-            return Ok(text);
-        }
+    let remote_decoded = root.join(".cache/palaestra/remote/deepseek-ocr/decoded.txt");
+    let text_path = if decoded.is_file() {
+        decoded
+    } else if remote_decoded.is_file() {
+        remote_decoded
+    } else {
+        return Err("deepseek-ocr finished without decoded.txt".into());
+    };
+    let text = fs::read_to_string(&text_path).map_err(|e| e.to_string())?;
+    if text.trim().is_empty() {
         return Err("deepseek-ocr returned empty decoded.txt".into());
     }
-    let remote = root.join(".cache/palaestra/remote/deepseek-ocr/decoded.txt");
-    if remote.is_file() {
-        return fs::read_to_string(remote).map_err(|e| e.to_string());
-    }
-    Err(format!(
-        "deepseek-ocr finished without decoded.txt (status: {})",
-        reply.lines().next().unwrap_or("?")
-    ))
+    Ok(OcrTaskResult {
+        text,
+        backend,
+        nonce,
+    })
 }
 
 /// Format optical section appended to knowledge_search replies.
@@ -685,6 +909,12 @@ pub fn format_optical_section(bundle: &OpticalHitBundle) -> String {
     ));
     if let Some(p) = bundle.precision {
         out.push_str(&format!(" precision={p:.3}"));
+    }
+    if let Some(rb) = &bundle.receipt_backend {
+        out.push_str(&format!(" receipt_backend={rb}"));
+    }
+    if bundle.clipped {
+        out.push_str(" clipped=true");
     }
     out.push('\n');
     if let Some(r) = &bundle.fallback_reason {
@@ -748,5 +978,46 @@ mod tests {
         assert!(!policy_allows_optical(10.0, 5.0, true));
         assert!(policy_allows_optical(10.0, 5.0, false));
         assert!(!policy_allows_optical(10.0, 15.0, false));
+    }
+
+    #[test]
+    fn assert_task_done_rejects_failed_child() {
+        let ok = r#"{"status":"done","exit_code":0}"#;
+        assert!(assert_task_done(ok).is_ok());
+        let fail = r#"{"status":"failed","exit_code":23}"#;
+        let err = assert_task_done(fail).unwrap_err();
+        assert!(err.contains("not done"), "{err}");
+    }
+
+    #[test]
+    fn assert_ocr_receipt_nonce_and_backend() {
+        let good = json!({
+            "job": "deepseek-ocr",
+            "backend": "sidecar",
+            "nonce": "abc-1",
+        });
+        assert_eq!(assert_ocr_receipt(&good, "abc-1").unwrap(), "sidecar");
+        let mismatch = json!({
+            "job": "deepseek-ocr",
+            "backend": "deepseek-ocr",
+            "nonce": "other",
+        });
+        assert!(assert_ocr_receipt(&mismatch, "abc-1").unwrap_err().contains("nonce"));
+        let empty = json!({
+            "job": "deepseek-ocr",
+            "backend": "empty",
+            "nonce": "abc-1",
+        });
+        assert!(assert_ocr_receipt(&empty, "abc-1").unwrap_err().contains("backend"));
+    }
+
+    #[test]
+    fn render_pages_marks_clip_when_capped() {
+        let dir = tmp("pages");
+        let long = "line\n".repeat(400);
+        let (pages, clipped) =
+            render_pages(&long, &dir, VisionMode::Tiny, Some("t"), 1, "t").unwrap();
+        assert_eq!(pages.len(), 1);
+        assert!(clipped);
     }
 }

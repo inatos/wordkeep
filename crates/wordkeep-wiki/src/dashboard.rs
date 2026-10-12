@@ -118,11 +118,12 @@ pub(crate) fn build() -> Result<Value, String> {
     let optical = data.get("optical").cloned().unwrap_or_else(|| {
         json!({
             "calls": 0,
+            "mas_calls": 0,
             "fallback_calls": 0,
             "avg_ratio": 0.0,
             "avg_precision": 0.0,
             "precision_samples": 0,
-            "enabled_hint": "Opt-in: knowledge_search optical:true (default off until 10× gate)."
+            "enabled_hint": "Opt-in: knowledge_search optical:true / session_handoff optical:true (default off until 10× gate)."
         })
     });
 

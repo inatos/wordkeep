@@ -124,7 +124,8 @@ fn job_lane(job: &str) -> &'static str {
         // Live / micro workers — Copper wire + optional Copper worker.
         "identity-tmlp" | "cuda-smoke" | "arte-art-pose" | "deepseek-ocr" => "L",
         // Overnight / heavy — task_* SoT + SSH executor (Copper notify only).
-        "train-stub" | "hunyuan-img2mesh" | "lift-stub" => "J",
+        // deepseek-ocr-provision is Lane J (venv + HF download); Courier announce-only.
+        "train-stub" | "hunyuan-img2mesh" | "lift-stub" | "deepseek-ocr-provision" => "J",
         _ => "J",
     }
 }
