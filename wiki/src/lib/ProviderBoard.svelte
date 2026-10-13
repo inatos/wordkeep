@@ -132,13 +132,17 @@
   function stateOf(raw: string | number | null | undefined): { tone: Tone; kind: string; label: string } {
     const label = String(raw ?? '—').trim() || '—';
     const key = label.toLowerCase();
-    if (['up', 'ok', 'live', 'ready', 'healthy', 'true', '1'].includes(key)) {
+    // Bare integers are count metrics (e.g. Courier unread) — not boolean 0/1.
+    if (/^\d+$/.test(key)) {
+      return { tone: key === '0' ? 'muted' : 'accent', kind: 'dot', label };
+    }
+    if (['up', 'ok', 'live', 'ready', 'healthy', 'true'].includes(key)) {
       return { tone: 'ok', kind: 'check', label };
     }
     if (['stale', 'n/a', 'na', 'degraded', 'warn', 'warning'].includes(key)) {
       return { tone: 'warn', kind: 'clock', label };
     }
-    if (['down', 'missing', 'error', 'fail', 'failed', 'false', '0', 'unavailable'].includes(key)) {
+    if (['down', 'missing', 'error', 'fail', 'failed', 'false', 'unavailable'].includes(key)) {
       return { tone: 'danger', kind: 'x', label };
     }
     if (key === '—' || key === 'unknown' || key === 'none') {
@@ -151,7 +155,9 @@
     const label = String(raw ?? '—').trim() || '—';
     const key = label.toLowerCase();
     if (key === 'ok' || key === 'pass' || key === 'done') return { tone: 'ok', kind: 'check', label };
-    if (key === 'trunc' || key === 'empty' || key === 'low_yield') return { tone: 'warn', kind: 'warn', label };
+    if (key === 'trunc' || key === 'empty' || key === 'low_yield' || key === 'warn' || key === 'warning') {
+      return { tone: 'warn', kind: 'warn', label };
+    }
     if (key === 'error' || key === 'invalid' || key === 'fail' || key === 'failed') {
       return { tone: 'danger', kind: 'x', label };
     }
@@ -164,6 +170,14 @@
     if (secs < 60) return `${secs}s`;
     if (secs < 3600) return `${Math.floor(secs / 60)}m`;
     return `${Math.floor(secs / 3600)}h`;
+  }
+
+  function sparkUnit(title: string): string {
+    const t = title.trim().toLowerCase();
+    if (t.includes('mbps') || t.includes('mbit')) return 'Mbps';
+    if (t.includes('rtt') || t.endsWith(' ms') || t.includes('latency')) return 'ms';
+    if (t.includes('byte')) return 'B';
+    return 'value';
   }
 
   function partition(cards: ProviderCard[]) {
@@ -321,7 +335,7 @@
           {#if activityRows(card).length === 0}
             <p class="muted empty-msg">No recent calls.</p>
           {:else}
-            <div class="table-wrap activity-scroll">
+            <div class="table-wrap">
               <table class="dash-table">
                 <thead>
                   <tr>
@@ -414,6 +428,7 @@
           {#if parts.sparks.length}
             <div class="dash-charts">
               {#each parts.sparks as card, sIdx (`${provider.name}-s-${sIdx}`)}
+                {@const unit = sparkUnit(card.title)}
                 <article class="card chart-card" title={providerFieldHelp(card.title, card.kind)}>
                   <h3>{card.title}</h3>
                   <Sparkline
@@ -421,8 +436,8 @@
                     empty="No series yet."
                     ariaLabel={card.title}
                     chartTitle={card.title}
-                    valueLabel="ms"
-                    yAxisLabel="ms"
+                    valueLabel={unit}
+                    yAxisLabel={unit}
                     xAxisLabel="older → newer"
                   />
                 </article>
@@ -517,16 +532,16 @@
     font-variant-numeric: tabular-nums;
   }
 
-  /* Match shared dash-table header chrome (app.css sets thead th padding:0 for .sort-btn). */
-  .activity-scroll :global(th .sort-btn) {
+  /* Match Telemetry / Ereshkigal: plain .table-wrap + .dash-table (no height cage). */
+  :global(.table-wrap) :global(th .sort-btn) {
     cursor: default;
   }
-  .activity-scroll :global(th.tool-name),
-  .activity-scroll :global(th.text) {
+  :global(.table-wrap) :global(th.tool-name),
+  :global(.table-wrap) :global(th.text) {
     text-align: left;
   }
-  .activity-scroll :global(th.tool-name .sort-btn),
-  .activity-scroll :global(th.text .sort-btn) {
+  :global(.table-wrap) :global(th.tool-name .sort-btn),
+  :global(.table-wrap) :global(th.text .sort-btn) {
     text-align: left;
   }
 
@@ -614,16 +629,6 @@
     gap: 0;
   }
 
-  /* Height cap only — border/radius/padding come from shared app.css .table-wrap. */
-  .activity-scroll {
-    max-height: 16.5rem;
-    margin-bottom: 0;
-  }
-  .activity-scroll thead th {
-    position: sticky;
-    top: 0;
-    z-index: 1;
-  }
   .outcome-ico {
     display: inline-flex;
     width: 1rem;
