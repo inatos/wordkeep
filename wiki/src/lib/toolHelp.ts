@@ -169,6 +169,57 @@ export const OUTCOME_HELP: Record<string, string> = {
   other: 'Remaining tools outside the top-N chart slots, aggregated together.',
 };
 
+/** Dashboard → Providers page (config-declared sidecar cards). Keys match card titles (case-insensitive). */
+export const PROVIDER_FIELD_HELP: Record<string, string> = {
+  peer:
+    'Whether the linked peer answers health checks (up/down). Detail is usually the vantage role (desktop / serve host).',
+  'rtt ms':
+    'Round-trip time to the peer in milliseconds (sparkline of recent samples). Empty means no RTT was recorded yet.',
+  caps:
+    'Capability probe for the peer link (e.g. AF_PACKET / setcap readiness). missing = cannot use the fabric wire.',
+  'infer daemon':
+    'Local inference daemon that hosts remote SemIf / Lane-L work. up = ready; n/a = not expected on this vantage; stale = sock left behind.',
+  'task lanes':
+    'Counts of Palaestra LAN jobs by lane and status (L = light identity/smoke/pose/OCR; J = heavier train/mesh). From task_* receipts.',
+  'semif backends':
+    'Mix of recent SemIf scorers from semif-events.jsonl. remote-fabric = peer-backed path; ereshkigal = local GGUF; heuristic = local fallback.',
+  'recent fabric calls':
+    'Recent MCP calls biased toward task_*/SemIf/runtime tools (from savings.json). Outcome icons match telemetry outcomes.',
+  status:
+    'Live scalars from the provider sidecar: peer reachability, caps, daemon, and optional RTT history.',
+  mix: 'Aggregate charts from the sidecar — task-lane volume and SemIf backend share.',
+};
+
+export const PROVIDER_CHROME_HELP = {
+  live: 'Sidecar is fresh (within stale_secs). Values are from the last writer refresh.',
+  stale:
+    'Sidecar timestamp is older than stale_secs — showing last-known values. Refresh the out-of-tree writer / health watch.',
+  unavailable: 'Sidecar file missing or unreadable. Configure telemetry_providers.sidecar and run the writer.',
+  age: 'Seconds since the sidecar ts (or file mtime). Wiki polls /api/dashboard every 2s while this page is open.',
+  provider:
+    'Config-declared telemetry provider: opaque JSON sidecar projected via JSON Pointers (no private fabric code in Wordkeep).',
+} as const;
+
+export const PROVIDER_COLUMN_HELP = {
+  when: 'Relative age of the call (from savings.json event ts). Newest toward the top of the scroll.',
+  tool: 'MCP tool name that ran. Purple chip = identifier only; hover for the savings outcome context.',
+  outcome:
+    'Call outcome icon: check = ok; warn = trunc/empty/low-yield; x = error/invalid/fail; search = not_found.',
+  detail: 'Optional reason string from the tool (validation errors, empty results, etc.).',
+} as const;
+
+/** Resolve help for a provider card title (or kind fallback). */
+export function providerFieldHelp(title: string, kind?: string): string {
+  const key = title.trim().toLowerCase();
+  if (PROVIDER_FIELD_HELP[key]) return PROVIDER_FIELD_HELP[key];
+  if (kind === 'metric') return `Status field “${title}” from the provider sidecar.`;
+  if (kind === 'sparkline') return `Time series “${title}” from the provider sidecar (oldest → newest).`;
+  if (kind === 'bar') return `Bar breakdown “${title}” from the provider sidecar.`;
+  if (kind === 'donut') return `Share mix “${title}” from the provider sidecar.`;
+  if (kind === 'activity') return `Recent call log “${title}” projected from the sidecar / savings events.`;
+  return `Provider card “${title}”.`;
+}
+
 export const TERMINAL_DASHBOARD_CMD =
   'cargo run -p wordkeep --features dashboard -- dashboard';
 

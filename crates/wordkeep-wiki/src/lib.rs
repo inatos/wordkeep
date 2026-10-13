@@ -4,6 +4,7 @@ mod garden;
 mod indexer;
 mod izakaya;
 mod meili;
+mod providers;
 mod runtime;
 mod semif;
 mod shrift;

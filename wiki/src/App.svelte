@@ -56,6 +56,7 @@
   import IzakayaBoard from './lib/IzakayaBoard.svelte';
   import EreshkigalBoard from './lib/EreshkigalBoard.svelte';
   import ShriftBoard from './lib/ShriftBoard.svelte';
+  import ProviderBoard from './lib/ProviderBoard.svelte';
 
   type Tab = 'search' | 'reader' | 'dashboard' | 'health' | 'shrift';
   type EditorTab = { path: string; pinned: boolean };
@@ -86,7 +87,7 @@
 
   let tab = $state<Tab>('search');
   let healthView = $state<'runtime' | 'knowledge'>('runtime');
-  let dashView = $state<'telemetry' | 'izakaya' | 'ereshkigal'>('telemetry');
+  let dashView = $state<'telemetry' | 'izakaya' | 'ereshkigal' | 'providers'>('telemetry');
   let dashQuery = $state('');
   let urlReady = $state(false);
   let query = $state('');
@@ -115,6 +116,10 @@
   let searchTelemetry = $state<SearchTelemetry | null>(null);
   let dashboard = $state<DashboardPayload | null>(null);
   let dashboardError = $state('');
+  /** Tab label from first configured `telemetry_providers` entry. */
+  let providerPageLabel = $derived(
+    dashboard?.providers?.[0]?.name?.trim() || 'Providers',
+  );
   let sessionSavedFmt = $state('0');
   let sortKey = $state<SortKey>('saved');
   let sortDir = $state<'asc' | 'desc'>('desc');
@@ -281,6 +286,7 @@
     else if (tab === 'health') url.searchParams.set('view', 'knowledge');
     else if (tab === 'dashboard' && dashView === 'izakaya') url.searchParams.set('view', 'izakaya');
     else if (tab === 'dashboard' && dashView === 'ereshkigal') url.searchParams.set('view', 'ereshkigal');
+    else if (tab === 'dashboard' && dashView === 'providers') url.searchParams.set('view', 'providers');
     else url.searchParams.delete('view');
     if (tab === 'dashboard' && dashQuery.trim()) url.searchParams.set('dq', dashQuery.trim());
     else if (tab === 'shrift' && dashQuery.trim()) url.searchParams.set('dq', dashQuery.trim());
@@ -458,6 +464,7 @@
     if (view === 'runtime' || view === 'knowledge') healthView = view;
     if (view === 'izakaya') dashView = 'izakaya';
     if (view === 'ereshkigal') dashView = 'ereshkigal';
+    if (view === 'providers') dashView = 'providers';
     const dq = params.get('dq');
     if (dq) dashQuery = dq;
     if (path) {
@@ -2578,7 +2585,7 @@
         <header class="panel-head">
           <h2
             class="section-title"
-            title="Dashboard pages: MCP token savings, or live Izakaya presence from the coordination journal."
+            title="Dashboard pages: MCP telemetry, Izakaya, Ereshkigal, or config-declared provider sidecars."
           >
             <svg viewBox="0 0 24 24" aria-hidden="true"
               ><path
@@ -2590,7 +2597,13 @@
                 stroke-linejoin="round"
               /></svg
             >
-            {dashView === 'izakaya' ? 'Izakaya' : dashView === 'ereshkigal' ? 'Ereshkigal' : 'MCP telemetry'}
+            {dashView === 'izakaya'
+              ? 'Izakaya'
+              : dashView === 'ereshkigal'
+                ? 'Ereshkigal'
+                : dashView === 'providers'
+                  ? providerPageLabel
+                  : 'MCP telemetry'}
           </h2>
           <button
             class="icon-btn"
@@ -2633,6 +2646,11 @@
             class:active={dashView === 'ereshkigal'}
             onclick={() => (dashView = 'ereshkigal')}>Ereshkigal</button
           >
+          <button
+            class="subview-btn"
+            class:active={dashView === 'providers'}
+            onclick={() => (dashView = 'providers')}>{providerPageLabel}</button
+          >
         </div>
 
         <label class="dash-filter">
@@ -2643,8 +2661,14 @@
               ? 'Filter agents, journal, claims, and izakaya calls…'
               : dashView === 'ereshkigal'
                 ? 'Filter Ereshkigal calls, cascade, scorers…'
-                : 'Filter tools, calls, and health signals…'}
-            aria-label={dashView === 'izakaya' ? 'Filter Izakaya data and telemetry' : 'Filter MCP telemetry'}
+                : dashView === 'providers'
+                  ? `Filter ${providerPageLabel} cards, lanes, backends, calls…`
+                  : 'Filter tools, calls, and health signals…'}
+            aria-label={dashView === 'izakaya'
+              ? 'Filter Izakaya data and telemetry'
+              : dashView === 'providers'
+                ? `Filter ${providerPageLabel}`
+                : 'Filter MCP telemetry'}
             title="Space-separated substrings. Applies to charts and tables on this page. Empty shows everything."
           />
         </label>
@@ -2657,6 +2681,14 @@
           />
         {:else if dashView === 'ereshkigal'}
           <EreshkigalBoard query={dashQuery} />
+        {:else if dashView === 'providers'}
+          {#if dashboardError}
+            <p class="muted">Dashboard unavailable: <code>{dashboardError}</code></p>
+          {:else if !dashboard}
+            <p class="muted">Loading {providerPageLabel}…</p>
+          {:else}
+            <ProviderBoard providers={dashboard.providers ?? []} query={dashQuery} />
+          {/if}
         {:else if dashboardError}
           <p class="muted">Dashboard unavailable: <code>{dashboardError}</code></p>
         {:else if !dashboard}

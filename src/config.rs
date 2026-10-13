@@ -877,6 +877,189 @@ pub fn coverage_hint(root: &Path, paths: &[String]) -> String {
     )
 }
 
+/// Card kinds rendered by the wiki telemetry dashboard (provider-generic).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TelemetryCardKind {
+    Metric,
+    Sparkline,
+    Donut,
+    Bar,
+    Activity,
+}
+
+impl TelemetryCardKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Metric => "metric",
+            Self::Sparkline => "sparkline",
+            Self::Donut => "donut",
+            Self::Bar => "bar",
+            Self::Activity => "activity",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "metric" => Some(Self::Metric),
+            "sparkline" => Some(Self::Sparkline),
+            "donut" => Some(Self::Donut),
+            "bar" => Some(Self::Bar),
+            "activity" => Some(Self::Activity),
+            _ => None,
+        }
+    }
+}
+
+/// One chart/metric card declared under a telemetry provider.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TelemetryCardSpec {
+    pub kind: TelemetryCardKind,
+    pub title: String,
+    /// JSON Pointer (RFC 6901 subset: `/a/b`) into the sidecar document for the primary value.
+    pub value: Option<String>,
+    /// JSON Pointer for a secondary detail string (metric cards).
+    pub detail: Option<String>,
+    /// JSON Pointer for series data (sparkline / donut / bar / activity).
+    pub series: Option<String>,
+}
+
+/// Config-declared telemetry sidecar provider (fabric-agnostic).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TelemetryProviderSpec {
+    pub name: String,
+    /// Repo-relative path to the JSON sidecar written by an out-of-tree producer.
+    pub sidecar: String,
+    pub refresh_secs: u64,
+    pub stale_secs: u64,
+    pub cards: Vec<TelemetryCardSpec>,
+}
+
+const DEFAULT_PROVIDER_REFRESH_SECS: u64 = 30;
+const DEFAULT_PROVIDER_STALE_MULT: u64 = 3;
+
+/// Parse `telemetry_providers` from `.wordkeep/config.json` (empty when missing).
+pub fn telemetry_providers(root: &Path) -> Result<Vec<TelemetryProviderSpec>, String> {
+    let Some(cfg) = load_config(root) else {
+        return Ok(Vec::new());
+    };
+    parse_telemetry_providers(&cfg)
+}
+
+/// Parse provider specs from an already-loaded config document.
+pub fn parse_telemetry_providers(cfg: &Value) -> Result<Vec<TelemetryProviderSpec>, String> {
+    let Some(arr) = cfg.get("telemetry_providers").and_then(Value::as_array) else {
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::with_capacity(arr.len());
+    for (i, entry) in arr.iter().enumerate() {
+        let name = entry
+            .get("name")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| format!("telemetry_providers[{i}].name must be a non-empty string"))?
+            .to_string();
+        let sidecar_raw = entry
+            .get("sidecar")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| format!("telemetry_providers[{i}].sidecar must be a non-empty string"))?;
+        let sidecar = validate_rel_path(sidecar_raw)
+            .map_err(|e| format!("telemetry_providers[{i}].sidecar: {e}"))?;
+        let refresh_secs = entry
+            .get("refresh_secs")
+            .and_then(Value::as_u64)
+            .unwrap_or(DEFAULT_PROVIDER_REFRESH_SECS)
+            .max(1);
+        let stale_secs = entry
+            .get("stale_secs")
+            .and_then(Value::as_u64)
+            .unwrap_or(refresh_secs.saturating_mul(DEFAULT_PROVIDER_STALE_MULT))
+            .max(refresh_secs);
+        let cards_arr = entry
+            .get("cards")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let mut cards = Vec::with_capacity(cards_arr.len());
+        for (j, card) in cards_arr.iter().enumerate() {
+            let kind_raw = card
+                .get("kind")
+                .and_then(Value::as_str)
+                .ok_or_else(|| format!("telemetry_providers[{i}].cards[{j}].kind required"))?;
+            let kind = TelemetryCardKind::parse(kind_raw).ok_or_else(|| {
+                format!(
+                    "telemetry_providers[{i}].cards[{j}].kind unknown: {kind_raw} \
+                     (expected metric|sparkline|donut|bar|activity)"
+                )
+            })?;
+            let title = card
+                .get("title")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| {
+                    format!("telemetry_providers[{i}].cards[{j}].title must be a non-empty string")
+                })?
+                .to_string();
+            let value = card
+                .get("value")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
+            let detail = card
+                .get("detail")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
+            let series = card
+                .get("series")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
+            match kind {
+                TelemetryCardKind::Metric => {
+                    if value.is_none() {
+                        return Err(format!(
+                            "telemetry_providers[{i}].cards[{j}] metric requires value pointer"
+                        ));
+                    }
+                }
+                TelemetryCardKind::Sparkline
+                | TelemetryCardKind::Donut
+                | TelemetryCardKind::Bar
+                | TelemetryCardKind::Activity => {
+                    if series.is_none() {
+                        return Err(format!(
+                            "telemetry_providers[{i}].cards[{j}] {} requires series pointer",
+                            kind.as_str()
+                        ));
+                    }
+                }
+            }
+            cards.push(TelemetryCardSpec {
+                kind,
+                title,
+                value,
+                detail,
+                series,
+            });
+        }
+        out.push(TelemetryProviderSpec {
+            name,
+            sidecar,
+            refresh_secs,
+            stale_secs,
+            cards,
+        });
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1169,5 +1352,67 @@ mod tests {
         fs::write(dir.join(".wordkeep/config.json"), r#"{"commit_ignore":[]}"#).unwrap();
         assert!(commit_ignore(&dir).is_empty());
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn telemetry_providers_empty_when_missing() {
+        let dir = tmp("tp_empty");
+        fs::write(dir.join(".wordkeep/config.json"), r#"{}"#).unwrap();
+        assert!(telemetry_providers(&dir).unwrap().is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn telemetry_providers_parse_and_validate() {
+        let dir = tmp("tp_ok");
+        fs::write(
+            dir.join(".wordkeep/config.json"),
+            r#"{
+              "telemetry_providers": [{
+                "name": "Fabric",
+                "sidecar": ".cache/palaestra/telemetry_provider.json",
+                "refresh_secs": 30,
+                "cards": [
+                  {"kind": "metric", "title": "Peer", "value": "/presence", "detail": "/role"},
+                  {"kind": "sparkline", "title": "RTT", "series": "/rtt_ms_history"},
+                  {"kind": "donut", "title": "Backends", "series": "/semif_backends"},
+                  {"kind": "bar", "title": "Lanes", "series": "/task_lanes"},
+                  {"kind": "activity", "title": "Recent", "series": "/recent_activity"}
+                ]
+              }]
+            }"#,
+        )
+        .unwrap();
+        let specs = telemetry_providers(&dir).unwrap();
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].name, "Fabric");
+        assert_eq!(specs[0].sidecar, ".cache/palaestra/telemetry_provider.json");
+        assert_eq!(specs[0].refresh_secs, 30);
+        assert_eq!(specs[0].stale_secs, 90);
+        assert_eq!(specs[0].cards.len(), 5);
+        assert_eq!(specs[0].cards[0].kind, TelemetryCardKind::Metric);
+        assert_eq!(specs[0].cards[1].kind, TelemetryCardKind::Sparkline);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn telemetry_providers_reject_escape_and_bad_kind() {
+        let bad_path = serde_json::json!({
+            "telemetry_providers": [{
+                "name": "X",
+                "sidecar": "../outside.json",
+                "cards": []
+            }]
+        });
+        assert!(parse_telemetry_providers(&bad_path).unwrap_err().contains("sidecar"));
+
+        let bad_kind = serde_json::json!({
+            "telemetry_providers": [{
+                "name": "X",
+                "sidecar": ".cache/x.json",
+                "cards": [{"kind": "heatmap", "title": "Nope", "series": "/a"}]
+            }]
+        });
+        assert!(parse_telemetry_providers(&bad_kind).unwrap_err().contains("kind"));
     }
 }

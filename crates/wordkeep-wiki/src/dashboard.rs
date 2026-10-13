@@ -2,23 +2,27 @@
 //!
 //! Mirrors the terminal `wordkeep dashboard` overview (tools / activity / health)
 //! using on-disk `savings.json`, so the GUI works without the `dashboard` Cargo
-//! feature.
+//! feature. Also projects config-declared telemetry providers (opaque sidecars).
 
 use crate::indexer::global_cache_dir;
+use crate::providers;
 use serde_json::{json, Value};
+use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const LOW_YIELD_RATE_PCT: u64 = 25;
 const LOW_YIELD_MIN_CALLS: u64 = 10;
 const NET_NEGATIVE_BASELINE_FLOOR: u64 = 500;
 
-pub(crate) fn build() -> Result<Value, String> {
+pub(crate) fn build(root: &Path) -> Result<Value, String> {
+    let providers = providers::build_providers(root);
     let path = global_cache_dir().join("wordkeep/savings.json");
     if !path.exists() {
         return Ok(json!({
             "available": false,
             "message": "No savings.json yet — run some wordkeep MCP tools first.",
-            "terminal_hint": "cargo run -p wordkeep --features dashboard -- dashboard"
+            "terminal_hint": "cargo run -p wordkeep --features dashboard -- dashboard",
+            "providers": providers
         }));
     }
 
@@ -149,6 +153,7 @@ pub(crate) fn build() -> Result<Value, String> {
         "tools": tools,
         "activity": activity,
         "health": health_signals(&tools),
+        "providers": providers,
         "terminal_hint": "cargo run -p wordkeep --features dashboard -- dashboard"
     }))
 }

@@ -150,6 +150,39 @@ export type DashboardOptical = {
   enabled_hint?: string;
 };
 
+/** One projected card from a config-declared telemetry provider sidecar. */
+export type ProviderCard = {
+  kind: 'metric' | 'sparkline' | 'donut' | 'bar' | 'activity' | string;
+  title: string;
+  value?: string | number | null;
+  detail?: string | null;
+  series?: Array<{
+    ts?: number;
+    value?: number;
+    label?: string;
+    name?: string;
+    ago?: string;
+    tool?: string;
+    outcome?: string;
+    reason?: string;
+    detail?: string;
+    [key: string]: unknown;
+  }>;
+};
+
+/** Opaque sidecar provider projected by /api/dashboard. */
+export type ProviderPayload = {
+  name: string;
+  available: boolean;
+  reason?: string | null;
+  sidecar?: string;
+  age_secs?: number;
+  refresh_secs?: number;
+  stale_secs?: number;
+  ts?: number | string | null;
+  cards?: ProviderCard[];
+};
+
 export type DashboardPayload = {
   available: boolean;
   message?: string;
@@ -171,6 +204,8 @@ export type DashboardPayload = {
   tools?: DashboardTool[];
   activity?: DashboardActivity[];
   health?: { signals?: DashboardSignal[] };
+  /** Config-declared telemetry providers (opaque JSON sidecars). */
+  providers?: ProviderPayload[];
 };
 
 const API_BASE = `${import.meta.env.BASE_URL}api`;

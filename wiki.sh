@@ -301,6 +301,13 @@ ui_has_tool_help() {
     && grep -q 'pages via continuation when truncated' "$WK/wiki/dist"/assets/*.js 2>/dev/null
 }
 
+ui_has_provider_view() {
+  # Bump unique phrases when ProviderBoard layout/CSS changes need a dist rebuild.
+  grep -q 'No telemetry providers configured' "$WK/wiki/dist"/assets/*.js 2>/dev/null \
+    && grep -q 'dash-provider-' "$WK/wiki/dist"/assets/*.js 2>/dev/null \
+    && grep -q 'dash-overview' "$WK/wiki/dist"/assets/*.css 2>/dev/null
+}
+
 ui_has_local_base() {
   # Local host serve must use Vite base `/` (lab Docker sets /lab/wordkeep/ui/).
   local index="$WK/wiki/dist/index.html"
@@ -319,7 +326,7 @@ rebuild_ui_dist() {
 }
 
 ensure_ui_dist() {
-  if ui_has_runtime_view && ui_has_local_base && ui_has_izakaya_view && ui_has_tool_help && ui_has_ereshkigal_view; then
+  if ui_has_runtime_view && ui_has_local_base && ui_has_izakaya_view && ui_has_tool_help && ui_has_ereshkigal_view && ui_has_provider_view; then
     return 0
   fi
   if ! ui_has_local_base && [[ -f "$WK/wiki/dist/index.html" ]]; then
@@ -332,13 +339,15 @@ ensure_ui_dist() {
     echo "[wordkeep:wiki] wiki/dist is stale (no Ereshkigal dashboard page)"
   elif ! ui_has_tool_help; then
     echo "[wordkeep:wiki] wiki/dist is stale (TOOL_HELP hover strings missing)"
+  elif ! ui_has_provider_view; then
+    echo "[wordkeep:wiki] wiki/dist is stale (no Providers dashboard page)"
   fi
   rebuild_ui_dist || return 1
-  ui_has_runtime_view && ui_has_local_base && ui_has_izakaya_view && ui_has_tool_help && ui_has_ereshkigal_view
+  ui_has_runtime_view && ui_has_local_base && ui_has_izakaya_view && ui_has_tool_help && ui_has_ereshkigal_view && ui_has_provider_view
 }
 
 healthy() {
-  ui_up && dashboard_ok && izakaya_ok && semif_api_ok && runtime_ok && runtime_attach_ok && ui_has_runtime_view && ui_has_izakaya_view && ui_has_ereshkigal_view && ui_has_tool_help && ui_has_local_base
+  ui_up && dashboard_ok && izakaya_ok && semif_api_ok && runtime_ok && runtime_attach_ok && ui_has_runtime_view && ui_has_izakaya_view && ui_has_ereshkigal_view && ui_has_tool_help && ui_has_provider_view && ui_has_local_base
 }
 
 # Print which healthy() probe failed (for timeout / stale-restart diagnostics).
@@ -353,6 +362,7 @@ healthy_fail_reason() {
   ui_has_izakaya_view || { echo "wiki/dist Izakaya UI"; return; }
   ui_has_ereshkigal_view || { echo "wiki/dist Ereshkigal UI"; return; }
   ui_has_tool_help || { echo "wiki/dist TOOL_HELP"; return; }
+  ui_has_provider_view || { echo "wiki/dist Providers UI"; return; }
   ui_has_local_base || { echo "wiki/dist lab base"; return; }
   echo "unknown"
 }

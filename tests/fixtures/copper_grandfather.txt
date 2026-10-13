@@ -1,0 +1,15 @@
+# Grandfathered paths under tools/wordkeep that may contain the substring "copper"
+# (case-insensitive). New hits outside this list fail the privacy guard.
+# Keep Copper private: add Wordkeep code that is fabric-agnostic instead.
+tools/wordkeep/docs/semif.md
+tools/wordkeep/src/config.rs
+tools/wordkeep/src/copper_health.rs
+tools/wordkeep/src/lib.rs
+tools/wordkeep/src/main.rs
+tools/wordkeep/src/optical.rs
+tools/wordkeep/src/semif.rs
+tools/wordkeep/src/semif_visual.rs
+tools/wordkeep/src/task_lan.rs
+tools/wordkeep/tests/eval_optical.rs
+tools/wordkeep/tests/fixtures/copper_grandfather.txt
+tools/wordkeep/tests/copper_privacy_guard.rs

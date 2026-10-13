@@ -511,8 +511,8 @@ async fn stats() -> ApiResult {
     })))
 }
 
-async fn dashboard_api() -> ApiResult {
-    crate::dashboard::build()
+async fn dashboard_api(State(state): State<AppState>) -> ApiResult {
+    crate::dashboard::build(&state.root)
         .map(Json)
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error))
 }
