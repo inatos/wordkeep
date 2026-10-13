@@ -243,13 +243,10 @@ ui_up() {
 
 dashboard_ok() {
   # /api/dashboard is required for the GUI telemetry tab; older binaries 404 it.
-  # Also reject the "No savings.json" stub caused by a poisoned XDG_CACHE_HOME.
-  local body code
-  body="$(curl -s --max-time 1 -w '\n%{http_code}' "http://${BIND}/api/dashboard" 2>/dev/null || true)"
-  code="$(printf '%s\n' "$body" | tail -n1)"
-  body="$(printf '%s\n' "$body" | sed '$d')"
-  [[ "$code" == "200" ]] || return 1
-  [[ "$body" != *'"available":false'* && "$body" != *'"available": false'* ]]
+  # available:false is fine when savings.json is simply absent (fresh machine /
+  # MCP never run). Poisoned XDG_CACHE_HOME is handled by sanitize_cache_home
+  # before start — do not treat empty telemetry as unhealthy.
+  [[ "$(http_code /api/dashboard)" == "200" ]]
 }
 
 runtime_ok() {
@@ -344,6 +341,22 @@ healthy() {
   ui_up && dashboard_ok && izakaya_ok && semif_api_ok && runtime_ok && runtime_attach_ok && ui_has_runtime_view && ui_has_izakaya_view && ui_has_ereshkigal_view && ui_has_tool_help && ui_has_local_base
 }
 
+# Print which healthy() probe failed (for timeout / stale-restart diagnostics).
+healthy_fail_reason() {
+  ui_up || { echo "ui /"; return; }
+  dashboard_ok || { echo "/api/dashboard"; return; }
+  izakaya_ok || { echo "/api/izakaya"; return; }
+  semif_api_ok || { echo "/api/semif"; return; }
+  runtime_ok || { echo "/api/runtime"; return; }
+  runtime_attach_ok || { echo "runtime attach_enabled"; return; }
+  ui_has_runtime_view || { echo "wiki/dist Runtime Health UI"; return; }
+  ui_has_izakaya_view || { echo "wiki/dist Izakaya UI"; return; }
+  ui_has_ereshkigal_view || { echo "wiki/dist Ereshkigal UI"; return; }
+  ui_has_tool_help || { echo "wiki/dist TOOL_HELP"; return; }
+  ui_has_local_base || { echo "wiki/dist lab base"; return; }
+  echo "unknown"
+}
+
 alive_pid() {
   local pid="$1"
   [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null
@@ -379,7 +392,7 @@ elif healthy; then
   # Still ensure binary is current; a rebuild forces a restart onto the new bin.
   :
 elif ui_up; then
-  echo "[wordkeep:wiki] UI up but dashboard/runtime API stale — restarting"
+  echo "[wordkeep:wiki] UI up but health stale ($(healthy_fail_reason)) — restarting"
   stop_existing
 fi
 
@@ -395,16 +408,95 @@ elif [[ "$FORCE" -eq 0 ]] && healthy; then
   exit 0
 fi
 
-if ! command -v docker >/dev/null 2>&1; then
-  echo "[wordkeep:wiki] docker not found; starting without Meilisearch (search degraded)" >&2
-elif ! docker info >/dev/null 2>&1; then
-  echo "[wordkeep:wiki] docker daemon unavailable; starting without Meilisearch (search degraded)" >&2
+# Docker sock is root:docker. Membership may be in /etc/group while this
+# desktop/Cursor session still lacks the supplementary group (no re-login yet).
+# newgrp + bash re-enters the group; prefer compose, else plain docker run.
+docker_info_ok() {
+  docker info >/dev/null 2>&1
+}
+
+user_listed_in_docker_group() {
+  local user
+  user="$(id -un)"
+  getent group docker 2>/dev/null | grep -Eq "(^|:)${user}(,|$)"
+}
+
+# Run a bash script with docker group credentials when the session lacks them.
+docker_bash() {
+  local script="$1"
+  if docker_info_ok; then
+    /bin/bash -c "$script"
+    return $?
+  fi
+  if ! user_listed_in_docker_group; then
+    return 1
+  fi
+  local tmp rc=0
+  tmp="$(mktemp "${TMPDIR:-/tmp}/wordkeep-docker.XXXXXX.sh")"
+  printf '%s\n' "$script" >"$tmp"
+  chmod 700 "$tmp"
+  # Force bash: login SHELL is often fish and mangles non-interactive pipes.
+  if ! printf 'exec /bin/bash %q\n' "$tmp" | env SHELL=/bin/bash newgrp docker; then
+    rc=1
+  fi
+  rm -f "$tmp"
+  return "$rc"
+}
+
+ensure_meilisearch() {
+  if ! command -v docker >/dev/null 2>&1; then
+    echo "[wordkeep:wiki] docker not found; starting without Meilisearch (search degraded)" >&2
+    return 1
+  fi
+  if ! docker_info_ok && ! user_listed_in_docker_group; then
+    echo "[wordkeep:wiki] docker daemon unavailable (not in docker group); starting without Meilisearch (search degraded)" >&2
+    return 1
+  fi
+  if ! docker_info_ok && user_listed_in_docker_group; then
+    echo "[wordkeep:wiki] docker group in /etc/group but missing from this session — using newgrp (log out/in to fix permanently)" >&2
+  fi
+  echo "[wordkeep:wiki] ensuring Meilisearch…"
+  # shellcheck disable=SC2016
+  if ! docker_bash "
+set -euo pipefail
+COMPOSE_FILE=$(printf '%q' "$WK/docker-compose.wiki.yml")
+NAME=wordkeep-wiki-meilisearch-1
+if docker compose version >/dev/null 2>&1; then
+  docker compose -f \"\$COMPOSE_FILE\" up -d
+elif command -v docker-compose >/dev/null 2>&1; then
+  docker-compose -f \"\$COMPOSE_FILE\" up -d
 else
-  echo "[wordkeep:wiki] ensuring Meilisearch (compose)…"
-  if ! docker compose -f "$WK/docker-compose.wiki.yml" up -d; then
-    echo "[wordkeep:wiki] Meilisearch compose failed; continuing without it (search degraded)" >&2
+  # Arch/CachyOS often ships docker without the compose plugin.
+  if docker ps -a --format '{{.Names}}' | grep -qx \"\$NAME\"; then
+    docker start \"\$NAME\" >/dev/null
+  else
+    docker volume create wordkeep_wiki_meili >/dev/null
+    docker run -d --name \"\$NAME\" \
+      -e MEILI_ENV=development \
+      -e MEILI_MASTER_KEY=wordkeep_dev_key \
+      -p 127.0.0.1:7700:7700 \
+      -v wordkeep_wiki_meili:/meili_data \
+      --restart unless-stopped \
+      getmeili/meilisearch:v1.15 >/dev/null
   fi
 fi
+"; then
+    echo "[wordkeep:wiki] Meilisearch start failed; continuing without it (search degraded)" >&2
+    return 1
+  fi
+  # Brief wait so wiki startup does not race an empty accept queue.
+  local i
+  for i in $(seq 1 20); do
+    if curl -s -o /dev/null --max-time 1 "http://127.0.0.1:7700/health" 2>/dev/null; then
+      return 0
+    fi
+    sleep 0.25
+  done
+  echo "[wordkeep:wiki] Meilisearch container up but /health not ready yet (wiki will retry)" >&2
+  return 0
+}
+
+ensure_meilisearch || true
 
 if ! ensure_ui_dist; then
   exit 1
@@ -466,5 +558,5 @@ for _ in $(seq 1 40); do
   sleep 0.25
 done
 
-echo "[wordkeep:wiki] started (pid $(cat "$PIDFILE")) but health check timed out; see $LOG" >&2
+echo "[wordkeep:wiki] started (pid $(cat "$PIDFILE")) but health check timed out ($(healthy_fail_reason)); see $LOG" >&2
 exit 1
