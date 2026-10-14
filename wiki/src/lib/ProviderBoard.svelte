@@ -23,6 +23,15 @@
     query?: string;
   } = $props();
 
+  /** Wall clock for live When labels (sidecar `ago` is bake-time only). */
+  let nowSecs = $state(Math.floor(Date.now() / 1000));
+  $effect(() => {
+    const id = setInterval(() => {
+      nowSecs = Math.floor(Date.now() / 1000);
+    }, 1000);
+    return () => clearInterval(id);
+  });
+
   const DONUT_PALETTE = [
     'var(--ok)',
     'var(--accent)',
@@ -76,7 +85,16 @@
 
   function activityRows(card: ProviderCard) {
     return (card.series || []).filter((row) =>
-      matchesQuery(query, [row.ago, row.ts, row.tool, row.label, row.outcome, row.detail, row.reason]),
+      matchesQuery(query, [
+        formatWhen(row),
+        row.ago,
+        row.ts,
+        row.tool,
+        row.label,
+        row.outcome,
+        row.detail,
+        row.reason,
+      ]),
     );
   }
 
@@ -169,7 +187,25 @@
     if (secs == null) return '';
     if (secs < 60) return `${secs}s`;
     if (secs < 3600) return `${Math.floor(secs / 60)}m`;
-    return `${Math.floor(secs / 3600)}h`;
+    if (secs < 86400) return `${Math.floor(secs / 3600)}h`;
+    return `${Math.floor(secs / 86400)}d`;
+  }
+
+  function formatWhen(row: {
+    ts?: unknown;
+    ago?: unknown;
+  }): string {
+    const raw = row.ts;
+    const ts =
+      typeof raw === 'number'
+        ? raw
+        : typeof raw === 'string'
+          ? Number(raw)
+          : NaN;
+    if (Number.isFinite(ts) && ts > 0) {
+      return formatAge(Math.max(0, nowSecs - Math.floor(ts))) || '0s';
+    }
+    return typeof row.ago === 'string' && row.ago ? row.ago : '—';
   }
 
   function sparkUnit(title: string): string {
@@ -360,7 +396,7 @@
                     )}
                     {@const toolName = String(row.tool ?? row.label ?? '—')}
                     <tr class:inverted={oc.tone === 'danger'}>
-                      <td class="muted">{row.ago ?? row.ts ?? '—'}</td>
+                      <td class="muted">{formatWhen(row)}</td>
                       <td class="tool-name" title={toolHelp(toolName)}>
                         <code>{toolName}</code>
                       </td>

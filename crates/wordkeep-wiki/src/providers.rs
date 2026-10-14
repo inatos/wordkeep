@@ -301,6 +301,9 @@ fn project_card(card: &CardSpec, doc: &Value) -> Value {
                 .and_then(|p| json_pointer(doc, p))
                 .cloned()
                 .unwrap_or_else(|| json!([]));
+            // Sidecar writers bake `ago` at write time; recompute from `ts` on
+            // every /api/dashboard poll so the When column keeps ticking.
+            let series = refresh_activity_ago(series, now_secs());
             json!({
                 "kind": "activity",
                 "title": card.title,
@@ -403,6 +406,54 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
+fn ago_label(now: u64, ts: u64) -> String {
+    let secs = now.saturating_sub(ts);
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m", secs / 60)
+    } else if secs < 86_400 {
+        format!("{}h", secs / 3600)
+    } else {
+        format!("{}d", secs / 86_400)
+    }
+}
+
+fn row_ts(row: &Value) -> Option<u64> {
+    let v = row.get("ts")?;
+    if let Some(n) = v.as_u64() {
+        return Some(n);
+    }
+    if let Some(n) = v.as_i64() {
+        return Some(n.max(0) as u64);
+    }
+    if let Some(n) = v.as_f64() {
+        return Some(n.max(0.0) as u64);
+    }
+    None
+}
+
+/// Rewrite activity-row `ago` from `ts` so relative times stay live.
+fn refresh_activity_ago(series: Value, now: u64) -> Value {
+    let Some(arr) = series.as_array() else {
+        return series;
+    };
+    let out: Vec<Value> = arr
+        .iter()
+        .map(|row| {
+            let Some(ts) = row_ts(row) else {
+                return row.clone();
+            };
+            let mut obj = row.clone();
+            if let Some(map) = obj.as_object_mut() {
+                map.insert("ago".into(), json!(ago_label(now, ts)));
+            }
+            obj
+        })
+        .collect();
+    Value::Array(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -489,6 +540,45 @@ mod tests {
         assert_eq!(cards[0]["detail"], "desktop");
         assert_eq!(cards[1]["series"].as_array().unwrap().len(), 1);
         assert_eq!(cards[2]["series"][0]["label"], "local");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn activity_ago_recomputed_from_ts() {
+        let dir = tmp("ago");
+        let now = now_secs();
+        let event_ts = now.saturating_sub(125);
+        fs::write(
+            dir.join(".wordkeep/config.json"),
+            r#"{
+              "telemetry_providers": [{
+                "name": "Fabric",
+                "sidecar": ".cache/palaestra/telemetry_provider.json",
+                "stale_secs": 600,
+                "cards": [
+                  {"kind":"activity","title":"Recent","series":"/recent_activity"}
+                ]
+              }]
+            }"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.join(".cache/palaestra/telemetry_provider.json"),
+            format!(
+                r#"{{
+                  "ts": {now},
+                  "recent_activity": [
+                    {{"ts": {event_ts}, "ago": "1s", "tool": "copper_status", "outcome": "ok"}}
+                  ]
+                }}"#
+            ),
+        )
+        .unwrap();
+        let providers = build_providers(&dir);
+        let p = &providers.as_array().unwrap()[0];
+        let ago = p["cards"][0]["series"][0]["ago"].as_str().unwrap();
+        // Baked "1s" must not win — 125s → "2m".
+        assert_eq!(ago, "2m");
         let _ = fs::remove_dir_all(&dir);
     }
 

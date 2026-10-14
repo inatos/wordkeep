@@ -165,7 +165,7 @@ export const PROVIDER_CHROME_HELP = {
 } as const;
 
 export const PROVIDER_COLUMN_HELP = {
-  when: "How long ago this row happened. Newest at the top \u2014 use it to see if the fabric is live right now or stuck on old noise.",
+  when: "How long ago this row happened (live from event ts, not the sidecar bake stamp). Newest at the top \u2014 use it to see if the fabric is live right now or stuck on old noise.",
   tool: "MCP tool name or Courier kind. Hover for tool help when available; this is the \u201cwhat ran / what notified\u201d.",
   outcome: "Result icon: check = ok; warn = trunc/empty/progress/health blip; x = error/fail. Why: scan for red before reading Detail.",
   detail: "Reason string or redacted Courier body \u2014 the so-what behind the outcome (error text, notify payload, etc.).",
