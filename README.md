@@ -155,7 +155,7 @@ CLI: `wordkeep run-record …` records gate metadata without executing commands.
 
 ## What you get
 
-60 MCP tools + 2 MCP resources (`wordkeep://readme`, `wordkeep://capabilities`), including:
+67 MCP tools + 2 MCP resources (`wordkeep://readme`, `wordkeep://capabilities`), including:
 
 | Tool | Use when you need |
 | --- | --- |

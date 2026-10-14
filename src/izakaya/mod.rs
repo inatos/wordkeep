@@ -32,6 +32,12 @@ pub fn cli(root: &Path, argv: &[String]) -> Result<String, String> {
         return Ok(HELP.to_string());
     }
     match argv[0].as_str() {
+        "check-in" => crate::tacet::gate_write(root, "izakaya_check_in")?,
+        "update" | "compact" => crate::tacet::gate_write(root, "izakaya_update")?,
+        "check-out" => crate::tacet::gate_write(root, "izakaya_check_out")?,
+        _ => {}
+    }
+    match argv[0].as_str() {
         "status" | "check-in" | "update" | "check-out" => {
             let mut args = parse_flags(&argv[1..])?;
             if argv[0] == "check-out"

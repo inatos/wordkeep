@@ -31,6 +31,16 @@ impl<'a> NotifyCtx<'a> {
     };
 }
 
+/// True when `tool` declares any durable `effects` in the capabilities manifest.
+pub fn tool_has_effects(tool: &str) -> bool {
+    capabilities()
+        .get("tools")
+        .and_then(|tools| tools.get(tool))
+        .and_then(|t| t.get("effects"))
+        .and_then(Value::as_array)
+        .is_some_and(|a| !a.is_empty())
+}
+
 /// Invalidate caches declared as coeffects for `tool` after a write.
 pub fn notify(root: &Path, tool: &str, ctx: NotifyCtx<'_>) {
     let Some(coeffects) = capabilities()
@@ -84,6 +94,9 @@ mod tests {
             upsert.is_some_and(|a| a.iter().any(|v| v == "knowledge-chunks-cache")),
             "knowledge_upsert must declare knowledge-chunks-cache coeffect"
         );
+        assert!(tool_has_effects("run_record"));
+        assert!(tool_has_effects("tacet"));
+        assert!(!tool_has_effects("repo_map"));
     }
 
     #[test]

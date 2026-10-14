@@ -51,6 +51,7 @@ mod semif_visual;
 mod session_pressure;
 mod shrift;
 mod stats;
+mod tacet;
 mod task_lan;
 mod symbol_context;
 mod symbol_def;

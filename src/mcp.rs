@@ -8,6 +8,7 @@
 
 use serde_json::{json, Value};
 use std::io::{self, BufRead, Write};
+use std::path::PathBuf;
 
 /// A tool handler maps a JSON `arguments` object to a text result (or an error string).
 pub type Handler = Box<dyn Fn(&Value) -> Result<String, String> + Send + Sync>;
@@ -32,6 +33,8 @@ pub struct Server {
     pub resources: Vec<Resource>,
     pub server_name: String,
     pub server_version: String,
+    /// Workspace root for `/tacet` write gating (empty = gate disabled).
+    pub workspace_root: PathBuf,
 }
 
 impl Server {
@@ -143,17 +146,24 @@ impl Server {
         // Progress notifications may flush to stdout during the handler.
         crate::progress::install(crate::progress::token_from_call_params(params));
         let response = match self.tools.iter().find(|t| t.name == name) {
-            Some(tool) => match (tool.handler)(&args) {
-                // Tool-level failures are reported via `isError`, not a JSON-RPC error.
-                Ok(text) => ok_result(
-                    id,
-                    json!({ "content": [{ "type": "text", "text": text }], "isError": false }),
-                ),
-                Err(e) => ok_result(
-                    id,
-                    json!({ "content": [{ "type": "text", "text": format!("error: {e}") }], "isError": true }),
-                ),
-            },
+            Some(tool) => {
+                let gated = if !self.workspace_root.as_os_str().is_empty() {
+                    crate::tacet::gate_write(&self.workspace_root, name)
+                } else {
+                    Ok(())
+                };
+                match gated.and_then(|_| (tool.handler)(&args)) {
+                    // Tool-level failures are reported via `isError`, not a JSON-RPC error.
+                    Ok(text) => ok_result(
+                        id,
+                        json!({ "content": [{ "type": "text", "text": text }], "isError": false }),
+                    ),
+                    Err(e) => ok_result(
+                        id,
+                        json!({ "content": [{ "type": "text", "text": format!("error: {e}") }], "isError": true }),
+                    ),
+                }
+            }
             None => err_response(id, -32602, &format!("unknown tool: {name}")),
         };
         crate::progress::clear();

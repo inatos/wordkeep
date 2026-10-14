@@ -5,6 +5,15 @@ All notable changes to wordkeep are documented here. The project follows
 
 ## [Unreleased]
 
+### Added
+
+- **`tacet` MCP tool + CLI** (`wordkeep tacet on|off|status [--mode turn|session]`):
+  workspace latch under `…/workspaces/<id>/tacet.json`. While enabled, tools with
+  declared `effects` in `wordkeep://capabilities` refuse with `tacet_suppressed`
+  (`isError: true`); the `tacet` tool itself is always allowed. Instrumented
+  savings/events append is skipped for the latch window. Cursor skill `/tacet`
+  (turn / `1` session on / `0` session off).
+
 ### Fixed
 
 - Sole SemIf VRAM: prefetch GPU draft only (lazy tandem CPU + verify); escalate

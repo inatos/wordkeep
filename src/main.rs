@@ -65,6 +65,7 @@
 //!   * task_fetch       - list pulled artifacts under .cache/palaestra/remote/
 //!   * task_cancel      - best-effort kill + release GPU lease
 //!   * copper_status    - Copper peer health glance (not job SoT)
+//!   * tacet            - workspace silence latch (hard-block durable write tools)
 //!
 //! Languages: C/C++, GLSL, Rust, Python, C#, and TypeScript via tree-sitter (GLSL
 //! through tree-sitter-glsl, a tree-sitter-c fork sharing the C node kinds;
@@ -124,6 +125,7 @@ mod semif_visual;
 mod session_pressure;
 mod shrift;
 mod stats;
+mod tacet;
 mod task_lan;
 mod symbol_context;
 mod symbol_def;
@@ -164,6 +166,7 @@ fn main() {
 
     let mut want_dashboard = false;
     let mut run_record_args: Option<Vec<String>> = None;
+    let mut tacet_args: Option<Vec<String>> = None;
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
         match arg.as_str() {
@@ -175,6 +178,10 @@ fn main() {
             "dashboard" => want_dashboard = true,
             "run-record" => {
                 run_record_args = Some(it.collect());
+                break;
+            }
+            "tacet" => {
+                tacet_args = Some(it.collect());
                 break;
             }
             "izakaya" => {
@@ -196,6 +203,7 @@ fn main() {
                 eprintln!(
                     "wordkeep [--root <workspace>]   speak MCP over stdio (default)\n\
                      wordkeep run-record [flags]     record gate/run metadata (no command exec)\n\
+                     wordkeep tacet on|off|status    workspace silence latch for durable writes\n\
                      wordkeep izakaya <command>      agent presence / replay (see izakaya --help)\n\
                      wordkeep dashboard              live savings dashboard (build --features dashboard)"
                 );
@@ -205,7 +213,24 @@ fn main() {
         }
     }
 
+    if let Some(argv) = tacet_args {
+        match tacet::cli(&root, &argv) {
+            Ok(msg) => {
+                println!("{msg}");
+                return;
+            }
+            Err(e) => {
+                eprintln!("[wordkeep] tacet: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+
     if let Some(argv) = run_record_args {
+        if let Err(e) = tacet::gate_write(&root, "run_record") {
+            eprintln!("run-record error: {e}");
+            std::process::exit(1);
+        }
         match runs::cli_record(&root, &argv) {
             Ok(()) => return,
             Err(code) => std::process::exit(code),
@@ -288,8 +313,10 @@ fn main() {
     let root_session_pressure = root.clone();
     let root_commit_scope = root.clone();
     let root_profile_upsert = root.clone();
+    let root_tacet = root.clone();
     let root_prefetch = root.clone();
     let root_task_lan = root.clone();
+    let root_server = root.clone();
     let root_izakaya = root;
 
     let mut raw_tools = vec![
@@ -1506,6 +1533,26 @@ fn main() {
             handler: Box::new(move |args| runs::record(&root_run_record, args)),
         },
         mcp::Tool {
+            name: "tacet",
+            description: "Workspace silence latch for `/tacet`: while enabled, durable write \
+                          tools (capabilities effects) refuse with tacet_suppressed. Pass \
+                          enabled true/false to set; mode turn|session (default session) when \
+                          enabling; status true or omit enabled to query. The tacet tool itself \
+                          is never suppressed.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "enabled": { "type": "boolean",
+                                 "description": "Set latch on/off. Omit with status to query." },
+                    "mode": { "type": "string", "enum": ["session", "turn"],
+                              "description": "Latch mode when enabling. Default session." },
+                    "status": { "type": "boolean",
+                                "description": "When true (or enabled omitted), return current state." }
+                }
+            }),
+            handler: Box::new(move |args| tacet::run(&root_tacet, args)),
+        },
+        mcp::Tool {
             name: "run_history",
             description: "List recent run records; flags missing logs/artifacts.",
             input_schema: json!({
@@ -1641,6 +1688,7 @@ fn main() {
         resources,
         server_name: "wordkeep".to_string(),
         server_version: env!("CARGO_PKG_VERSION").to_string(),
+        workspace_root: root_server,
     };
 
     // Prefetch GGUF in the background so MCP tools are available immediately;

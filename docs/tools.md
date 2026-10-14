@@ -14,7 +14,9 @@ during long walks (status only; the agent still sees one final text result).
 Default off — Cursor's Shared MCP client currently fatals on unrecognized
 progress tokens and drops the server connection.
 
-**Surface:** 60 tools + MCP resources `wordkeep://readme`, `wordkeep://capabilities`.
+**Surface:** 67 tools + MCP resources `wordkeep://readme`, `wordkeep://capabilities`.
+While `/tacet` is latched, tools with declared `effects` in `wordkeep://capabilities`
+return `tacet_suppressed` (except the `tacet` tool itself).
 
 ## Navigation
 
@@ -73,6 +75,7 @@ progress tokens and drops the server connection.
 | `index_health` | optional | Profile coverage gaps + proactive stale signal |
 | `stats` | optional `reset`, `insights`, `format` (`text`\|`json`), `workspace` | Estimated context avoided (v5: µs latency, typed outcomes, jsonl events) |
 | `run_record` | `command` | Metadata-only gate/run write (also CLI `run-record`) |
+| `tacet` | optional `enabled` / `mode` / `status` | Workspace silence latch; CLI `wordkeep tacet on\|off\|status` |
 | `run_history` | optional filters | Recent runs; flags missing logs/artifacts |
 | `artifact_index` | optional `roots` / `query` | Artifact metadata index (no image grading) |
 | `session_pressure` | optional `session` | Heuristic context-pressure (+ autopilot draft when high) |

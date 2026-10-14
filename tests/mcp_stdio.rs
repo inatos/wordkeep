@@ -237,6 +237,7 @@ fn lists_all_tools() {
         "defect_upsert",
         "defect_list",
         "run_record",
+        "tacet",
         "run_history",
         "artifact_index",
         "session_pressure",
@@ -254,6 +255,12 @@ fn lists_all_tools() {
         "shrift_review",
         "shrift_status",
         "shrift_bookmark",
+        "task_submit",
+        "task_status",
+        "task_fetch",
+        "task_cancel",
+        "copper_status",
+        "mas_timeline",
     ] {
         assert!(names.contains(&n), "missing tool {n}: {names:?}");
     }
@@ -271,8 +278,8 @@ fn lists_all_tools() {
     );
     assert_eq!(
         names.len(),
-        60,
-        "expected 60 tools, got {}: {names:?}",
+        67,
+        "expected 67 tools, got {}: {names:?}",
         names.len()
     );
 }
@@ -339,9 +346,63 @@ fn resources_list_and_read_readme() {
         "params": { "uri": "wordkeep://capabilities" }
     }));
     let caps_text = caps["result"]["contents"][0]["text"].as_str().unwrap_or("");
-    assert!(caps_text.contains("\"tool_count\": 60"), "{caps}");
+    assert!(caps_text.contains("\"tool_count\": 67"), "{caps}");
     assert!(caps_text.contains("knowledge_upsert"), "{caps}");
     assert!(caps_text.contains("shrift_upsert"), "{caps}");
+    assert!(caps_text.contains("\"tacet\""), "{caps}");
+}
+
+#[test]
+fn tacet_suppresses_write_tools_and_allows_reads() {
+    let mut s = Server::start();
+    let on = s.tool_text(
+        "tacet",
+        json!({ "enabled": true, "mode": "session" }),
+    );
+    assert!(on.contains("tacet: enabled"), "{on}");
+
+    let rr = s.tool_error(
+        "run_record",
+        json!({ "command": "ctest -R noop", "status": "passed" }),
+    );
+    assert!(rr.contains("tacet_suppressed"), "{rr}");
+
+    let ku = s.tool_error(
+        "knowledge_upsert",
+        json!({
+            "path": ".wordkeep/notes/tacet-should-not-write.md",
+            "heading": "should not write",
+            "body": "blocked"
+        }),
+    );
+    assert!(ku.contains("tacet_suppressed"), "{ku}");
+
+    let du = s.tool_error(
+        "defect_upsert",
+        json!({
+            "id": "tacet-should-not-write",
+            "summary": "blocked by tacet",
+            "status": "open",
+            "subsystem": "wordkeep"
+        }),
+    );
+    assert!(du.contains("tacet_suppressed"), "{du}");
+
+    let map = s.tool_text("repo_map", json!({ "paths": ["src"], "token_budget": 400 }));
+    assert!(!map.is_empty(), "{map}");
+    let ks = s.tool_text(
+        "knowledge_search",
+        json!({ "query": "wordkeep", "k": 2, "token_budget": 400 }),
+    );
+    assert!(!ks.is_empty(), "{ks}");
+
+    let off = s.tool_text("tacet", json!({ "enabled": false }));
+    assert!(off.contains("tacet: disabled"), "{off}");
+    let rr_ok = s.tool_text(
+        "run_record",
+        json!({ "command": "ctest -R noop", "status": "passed" }),
+    );
+    assert!(rr_ok.contains("run") || rr_ok.contains("recorded") || !rr_ok.is_empty(), "{rr_ok}");
 }
 
 #[test]

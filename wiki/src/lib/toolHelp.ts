@@ -38,6 +38,7 @@ export const TOOL_HELP: Record<string, string> = {
   index_health: "Path-profile coverage gaps + proactive stale signal.",
   stats: "Estimated context avoided / token displacement telemetry.",
   run_record: "Metadata-only gate/run write (never executes commands).",
+  tacet: "Workspace silence latch (/tacet): hard-blocks durable write tools with tacet_suppressed.",
   run_history: "Recent runs; flags missing logs/artifacts.",
   artifact_index: "Artifact metadata index (no image grading).",
   session_pressure: "Heuristic context-pressure level; autopilot handoff draft when high.",

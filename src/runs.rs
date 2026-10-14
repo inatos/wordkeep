@@ -175,6 +175,7 @@ fn missing_flags(root: &Path, r: &Run) -> Vec<String> {
 
 /// Create or update a run record (metadata only).
 pub fn record(root: &Path, args: &Value) -> Result<String, String> {
+    crate::tacet::gate_write(root, "run_record")?;
     let command = required_str(args, "command")?;
     let status = optional_str(args, "status").unwrap_or_else(|| "running".into());
     validate_status(&status)?;

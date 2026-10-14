@@ -73,6 +73,7 @@ Template: [`.wordkeep/config.example.json`](../.wordkeep/config.example.json).
 | --- | --- |
 | (default) | Speak MCP over stdio |
 | `run-record` | Record gate/run metadata without executing commands |
+| `tacet on\|off\|status` | Workspace silence latch (`--mode turn\|session` with `on`) |
 | `izakaya` | Presence, handoffs, and `policy list\|evaluate\|promote\|retire` |
 | `dashboard` | Live savings UI (`--features dashboard`) |
 

@@ -1,8 +1,12 @@
 {
   "version": 1,
-  "tool_count": 64,
-  "notes": "Effect/coeffect manifest (FIG-2026-005). Wired: knowledge-chunks-cache, mas-session, workspace-cache. config/defects/runs/effect-journal are disk-fresh reads. Izakaya writes only its coordination journal (FIG-2026-006); advise stays read-only. Shrift writes idea Markdown + ledger + local bookmarks. Decision/outcome/replay MCP tools were removed (no agent producer path; offline lab remains via CLI policy evaluate). Triage composites (batch_context, perf_triage, test_impact) and index_health are read-only.",
+  "tool_count": 67,
+  "notes": "Effect/coeffect manifest (FIG-2026-005). Wired: knowledge-chunks-cache, mas-session, workspace-cache. config/defects/runs/effect-journal are disk-fresh reads. Izakaya writes only its coordination journal (FIG-2026-006); advise stays read-only. Shrift writes idea Markdown + ledger + local bookmarks. Decision/outcome/replay MCP tools were removed (no agent producer path; offline lab remains via CLI policy evaluate). Triage composites (batch_context, perf_triage, test_impact) and index_health are read-only. `/tacet` latch (tacet.json) hard-blocks tools with effects except the tacet tool itself.",
   "tools": {
+    "tacet": {
+      "effects": ["write-tacet-latch"],
+      "coeffects": ["config"]
+    },
     "knowledge_upsert": {
       "effects": ["write-notes"],
       "coeffects": ["config", "knowledge-chunks-cache", "mas-session"],

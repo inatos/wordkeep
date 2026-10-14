@@ -789,10 +789,14 @@ pub fn finish(tool: &str, elapsed_us: u64, result: &Result<String, String>) {
     }
     let now = now_secs();
     let ws = workspace_id_str();
-    if let Ok(mut s) = cell().lock() {
-        s.observe(tool, elapsed_us, outcome, now, &ws, &meta);
-        if s.needs_flush() {
-            s.flush_aggregates();
+    // `/tacet`: skip durable savings/events append while the workspace latch is on.
+    let tacet_quiet = workspace_root().is_some_and(crate::tacet::is_enabled);
+    if !tacet_quiet {
+        if let Ok(mut s) = cell().lock() {
+            s.observe(tool, elapsed_us, outcome, now, &ws, &meta);
+            if s.needs_flush() {
+                s.flush_aggregates();
+            }
         }
     }
     let saved = meta.baseline.saturating_sub(meta.returned);
