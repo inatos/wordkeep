@@ -102,6 +102,7 @@ export type DashboardTool = {
   trunc_count: number;
   error_count: number;
   invalid_count?: number;
+  not_found_count?: number;
   low_yield_count?: number;
   baseline_tokens: number;
   baseline_fmt?: string;
@@ -198,6 +199,8 @@ export type DashboardPayload = {
     saved_fmt?: string;
     reduction_pct: number;
     since_label?: string;
+    window_label?: string;
+    window_days?: number;
   };
   /** Optical Compression Tier counters (split from text-path tools). */
   optical?: DashboardOptical;

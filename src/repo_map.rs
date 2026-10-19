@@ -73,19 +73,25 @@ fn format_symbol_block(rel: &str, symbols: &[String]) -> String {
     block
 }
 
+/// Unfiltered maps (no pattern, no expand, no explicit budget) stay small.
+/// Targeted queries keep the 8,000-token default.
+fn map_budget(args: &Value, unfiltered: bool) -> usize {
+    if let Some(budget) = args.get("token_budget").and_then(Value::as_u64) {
+        return budget as usize;
+    }
+    if unfiltered { 1500 } else { 8000 }
+}
+
 pub fn build(root: &Path, args: &Value) -> Result<String, String> {
     const FP_KEYS: &[&str] = &["paths", "profile", "mode", "expand", "pattern"];
     let paths = crate::config::paths_from_args(root, args)?;
-    let budget = args
-        .get("token_budget")
-        .and_then(Value::as_u64)
-        .unwrap_or(8000) as usize;
     let pattern = args
         .get("pattern")
         .and_then(Value::as_str)
         .map(str::to_lowercase);
     let mode = resolve_mode(args, &pattern);
     let expand = expand_set(args);
+    let budget = map_budget(args, pattern.is_none() && expand.is_empty());
     let args_fp = continuation::args_fingerprint(args, FP_KEYS);
     let resume_at = continuation::resume_offset(args, "repo_map", FP_KEYS, KIND_FILE_SKIP)?;
 
@@ -690,6 +696,15 @@ mod tests {
         let mut p = Parser::new();
         p.set_language(&tree_sitter_cpp::LANGUAGE.into()).unwrap();
         p
+    }
+
+    #[test]
+    fn unfiltered_map_defaults_to_small_budget() {
+        let args = serde_json::json!({});
+        assert_eq!(map_budget(&args, true), 1500);
+        assert_eq!(map_budget(&args, false), 8000);
+        let explicit = serde_json::json!({"token_budget": 4000});
+        assert_eq!(map_budget(&explicit, true), 4000);
     }
 
     #[test]

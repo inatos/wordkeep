@@ -67,6 +67,7 @@
     | 'trunc_count'
     | 'error_count'
     | 'invalid_count'
+    | 'not_found_count'
     | 'baseline_tokens'
     | 'returned_tokens'
     | 'saved'
@@ -121,7 +122,7 @@
     dashboard?.providers?.[0]?.name?.trim() || 'Providers',
   );
   let sessionSavedFmt = $state('0');
-  let sortKey = $state<SortKey>('saved');
+  let sortKey = $state<SortKey>('returned_tokens');
   let sortDir = $state<'asc' | 'desc'>('desc');
   let copyFlash = $state('');
   let tagDraft = $state('');
@@ -1035,6 +1036,8 @@
         return tool.error_count;
       case 'invalid_count':
         return tool.invalid_count ?? 0;
+      case 'not_found_count':
+        return tool.not_found_count ?? 0;
       case 'baseline_tokens':
         return tool.baseline_tokens;
       case 'returned_tokens':
@@ -1284,12 +1287,11 @@
   let chartSavedBars = $derived.by((): BarDatum[] =>
     telemetryTools.map((tool) => ({
       label: tool.name,
-      value: tool.saved,
-      color: tool.inverted ? 'var(--danger)' : 'var(--ok)',
+      value: tool.returned_tokens,
+      color: 'var(--accent)',
       title: [
         toolHelp(tool.name),
-        `Tokens saved (distill − return): ${tool.saved_fmt ?? tool.saved}`,
-        tool.inverted ? 'Net-negative: returned more tokens than the distilled baseline.' : '',
+        `Returned tokens: ${tool.returned_fmt ?? tool.returned_tokens}`,
       ]
         .filter(Boolean)
         .join('\n'),
@@ -2714,16 +2716,21 @@
                 <h3>Calls</h3>
                 <p class="metric"><code>{telemetryOverview?.calls_fmt ?? 0}</code></p>
               </article>
-              <article class="card" title={METRIC_HELP.distilled}>
-                <h3>Distilled</h3>
-                <p class="metric"><code>{telemetryOverview?.baseline_fmt ?? 0}</code></p>
-              </article>
               <article class="card" title={METRIC_HELP.returned}>
                 <h3>Returned</h3>
                 <p class="metric"><code>{telemetryOverview?.returned_fmt ?? 0}</code></p>
+                {#if dashboard.overview?.window_label}
+                  <p class="muted" style="font-size:0.85em;margin:0.25rem 0 0">
+                    {dashboard.overview.window_label}
+                  </p>
+                {/if}
+              </article>
+              <article class="card" title={METRIC_HELP.distilled}>
+                <h3>Scanned</h3>
+                <p class="metric"><code>{telemetryOverview?.baseline_fmt ?? 0}</code></p>
               </article>
               <article class="card" title={METRIC_HELP.saved}>
-                <h3>Saved</h3>
+                <h3>Counterfactual</h3>
                 <p class="metric good"
                   ><code
                     >{telemetryOverview?.saved_fmt ?? 0}
@@ -2778,11 +2785,11 @@
             {/snippet}
             <div class="dash-charts">
               <article class="card chart-card" title={CHART_HELP.saved}>
-                <h3 title={CHART_HELP.saved}>Tokens saved by tool</h3>
+                <h3 title={CHART_HELP.saved}>Returned tokens by tool</h3>
                 <BarChart
                   data={chartSavedBars}
-                  empty="No tool savings yet."
-                  ariaLabel="Tokens saved by tool"
+                  empty="No returned tokens yet."
+                  ariaLabel="Returned tokens by tool"
                   chartTitle={CHART_HELP.saved}
                 />
               </article>
@@ -3113,6 +3120,15 @@
                     <button
                       type="button"
                       class="sort-btn"
+                      title={COLUMN_HELP.nf}
+                      onclick={() => toggleSort('not_found_count')}
+                      >Nf{sortMark('not_found_count')}</button
+                    >
+                  </th>
+                  <th>
+                    <button
+                      type="button"
+                      class="sort-btn"
                       title={COLUMN_HELP.distill}
                       onclick={() => toggleSort('baseline_tokens')}
                       >Distill{sortMark('baseline_tokens')}</button
@@ -3176,6 +3192,7 @@
                     <td title={COLUMN_HELP.trunc}>{tool.trunc_count || '—'}</td>
                     <td title={COLUMN_HELP.err}>{tool.error_count || '—'}</td>
                     <td title={COLUMN_HELP.inv}>{tool.invalid_count || '—'}</td>
+                    <td title={COLUMN_HELP.nf}>{tool.not_found_count || '—'}</td>
                     <td title={COLUMN_HELP.distill}
                       >{tool.baseline_fmt ?? tool.baseline_tokens}</td
                     >

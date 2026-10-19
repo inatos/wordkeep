@@ -132,9 +132,20 @@ pub fn update(root: &Path, args: &Value) -> Result<Value, String> {
         return Ok(json!({"idempotent": true, "text": text, "agent_id": agent_id}));
     }
     let agent = live_agent(&snap.projection, &agent_id)?;
-    let lease = required(args, "lease_id")?;
+    let lease = match required(args, "lease_id") {
+        Ok(lease) => lease,
+        Err(_) => {
+            return Err(format!(
+                "lease_id is required (agent {agent_id} current lease_id: {})",
+                agent.lease_id
+            ));
+        }
+    };
     if agent.lease_id != lease {
-        return Err(format!("lease mismatch for agent {agent_id}"));
+        return Err(format!(
+            "lease mismatch for agent {agent_id}: current lease_id is {} — resend that value",
+            agent.lease_id
+        ));
     }
     expect_revision(args, agent)?;
     let now = store::now_secs();
@@ -463,7 +474,6 @@ fn btree_map_from(v: Option<&Value>) -> std::collections::BTreeMap<String, f64> 
 
 fn render_check_in(proj: &Projection, event: &Event) -> Value {
     let agent = &proj.agents[&event.agent_id];
-    let findings = finding_lines(proj, event.ts);
     let mut text = format!(
         "izakaya_check_in - agent {}\nstate: {}\nlease_id: {}\nrevision: {}\nseq: {}\nexpires_at: {}\n",
         agent.agent_id, agent.state, agent.lease_id, agent.revision, event.seq, agent.expires_at
@@ -474,7 +484,7 @@ fn render_check_in(proj: &Projection, event: &Event) -> Value {
             text.push('\n');
         }
     }
-    text.push_str(&findings);
+    text.push_str(&finding_lines(proj, event.ts, false));
     json!({
         "text": text,
         "agent_id": agent.agent_id,
@@ -496,7 +506,7 @@ fn render_update(proj: &Projection, event: &Event) -> Value {
         agent.lease_id,
         agent.revision,
         agent.expires_at,
-        finding_lines(proj, event.ts)
+        finding_lines(proj, event.ts, false)
     );
     json!({
         "text": text,
@@ -591,6 +601,7 @@ fn render_status(root: &Path, proj: &Projection, events: &[Event], args: &Value)
     let want_path = args.get("path").and_then(Value::as_str);
     let since = args.get("since_seq").and_then(Value::as_u64).unwrap_or(0);
     let include_out = flag(args, "include_checked_out") || want_state == Some("checked_out");
+    let verbose = flag(args, "verbose");
     let mut lines = vec![format!(
         "izakaya_status - coordination {} seq {} (read-only)",
         proj.coordination_id, proj.seq
@@ -651,18 +662,25 @@ fn render_status(root: &Path, proj: &Projection, events: &[Event], args: &Value)
         })
         .map(|a| a.agent_id.clone())
         .collect();
-    lines.push(format!(
-        "stale: {}",
-        if stale.is_empty() {
-            "(none)".into()
-        } else {
-            stale.join(", ")
-        }
-    ));
-    lines.push(finding_lines(proj, now).trim_end().to_string());
+    if verbose || stale.is_empty() {
+        lines.push(format!(
+            "stale: {}",
+            if stale.is_empty() {
+                "(none)".into()
+            } else {
+                stale.join(", ")
+            }
+        ));
+    } else {
+        lines.push(format!(
+            "stale: {} (verbose:true lists ids)",
+            stale.len()
+        ));
+    }
+    lines.push(finding_lines(proj, now, verbose).trim_end().to_string());
     if proj.handoffs.is_empty() {
         lines.push("handoffs: (none)".into());
-    } else {
+    } else if verbose {
         lines.push("handoffs:".into());
         for h in &proj.handoffs {
             let derived = store::derived_handoff_status(h, &proj.agents, now, orphan_secs);
@@ -671,6 +689,11 @@ fn render_status(root: &Path, proj: &Projection, events: &[Event], args: &Value)
                 h.id, h.from, h.to, h.summary
             ));
         }
+    } else {
+        lines.push(format!(
+            "handoffs: {} (verbose:true lists them)",
+            proj.handoffs.len()
+        ));
     }
     let inbox: Vec<_> = proj
         .messages
@@ -683,9 +706,16 @@ fn render_status(root: &Path, proj: &Projection, events: &[Event], args: &Value)
         .filter(|m| !m.acked)
         .map(|m| format!("  - #{} {} -> {}: {}", m.seq, m.from, m.to, m.body))
         .collect();
-    if !inbox.is_empty() {
+    if inbox.is_empty() {
+        // Quiet when there is nothing to say.
+    } else if verbose {
         lines.push("messages:".into());
         lines.extend(inbox);
+    } else {
+        lines.push(format!(
+            "messages: {} unread (verbose:true lists them)",
+            inbox.len()
+        ));
     }
     let incremental: Vec<_> = events
         .iter()
@@ -734,7 +764,7 @@ fn agent_line(agent: &Agent, stale: bool) -> String {
     )
 }
 
-fn finding_lines(proj: &Projection, now: u64) -> String {
+fn finding_lines(proj: &Projection, now: u64, include_stale: bool) -> String {
     let views: Vec<_> = proj
         .agents
         .values()
@@ -750,11 +780,15 @@ fn finding_lines(proj: &Projection, now: u64) -> String {
         })
         .collect();
     let found = model::advisory_findings(&views, now);
-    if found.is_empty() {
+    let shown: Vec<_> = found
+        .iter()
+        .filter(|f| include_stale || !f.stale)
+        .collect();
+    if shown.is_empty() {
         return "advisory: (no overlaps)\n".into();
     }
     let mut text = String::from("advisory:\n");
-    for f in found {
+    for f in shown {
         text.push_str(&format!(
             "  - {} {}{}\n",
             f.kind,

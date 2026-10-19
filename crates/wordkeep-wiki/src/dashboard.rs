@@ -7,8 +7,14 @@
 use crate::indexer::global_cache_dir;
 use crate::providers;
 use serde_json::{json, Value};
+use std::collections::BTreeMap;
+use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+/// Dashboard tool table window. Lifetime `savings.json` totals stay available
+/// as `lifetime_*` fields; the table itself is this many days of events.jsonl.
+const WINDOW_DAYS: u64 = 30;
 
 const LOW_YIELD_RATE_PCT: u64 = 25;
 const LOW_YIELD_MIN_CALLS: u64 = 10;
@@ -44,19 +50,27 @@ pub(crate) fn build(root: &Path) -> Result<Value, String> {
         .cloned()
         .unwrap_or_default();
 
-    let mut tools: Vec<Value> = tools_obj
+    let mut lifetime_tools: Vec<Value> = tools_obj
         .iter()
         .map(|(name, tool)| tool_row(name, tool))
         .collect();
-    tools.sort_by(|a, b| {
-        let sa = a.get("saved").and_then(Value::as_u64).unwrap_or(0);
-        let sb = b.get("saved").and_then(Value::as_u64).unwrap_or(0);
-        sb.cmp(&sa).then_with(|| {
-            let na = a.get("name").and_then(Value::as_str).unwrap_or("");
-            let nb = b.get("name").and_then(Value::as_str).unwrap_or("");
-            na.cmp(nb)
-        })
-    });
+    sort_by_returned(&mut lifetime_tools);
+
+    let workspace_id = data
+        .get("workspace_id")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let window = load_window(workspace_id, now);
+    let (tools, window_label) = if window.is_empty() {
+        (lifetime_tools, "lifetime aggregates".to_string())
+    } else {
+        let mut rows: Vec<Value> = window
+            .iter()
+            .map(|(name, win)| tool_row(name, &win.to_value()))
+            .collect();
+        sort_by_returned(&mut rows);
+        (rows, format!("last {WINDOW_DAYS}d"))
+    };
 
     let mut calls = 0u64;
     let mut baseline = 0u64;
@@ -138,6 +152,10 @@ pub(crate) fn build(root: &Path) -> Result<Value, String> {
         "overview": {
             "calls": calls,
             "calls_fmt": commafy(calls),
+            "label": "returned tokens",
+            "baseline_label": "scanned_counterfactual",
+            "window_days": if window.is_empty() { 0 } else { WINDOW_DAYS },
+            "window_label": window_label,
             "baseline_tokens": baseline,
             "baseline_fmt": commafy(baseline),
             "returned_tokens": returned,
@@ -156,6 +174,108 @@ pub(crate) fn build(root: &Path) -> Result<Value, String> {
         "providers": providers,
         "terminal_hint": "cargo run -p wordkeep --features dashboard -- dashboard"
     }))
+}
+
+fn sort_by_returned(tools: &mut [Value]) {
+    tools.sort_by(|a, b| {
+        let ra = a.get("returned_tokens").and_then(Value::as_u64).unwrap_or(0);
+        let rb = b.get("returned_tokens").and_then(Value::as_u64).unwrap_or(0);
+        rb.cmp(&ra).then_with(|| {
+            let na = a.get("name").and_then(Value::as_str).unwrap_or("");
+            let nb = b.get("name").and_then(Value::as_str).unwrap_or("");
+            na.cmp(nb)
+        })
+    });
+}
+
+#[derive(Default)]
+struct Win {
+    calls: u64,
+    baseline: u64,
+    returned: u64,
+    trunc: u64,
+    errors: u64,
+    invalid: u64,
+    not_found: u64,
+    low_yield: u64,
+    total_us: u64,
+    peak_us: u64,
+    peak_returned: u64,
+    peak_baseline: u64,
+    peak_saved: u64,
+    last_ts: u64,
+}
+
+impl Win {
+    fn observe(&mut self, event: &Value) {
+        let baseline = event.get("baseline").and_then(Value::as_u64).unwrap_or(0);
+        let returned = event.get("returned").and_then(Value::as_u64).unwrap_or(0);
+        let elapsed_us = event.get("elapsed_us").and_then(Value::as_u64).unwrap_or(0);
+        let ts = event.get("ts").and_then(Value::as_u64).unwrap_or(0);
+        self.calls += 1;
+        self.baseline += baseline;
+        self.returned += returned;
+        self.total_us += elapsed_us;
+        self.peak_us = self.peak_us.max(elapsed_us);
+        self.peak_returned = self.peak_returned.max(returned);
+        self.peak_baseline = self.peak_baseline.max(baseline);
+        self.peak_saved = self.peak_saved.max(baseline.saturating_sub(returned));
+        self.last_ts = self.last_ts.max(ts);
+        match event.get("outcome").and_then(Value::as_str).unwrap_or("ok") {
+            "truncated" => self.trunc += 1,
+            "error" => self.errors += 1,
+            "invalid" => self.invalid += 1,
+            "not_found" => self.not_found += 1,
+            "low_yield" => self.low_yield += 1,
+            _ => {}
+        }
+    }
+
+    fn to_value(&self) -> Value {
+        json!({
+            "calls": self.calls,
+            "baseline_tokens": self.baseline,
+            "returned_tokens": self.returned,
+            "trunc_count": self.trunc,
+            "error_count": self.errors,
+            "invalid_count": self.invalid,
+            "not_found_count": self.not_found,
+            "low_yield_count": self.low_yield,
+            "total_us": self.total_us,
+            "peak_us": self.peak_us,
+            "peak_saved": self.peak_saved,
+            "peak_baseline": self.peak_baseline,
+            "peak_returned": self.peak_returned,
+            "last_ts": self.last_ts,
+        })
+    }
+}
+
+fn load_window(workspace_id: &str, now: u64) -> BTreeMap<String, Win> {
+    let mut out = BTreeMap::new();
+    if workspace_id.is_empty() {
+        return out;
+    }
+    let path = global_cache_dir().join(format!("wordkeep/workspaces/{workspace_id}/events.jsonl"));
+    let Ok(file) = std::fs::File::open(path) else {
+        return out;
+    };
+    let cutoff = now.saturating_sub(WINDOW_DAYS * 86_400);
+    for line in BufReader::new(file).lines() {
+        let Ok(line) = line else { continue };
+        let Ok(event) = serde_json::from_str::<Value>(line.trim()) else {
+            continue;
+        };
+        let ts = event.get("ts").and_then(Value::as_u64).unwrap_or(0);
+        if ts <= cutoff {
+            continue;
+        }
+        let Some(tool) = event.get("tool").and_then(Value::as_str) else {
+            continue;
+        };
+        out.entry(tool.to_string()).or_default().observe(&event);
+    }
+    out
 }
 
 fn tool_row(name: &str, tool: &Value) -> Value {
@@ -180,6 +300,10 @@ fn tool_row(name: &str, tool: &Value) -> Value {
     let errors = tool.get("error_count").and_then(Value::as_u64).unwrap_or(0);
     let invalid = tool
         .get("invalid_count")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let not_found = tool
+        .get("not_found_count")
         .and_then(Value::as_u64)
         .unwrap_or(0);
     let low_yield = tool
@@ -208,6 +332,7 @@ fn tool_row(name: &str, tool: &Value) -> Value {
         "trunc_count": trunc,
         "error_count": errors,
         "invalid_count": invalid,
+        "not_found_count": not_found,
         "low_yield_count": low_yield,
         "baseline_tokens": baseline,
         "baseline_fmt": commafy(baseline),
@@ -231,13 +356,26 @@ fn tool_row(name: &str, tool: &Value) -> Value {
 fn health_signals(tools: &[Value]) -> Value {
     let mut lines = Vec::new();
 
+    if let Some(tool) = tools.iter().max_by_key(|tool| {
+        tool.get("returned_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+    }) {
+        lines.push(json!({
+            "kind": "info",
+            "label": "most returned",
+            "value": tool.get("returned_fmt").cloned().unwrap_or(Value::Null),
+            "detail": tool.get("name").cloned().unwrap_or(Value::Null)
+        }));
+    }
+
     let peak = tools
         .iter()
         .max_by_key(|tool| tool.get("peak_saved").and_then(Value::as_u64).unwrap_or(0));
     if let Some(tool) = peak {
         lines.push(json!({
             "kind": "ok",
-            "label": "peak single-call save",
+            "label": "peak counterfactual",
             "value": tool.get("peak_saved_fmt").cloned().unwrap_or(Value::Null),
             "detail": tool.get("name").cloned().unwrap_or(Value::Null)
         }));
@@ -435,5 +573,22 @@ mod tests {
         assert_eq!(bar(50, 4), "██░░");
         assert!(is_net_negative(600, 600));
         assert!(!is_notable_low_yield(5, 5));
+    }
+
+    #[test]
+    fn window_fold_counts_returned_and_not_found() {
+        let event = json!({
+            "ts": 50,
+            "tool": "repo_map",
+            "baseline": 400,
+            "returned": 90,
+            "elapsed_us": 1000,
+            "outcome": "not_found"
+        });
+        let mut win = Win::default();
+        win.observe(&event);
+        let row = tool_row("repo_map", &win.to_value());
+        assert_eq!(row.get("returned_tokens").and_then(Value::as_u64), Some(90));
+        assert_eq!(row.get("not_found_count").and_then(Value::as_u64), Some(1));
     }
 }

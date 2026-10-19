@@ -857,7 +857,37 @@ pub fn events_since(root: &Path, since_ts: u64) -> Vec<Event> {
         .collect()
 }
 
-/// `stats` tool handler: render cumulative savings + improvement signals.
+fn outcome_from_str(s: &str) -> Outcome {
+    match s {
+        "error" => Outcome::Error,
+        "truncated" => Outcome::Truncated,
+        "not_found" => Outcome::NotFound,
+        "invalid" => Outcome::Invalid,
+        "empty" => Outcome::Empty,
+        "low_yield" => Outcome::LowYield,
+        _ => Outcome::Ok,
+    }
+}
+
+/// Fold per-call events into tool totals. Used for the default 30-day window.
+fn aggregate_events(events: &[Event]) -> BTreeMap<String, Tool> {
+    let mut tools: BTreeMap<String, Tool> = BTreeMap::new();
+    let meta = RecordMeta::default();
+    for event in events {
+        tools.entry(event.tool.clone()).or_default().observe(
+            event.baseline,
+            event.returned,
+            event.elapsed_us,
+            outcome_from_str(&event.outcome),
+            event.ts,
+            &meta,
+        );
+    }
+    tools
+}
+
+/// `stats` tool handler. Default window is the last 30 days of `events.jsonl`
+/// (returned tokens). `since_days: 0` keeps the lifetime `savings.json` aggregates.
 pub fn report(args: &Value) -> Result<String, String> {
     let reset = args.get("reset").and_then(Value::as_bool).unwrap_or(false);
     let insights = args
@@ -897,37 +927,77 @@ pub fn report(args: &Value) -> Result<String, String> {
     if s.needs_flush() {
         s.flush_aggregates();
     }
+    let since_days = args.get("since_days").and_then(Value::as_u64).unwrap_or(30);
     let now = now_secs();
-    let out = if format == "json" {
-        render_json(
-            s.since,
-            now,
-            &s.tools,
-            &s.events,
-            workspace_filter.as_deref(),
+    let lifetime_since = s.since;
+    let lifetime_tools = s.tools.clone();
+    let ring = s.events.clone();
+    let optical = s.optical.to_json();
+    // Release the lock before scanning events.jsonl.
+    drop(s);
+
+    let (tools, events, window_days, window_label) = if since_days == 0 {
+        (
+            lifetime_tools,
+            ring,
+            0,
+            format!("lifetime aggregates since {}", elapsed(lifetime_since, now)),
         )
     } else {
-        let mut text = render(s.since, now, &s.tools);
-        let opt = s.optical.to_json();
+        let cutoff = now.saturating_sub(since_days.saturating_mul(86_400));
+        let window_events = workspace_root()
+            .map(|root| events_since(root, cutoff.saturating_sub(1)))
+            .unwrap_or_default();
+        if window_events.is_empty() {
+            (
+                lifetime_tools,
+                ring,
+                since_days,
+                format!("last {since_days}d — no events.jsonl rows; showing lifetime aggregates"),
+            )
+        } else {
+            let n = window_events.len();
+            let tools = aggregate_events(&window_events);
+            (
+                tools,
+                VecDeque::from(window_events),
+                since_days,
+                format!("last {since_days}d — {n} events"),
+            )
+        }
+    };
+
+    let out = if format == "json" {
+        render_json(
+            lifetime_since,
+            now,
+            &tools,
+            &events,
+            workspace_filter.as_deref(),
+            window_days,
+            &window_label,
+        )
+    } else {
+        let mut text = render(&window_label, &tools);
         text.push_str(&format!(
             "\noptical (OCT): calls={} mas={} fallback={} avg_ratio={:.2} avg_precision={:.3}\n",
-            opt.get("calls").and_then(Value::as_u64).unwrap_or(0),
-            opt.get("mas_calls").and_then(Value::as_u64).unwrap_or(0),
-            opt.get("fallback_calls")
+            optical.get("calls").and_then(Value::as_u64).unwrap_or(0),
+            optical.get("mas_calls").and_then(Value::as_u64).unwrap_or(0),
+            optical
+                .get("fallback_calls")
                 .and_then(Value::as_u64)
                 .unwrap_or(0),
-            opt.get("avg_ratio").and_then(Value::as_f64).unwrap_or(0.0),
-            opt.get("avg_precision")
+            optical.get("avg_ratio").and_then(Value::as_f64).unwrap_or(0.0),
+            optical
+                .get("avg_precision")
                 .and_then(Value::as_f64)
                 .unwrap_or(0.0),
         ));
         if insights {
-            text.push_str(&render_insights(now, &s.tools, registry()));
+            text.push_str(&render_insights(now, &tools, registry()));
         }
         text
     };
-    // Avoid holding the lock while recording (record only sets TLS).
-    drop(s);
     record("stats", 0, (out.len() / 4) as u64);
     Ok(out)
 }
@@ -1179,6 +1249,8 @@ fn render_json(
     tools: &BTreeMap<String, Tool>,
     events: &VecDeque<Event>,
     workspace_filter: Option<&str>,
+    window_days: u64,
+    window_label: &str,
 ) -> String {
     let tools_json: serde_json::Map<String, Value> = tools
         .iter()
@@ -1202,9 +1274,18 @@ fn render_json(
     }
     let avoided = tb.saturating_sub(tr);
     let optical = optical_json();
+    let mut ranked: Vec<&str> = tools.keys().map(String::as_str).collect();
+    ranked.sort_by(|a, b| {
+        let ra = tools[*a].returned_tokens;
+        let rb = tools[*b].returned_tokens;
+        rb.cmp(&ra).then_with(|| a.cmp(b))
+    });
     let doc = json!({
         "version": 5,
-        "label": "estimated context avoided",
+        "label": "returned tokens",
+        "baseline_label": "scanned_counterfactual",
+        "window_days": window_days,
+        "window_label": window_label,
         "since": since,
         "now": now,
         "workspace": workspace_filter,
@@ -1212,6 +1293,7 @@ fn render_json(
         "returned_tokens": tr,
         "avoided_tokens": avoided,
         "reduction_pct": pct_precise(avoided, tb),
+        "ranked_by_returned": ranked,
         "tools": Value::Object(tools_json),
         "optical": optical,
         "percentiles": {
@@ -1225,25 +1307,33 @@ fn render_json(
     serde_json::to_string_pretty(&doc).unwrap_or_else(|_| "{}".into())
 }
 
-fn render(since: u64, now: u64, tools: &BTreeMap<String, Tool>) -> String {
+fn render(window_label: &str, tools: &BTreeMap<String, Tool>) -> String {
     if tools.is_empty() {
-        return "wordkeep estimated context avoided - no tool calls recorded yet.".to_string();
+        return format!(
+            "wordkeep returned tokens — {window_label}\n\nno tool calls in this window."
+        );
     }
+    let mut ranked: Vec<(&str, &Tool)> = tools.iter().map(|(n, t)| (n.as_str(), t)).collect();
+    ranked.sort_by(|a, b| {
+        b.1.returned_tokens
+            .cmp(&a.1.returned_tokens)
+            .then_with(|| a.0.cmp(b.0))
+    });
     let (mut tc, mut tb, mut tr) = (0u64, 0u64, 0u64);
     let mut rows = String::new();
-    for (name, t) in tools {
+    for (name, t) in ranked {
         let saved = t.baseline_tokens.saturating_sub(t.returned_tokens);
         rows.push_str(&format!(
-            "  {:<16} {:>5} {:>8} {:>5} {:>4} {:>11} {:>11} {:>11} {:>5}%\n",
+            "  {:<16} {:>5} {:>8} {:>5} {:>4} {:>4} {:>11} {:>11} {:>11}\n",
             name,
             t.calls,
             t.avg_ms(),
             t.trunc_count,
-            t.error_count,
-            commafy(t.baseline_tokens),
+            t.invalid_count,
+            t.not_found_count,
             commafy(t.returned_tokens),
+            commafy(t.baseline_tokens),
             commafy(saved),
-            pct_precise(saved, t.baseline_tokens),
         ));
         tc += t.calls;
         tb += t.baseline_tokens;
@@ -1251,11 +1341,10 @@ fn render(since: u64, now: u64, tools: &BTreeMap<String, Tool>) -> String {
     }
     let tsaved = tb.saturating_sub(tr);
     format!(
-        "wordkeep estimated context avoided - tracking since {}\n\n  {:<16} {:>5} {:>8} {:>5} {:>4} {:>11} {:>11} {:>11} {:>5}\n{}  {:<16} {:>5} {:>8} {:>5} {:>4} {:>11} {:>11} {:>11} {:>5}%\n\n(distilled = est. tokens to read raw material; returned = tokens emitted;\navoided = estimated context avoided; avg ms = mean wall time; trunc/err = outcome counts; ~4 chars/token.)",
-        elapsed(since, now),
-        "tool", "calls", "avg ms", "trunc", "err", "distilled", "returned", "avoided", "red%",
+        "wordkeep returned tokens — {window_label}\n\n  {:<16} {:>5} {:>8} {:>5} {:>4} {:>4} {:>11} {:>11} {:>11}\n{}  {:<16} {:>5} {:>8} {:>5} {:>4} {:>4} {:>11} {:>11} {:>11}\n\n(returned = tokens emitted into agent context. scanned = counterfactual bytes/4\nif the raw material had been read. counterfactual = scanned − returned. ~4 chars/token.\navg ms = mean wall time; trunc/inv/nf = outcome counts.)",
+        "tool", "calls", "avg ms", "trunc", "inv", "nf", "returned", "scanned", "counterfactual",
         rows,
-        "TOTAL", tc, "-", "-", "-", commafy(tb), commafy(tr), commafy(tsaved), pct_precise(tsaved, tb),
+        "TOTAL", tc, "-", "-", "-", "-", commafy(tr), commafy(tb), commafy(tsaved),
     )
 }
 
@@ -1292,7 +1381,7 @@ fn render_insights(now: u64, tools: &BTreeMap<String, Tool>, registry: &[&'stati
     });
     if let Some((name, trunc, calls)) = by_trunc.first() {
         signals.push_str(&format!(
-            "high truncation: {name} ({trunc}/{calls} calls - raise token_budget or max)\n"
+            "high truncation: {name} ({trunc}/{calls} calls - page with continuation)\n"
         ));
     }
 
@@ -1532,11 +1621,80 @@ mod tests {
                 ..Default::default()
             },
         );
-        let out = render(1_000, 1_000 + 3_700, &tools);
+        let out = render("lifetime aggregates", &tools);
         assert!(out.contains("repo_map"));
         assert!(out.contains("TOTAL"));
         assert!(out.contains("avg ms"));
-        assert!(out.contains("estimated context avoided"));
+        assert!(out.contains("returned tokens"));
+        assert!(out.contains("counterfactual"));
+        assert!(!out.contains("estimated context avoided"), "{out}");
+    }
+
+    #[test]
+    fn render_ranks_by_returned_tokens() {
+        let mut tools = BTreeMap::new();
+        tools.insert(
+            "outline".to_string(),
+            Tool {
+                calls: 2,
+                returned_tokens: 50,
+                baseline_tokens: 10_000,
+                ..Default::default()
+            },
+        );
+        tools.insert(
+            "repo_map".to_string(),
+            Tool {
+                calls: 1,
+                returned_tokens: 900,
+                baseline_tokens: 100,
+                ..Default::default()
+            },
+        );
+        let out = render("last 30d — 3 events", &tools);
+        let repo = out.find("repo_map").unwrap();
+        let outline = out.find("outline").unwrap();
+        assert!(repo < outline, "{out}");
+    }
+
+    #[test]
+    fn aggregate_events_counts_outcomes() {
+        let events = vec![
+            Event {
+                ts: 10,
+                tool: "repo_map".into(),
+                baseline: 100,
+                returned: 40,
+                elapsed_us: 1_000,
+                outcome: "truncated".into(),
+                reason: None,
+                workspace_id: String::new(),
+                bytes_read: 0,
+                cache_hits: 0,
+                cache_misses: 0,
+                wordkeep_version: String::new(),
+            },
+            Event {
+                ts: 11,
+                tool: "repo_map".into(),
+                baseline: 80,
+                returned: 20,
+                elapsed_us: 2_000,
+                outcome: "not_found".into(),
+                reason: None,
+                workspace_id: String::new(),
+                bytes_read: 0,
+                cache_hits: 0,
+                cache_misses: 0,
+                wordkeep_version: String::new(),
+            },
+        ];
+        let tools = aggregate_events(&events);
+        let t = tools.get("repo_map").unwrap();
+        assert_eq!(t.calls, 2);
+        assert_eq!(t.returned_tokens, 60);
+        assert_eq!(t.trunc_count, 1);
+        assert_eq!(t.not_found_count, 1);
     }
 
     #[test]
@@ -1614,6 +1772,8 @@ mod tests {
         let out = render_insights(0, &tools, &["outline", "repo_map"]);
         assert!(out.contains("error-prone: outline"), "{out}");
         assert!(out.contains("high truncation: repo_map"), "{out}");
+        assert!(out.contains("page with continuation"), "{out}");
+        assert!(!out.contains("raise token_budget"), "{out}");
         assert!(out.contains("slowest (avg ms): repo_map"), "{out}");
     }
 

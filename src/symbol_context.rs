@@ -22,7 +22,7 @@ pub fn build(root: &Path, args: &Value) -> Result<String, String> {
         return Err(crate::config::symbol_required_err());
     }
     let paths = crate::config::paths_from_args(root, args)?;
-    let max = args.get("max").and_then(Value::as_u64).unwrap_or(40).max(1) as usize;
+    let max = args.get("max").and_then(Value::as_u64).unwrap_or(8).max(1) as usize;
     let budget = args
         .get("token_budget")
         .and_then(Value::as_u64)
@@ -140,7 +140,7 @@ fn render(
                 continue;
             }
             if shown >= max {
-                out.push_str(&format!("  … (+{} more)\n", hop.callers.len() - i));
+                truncated_at = Some(i);
                 break;
             }
             let row = format!("  {name}   {rel}:{line}\n");
@@ -182,7 +182,7 @@ fn render(
 fn indent_clip(body: &str, cap: usize) -> String {
     let clipped: String = if body.chars().count() > cap {
         let t: String = body.chars().take(cap).collect();
-        format!("{t}\n… (truncated; raise token_budget)")
+        format!("{t}\n… (definition clipped to token_budget)")
     } else {
         body.to_string()
     };
@@ -193,4 +193,36 @@ fn indent_clip(body: &str, cap: usize) -> String {
         out.push('\n');
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn caller_cap_pages_with_continuation() {
+        let info = DefInfo {
+            rel: "src/a.rs".into(),
+            line: 1,
+            end_line: 2,
+            kind: DefKind::Function,
+            name: "foo".into(),
+            signature: "fn foo()".into(),
+            doc: Vec::new(),
+            body: "fn foo() {}".into(),
+        };
+        let hop = call_graph::OneHop {
+            callees: Vec::new(),
+            callers: (0..12)
+                .map(|i| (format!("c{i}"), "src/b.rs".into(), i + 1))
+                .collect(),
+            scanned_bytes: 0,
+        };
+        let out = render("foo", &info, &hop, None, 8, 1600, 1, 0);
+        assert!(out.contains("c0"), "{out}");
+        assert!(out.contains("c7"), "{out}");
+        assert!(!out.contains("  c8   "), "{out}");
+        assert!(out.contains("continuation:"), "{out}");
+        assert!(out.contains("fn foo()"), "{out}");
+    }
 }

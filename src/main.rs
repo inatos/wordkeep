@@ -95,6 +95,7 @@ mod dashboard;
 mod dead_code;
 mod decree;
 mod defects;
+mod digest;
 mod diff_map;
 mod doc_comment;
 mod effect_journal;
@@ -167,6 +168,7 @@ fn main() {
     let mut want_dashboard = false;
     let mut run_record_args: Option<Vec<String>> = None;
     let mut tacet_args: Option<Vec<String>> = None;
+    let mut digest_args: Option<Vec<String>> = None;
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
         match arg.as_str() {
@@ -182,6 +184,10 @@ fn main() {
             }
             "tacet" => {
                 tacet_args = Some(it.collect());
+                break;
+            }
+            "digest" => {
+                digest_args = Some(it.collect());
                 break;
             }
             "izakaya" => {
@@ -204,6 +210,7 @@ fn main() {
                     "wordkeep [--root <workspace>]   speak MCP over stdio (default)\n\
                      wordkeep run-record [flags]     record gate/run metadata (no command exec)\n\
                      wordkeep tacet on|off|status    workspace silence latch for durable writes\n\
+                     wordkeep digest -- <cmd...>    compress noisy git/test output (fail-open)\n\
                      wordkeep izakaya <command>      agent presence / replay (see izakaya --help)\n\
                      wordkeep dashboard              live savings dashboard (build --features dashboard)"
                 );
@@ -211,6 +218,11 @@ fn main() {
             }
             _ => {}
         }
+    }
+
+    if let Some(argv) = digest_args {
+        let code = digest::cli(&argv);
+        std::process::exit(code);
     }
 
     if let Some(argv) = tacet_args {
@@ -506,7 +518,7 @@ fn main() {
                                 "description": "Symbol to assemble context for (function, type, method)." },
                     "paths": { "type": "array", "items": { "type": "string" },
                                "description": "Subdirs (relative to root) to search. Default: .wordkeep/config.json default_paths, else src only." },
-                    "max": { "type": "integer", "description": "Max callers/callees to list. Default 40." },
+                    "max": { "type": "integer", "description": "Max callers/callees to list before a continuation page. Default 8." },
                     "token_budget": { "type": "integer",
                                       "description": "Approx max tokens to return. Default 1600." },
                     "continuation": continuation::schema_prop()
@@ -1166,14 +1178,12 @@ fn main() {
         },
         mcp::Tool {
             name: "stats",
-            description: "Report estimated context avoided versus reading the raw material \
-                          (source files, docs, trace CSVs) directly. Shows per-tool call counts, \
-                          avg latency, truncation/error counts, distilled vs returned tokens, \
-                          reduction % (one decimal near 100%), and improvement signals (slow tools, \
-                          high truncation, never-called). Pass \"format\": \"json\" for machine-readable \
-                          output with elapsed_us percentiles. Optional \"workspace\" filters event \
-                          percentiles. Pass \"reset\": true to zero counters. Aggregates persist in \
-                          savings.json; per-call events append to workspace events.jsonl.",
+            description: "Report tokens Wordkeep actually returned into agent context. \
+                          Default window is the last 30 days of workspace events.jsonl, ranked by \
+                          returned tokens, with trunc/invalid/not_found counts. Scanned bytes/4 \
+                          stays as a labeled counterfactual, not a bill. Pass since_days 0 for \
+                          lifetime savings.json aggregates. Pass \"format\": \"json\" for \
+                          machine-readable output. Pass \"reset\": true to zero counters.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -1183,6 +1193,8 @@ fn main() {
                                   "description": "Append improvement-signals section (text format). Default true." },
                     "format": { "type": "string",
                                 "description": "\"text\" (default) or \"json\"." },
+                    "since_days": { "type": "integer",
+                                    "description": "Window in days over events.jsonl. Default 30. 0 = lifetime aggregates." },
                     "workspace": { "type": "string",
                                    "description": "Workspace id filter for JSON percentiles; defaults to current workspace." }
                 }

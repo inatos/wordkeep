@@ -9,7 +9,7 @@
 //! re-run `git status` on huge dirty trees.
 
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Mutex, OnceLock};
@@ -59,7 +59,7 @@ fn filter_ignored(dirty: Vec<Dirty>, ignore: &[String]) -> Vec<Dirty> {
 
 fn git_porcelain_uncached(root: &Path) -> Result<Vec<Dirty>, String> {
     let out = Command::new("git")
-        .args(["status", "--porcelain", "-uall"])
+        .args(["status", "--porcelain", "-unormal"])
         .current_dir(root)
         .output()
         .map_err(|e| format!("git status failed: {e}"))?;
@@ -271,22 +271,12 @@ pub fn propose(root: &Path, args: &Value) -> Result<String, String> {
 
     for (name, members) in &grouped {
         out.push_str(&format!("\n## scope `{name}` ({} files)\n", members.len()));
-        for d in members.iter().take(40) {
-            out.push_str(&format!("  {} {}\n", d.status, d.path));
-        }
-        if members.len() > 40 {
-            out.push_str(&format!("  … (+{} more)\n", members.len() - 40));
-        }
+        append_paths(&mut out, members);
         out.push_str("  suggested: review then `git add` these paths as one commit\n");
     }
     if !unscoped.is_empty() {
         out.push_str(&format!("\n## unscoped ({} files)\n", unscoped.len()));
-        for d in unscoped.iter().take(40) {
-            out.push_str(&format!("  {} {}\n", d.status, d.path));
-        }
-        if unscoped.len() > 40 {
-            out.push_str(&format!("  … (+{} more)\n", unscoped.len() - 40));
-        }
+        append_paths(&mut out, &unscoped);
     }
     if !warnings.is_empty() {
         out.push_str("\n## warnings\n");
@@ -303,6 +293,38 @@ pub fn propose(root: &Path, args: &Value) -> Result<String, String> {
         (out.len() / 4) as u64,
     );
     Ok(out)
+}
+
+fn is_untracked(status: &str) -> bool {
+    status.contains('?')
+}
+
+fn untracked_bucket(path: &str) -> String {
+    let trimmed = path.trim_end_matches('/');
+    if path.ends_with('/') {
+        return trimmed.to_string();
+    }
+    match trimmed.rfind('/') {
+        Some(i) if i > 0 => trimmed[..i].to_string(),
+        _ => ".".to_string(),
+    }
+}
+
+/// List modified and staged paths in full. Collapse untracked files to a
+/// directory count so a dirty tree does not dump every new file.
+fn append_paths(out: &mut String, members: &[&Dirty]) {
+    let mut untracked: BTreeMap<String, usize> = BTreeMap::new();
+    for d in members {
+        if is_untracked(&d.status) {
+            *untracked.entry(untracked_bucket(&d.path)).or_default() += 1;
+        } else {
+            out.push_str(&format!("  {} {}\n", d.status, d.path));
+        }
+    }
+    for (dir, n) in untracked {
+        let label = if dir == "." { "repo root" } else { dir.as_str() };
+        out.push_str(&format!("  ?? {label}/ ({n} untracked)\n"));
+    }
 }
 
 /// Parse porcelain lines for unit tests.
@@ -322,6 +344,33 @@ pub fn parse_porcelain_line(line: &str) -> Option<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn untracked_files_collapse_to_directory_counts() {
+        let members = vec![
+            Dirty {
+                status: " M".into(),
+                path: "src/a.rs".into(),
+                size: None,
+            },
+            Dirty {
+                status: "??".into(),
+                path: "screenshots/a.png".into(),
+                size: None,
+            },
+            Dirty {
+                status: "??".into(),
+                path: "screenshots/b.png".into(),
+                size: None,
+            },
+        ];
+        let refs: Vec<&Dirty> = members.iter().collect();
+        let mut out = String::new();
+        append_paths(&mut out, &refs);
+        assert!(out.contains(" M src/a.rs"), "{out}");
+        assert!(out.contains("screenshots/ (2 untracked)"), "{out}");
+        assert!(!out.contains("a.png"), "{out}");
+    }
 
     #[test]
     fn parses_porcelain() {

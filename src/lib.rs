@@ -21,6 +21,7 @@ mod dashboard;
 mod dead_code;
 mod decree;
 mod defects;
+mod digest;
 pub mod diff_map;
 mod doc_comment;
 mod effect_journal;

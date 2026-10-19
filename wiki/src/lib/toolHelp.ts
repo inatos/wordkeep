@@ -61,39 +61,40 @@ export function toolHelp(name: string): string {
 }
 
 export const METRIC_HELP: Record<string, string> = {
-  calls: "Total MCP tool invocations recorded in savings.json.",
-  distilled: "Estimated tokens the agent would have spent reading raw material (baseline).",
-  returned: "Tokens actually returned in distilled MCP answers.",
-  saved: "Distilled \u2212 returned: estimated context avoided.",
-  session: "Saved tokens since this browser tab first opened the Dashboard (session baseline).",
-  tracking: "How long cumulative telemetry has been collecting on disk.",
+  calls: "MCP tool invocations in the dashboard window (last 30 days of events.jsonl when that file exists).",
+  distilled: "Scanned counterfactual: bytes the tool walked, divided by 4. This is not the host bill.",
+  returned: "Tokens the tool emitted into agent context. This is the number to shrink.",
+  saved: "Scanned counterfactual minus returned. A large figure here does not mean the invoice dropped.",
+  session: "Counterfactual delta since this browser tab first opened the Dashboard.",
+  tracking: "How long cumulative telemetry has been collecting on disk. The table window is separate.",
 };
 
 export const COLUMN_HELP: Record<string, string> = {
   name: "MCP tool name. Hover a row for what the tool does.",
-  calls: "Lifetime call count for this tool.",
+  calls: "Call count for this tool in the dashboard window.",
+  nf: "Calls that returned not_found.",
   avg_ms: "Average latency per call (milliseconds).",
   trunc: "Calls whose answer was truncated to the token budget.",
   err: "Hard failures (IO/panic-class). Validation/missing-arg calls count as Inv instead.",
   inv: "Invalid calls: missing required args, bad modes, or other agent misuse.",
-  distill: "Cumulative baseline (distilled) tokens for this tool.",
-  return: "Cumulative tokens returned by this tool.",
-  saved: "Cumulative tokens avoided (distill \u2212 return). Click to sort.",
-  pct: "Reduction percentage: saved / distill.",
+  distill: "Scanned counterfactual for this tool (bytes walked / 4).",
+  return: "Tokens this tool emitted into agent context. Default sort.",
+  saved: "Counterfactual avoided (scanned \u2212 returned).",
+  pct: "Counterfactual reduction: avoided / scanned. Near 100% is not a bill cut.",
   peak: "Largest single-call save watermark for this tool.",
   last: "Time since the most recent call.",
 };
 
 export const CHART_HELP: Record<string, string> = {
   section: "Live visualizations from the same /api/dashboard poll as the tables (refreshes every 2s while this tab is open). Collapse to focus on tables.",
-  saved: "Per-tool cumulative tokens avoided (distill \u2212 return). Longer bar = more context saved. Top tools shown; remainder folded into \u201cother\u201d. Red bars mean net-negative distill.",
+  saved: "Per-tool tokens returned into agent context. Longer bar = more context spent. Top tools shown; remainder folded into \u201cother\u201d.",
   calls: "Per-tool lifetime MCP call count. Shows which tools dominate agent traffic. Top tools shown; remainder folded into \u201cother\u201d.",
   outcomes: "Share of all recorded calls by outcome: ok (clean), trunc (hit token budget), error (hard failure), invalid (bad args/misuse), low-yield (thin/unhelpful reply). Hover a slice or legend row for count, %, and meaning; center switches to that bucket.",
   spark: "Tokens saved on each recent MCP call (ring buffer, oldest \u2192 newest). Axes show value \u00d7 relative age; hover the line for the value, tool, and age at that point. Meta: n=events, last=newest save, peak=max in the window.",
-  overview: "Lifetime MCP call and token totals from ~/.cache/wordkeep/savings.json (same source as the terminal dashboard).",
+  overview: "Returned-token totals for the dashboard window (last 30 days of events.jsonl). Scanned figures are a counterfactual, not the host bill.",
   activity: "Most recent MCP tool calls (newest first). Outcome chips flag truncated / error / low-yield / invalid replies.",
   signals: "Watermarks and risk signals: peak saves, slow tools, low-yield rate, and net-negative distill.",
-  tools: "Per-tool lifetime stats. Click a column header to sort; hover a tool name for what it does.",
+  tools: "Per-tool stats for the dashboard window, ranked by returned tokens. Click a column header to sort.",
 };
 
 export const ERESHKIGAL_HELP: Record<string, string> = {

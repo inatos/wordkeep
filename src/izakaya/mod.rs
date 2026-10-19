@@ -121,6 +121,7 @@ pub fn mcp_tools(root: PathBuf) -> Vec<mcp::Tool> {
             "path":{"type":"string"},
             "since_seq":{"type":"integer"},
             "include_checked_out":{"type":"boolean"},
+            "verbose":{"type":"boolean","description":"Include stale ids, handoff summaries, unread message bodies, and stale advisory lines. Default is active leases only."},
             "format":{"type":"string","enum":["text","json"]},
             "token_budget":{"type":"integer"}
         }})),
