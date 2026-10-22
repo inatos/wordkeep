@@ -56,9 +56,10 @@
   import IzakayaBoard from './lib/IzakayaBoard.svelte';
   import EreshkigalBoard from './lib/EreshkigalBoard.svelte';
   import ShriftBoard from './lib/ShriftBoard.svelte';
+  import ElucifiaBoard from './lib/ElucifiaBoard.svelte';
   import ProviderBoard from './lib/ProviderBoard.svelte';
 
-  type Tab = 'search' | 'reader' | 'dashboard' | 'health' | 'shrift';
+  type Tab = 'search' | 'reader' | 'dashboard' | 'health' | 'shrift' | 'elucifia';
   type EditorTab = { path: string; pinned: boolean };
   type SortKey =
     | 'name'
@@ -75,7 +76,7 @@
     | 'peak_saved'
     | 'last_ts';
 
-  const TABS: Tab[] = ['search', 'reader', 'dashboard', 'health', 'shrift'];
+  const TABS: Tab[] = ['search', 'reader', 'dashboard', 'health', 'shrift', 'elucifia'];
   const SIDEBAR_MIN = 240;
   const SIDEBAR_MAX = 720;
   const SIDEBAR_DEFAULT = 320;
@@ -291,6 +292,7 @@
     else url.searchParams.delete('view');
     if (tab === 'dashboard' && dashQuery.trim()) url.searchParams.set('dq', dashQuery.trim());
     else if (tab === 'shrift' && dashQuery.trim()) url.searchParams.set('dq', dashQuery.trim());
+    else if (tab === 'elucifia' && dashQuery.trim()) url.searchParams.set('dq', dashQuery.trim());
     else url.searchParams.delete('dq');
     const next = `${url.pathname}${url.search}${url.hash}`;
     const cur = `${location.pathname}${location.search}${location.hash}`;
@@ -1465,6 +1467,23 @@
             stroke-linejoin="round"
           /><path
             d="M8 10h8M8 14h6"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="2"
+            stroke-linecap="round"
+          /></svg
+        >
+        </button>
+      <button
+        class="icon-btn"
+        class:active={tab === 'elucifia'}
+        title="Elucifia — Seraphina, co-architect and Lorekeep"
+        aria-label="Elucifia"
+        onclick={() => setTab('elucifia')}
+      >
+        <svg viewBox="0 0 24 24" aria-hidden="true"
+          ><circle cx="12" cy="9" r="3.2" fill="none" stroke="currentColor" stroke-width="2" /><path
+            d="M6 19c1.2-2.6 3.2-4 6-4s4.8 1.4 6 4"
             fill="none"
             stroke="currentColor"
             stroke-width="2"
@@ -3315,6 +3334,10 @@
             void openPath(path);
           }}
         />
+      </section>
+    {:else if tab === 'elucifia'}
+      <section class="dashboard panel enter">
+        <ElucifiaBoard />
       </section>
     {:else}
       <div class="health-wrap">
