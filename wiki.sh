@@ -308,6 +308,12 @@ ui_has_provider_view() {
     && grep -q 'dash-overview' "$WK/wiki/dist"/assets/*.css 2>/dev/null
 }
 
+ui_has_elucifia_view() {
+  # Bump when the Elucifia tab changes and dist must rebuild.
+  grep -q 'Seraphina Elucifia' "$WK/wiki/dist"/assets/*.js 2>/dev/null \
+    && grep -q 'elucifia-board' "$WK/wiki/dist"/assets/*.js 2>/dev/null
+}
+
 ui_has_local_base() {
   # Local host serve must use Vite base `/` (lab Docker sets /lab/wordkeep/ui/).
   local index="$WK/wiki/dist/index.html"
@@ -326,7 +332,7 @@ rebuild_ui_dist() {
 }
 
 ensure_ui_dist() {
-  if ui_has_runtime_view && ui_has_local_base && ui_has_izakaya_view && ui_has_tool_help && ui_has_ereshkigal_view && ui_has_provider_view; then
+  if ui_has_runtime_view && ui_has_local_base && ui_has_izakaya_view && ui_has_tool_help && ui_has_ereshkigal_view && ui_has_provider_view && ui_has_elucifia_view; then
     return 0
   fi
   if ! ui_has_local_base && [[ -f "$WK/wiki/dist/index.html" ]]; then
@@ -341,13 +347,15 @@ ensure_ui_dist() {
     echo "[wordkeep:wiki] wiki/dist is stale (TOOL_HELP hover strings missing)"
   elif ! ui_has_provider_view; then
     echo "[wordkeep:wiki] wiki/dist is stale (no Providers dashboard page)"
+  elif ! ui_has_elucifia_view; then
+    echo "[wordkeep:wiki] wiki/dist is stale (no Seraphina Elucifia tab)"
   fi
   rebuild_ui_dist || return 1
-  ui_has_runtime_view && ui_has_local_base && ui_has_izakaya_view && ui_has_tool_help && ui_has_ereshkigal_view && ui_has_provider_view
+  ui_has_runtime_view && ui_has_local_base && ui_has_izakaya_view && ui_has_tool_help && ui_has_ereshkigal_view && ui_has_provider_view && ui_has_elucifia_view
 }
 
 healthy() {
-  ui_up && dashboard_ok && izakaya_ok && semif_api_ok && runtime_ok && runtime_attach_ok && ui_has_runtime_view && ui_has_izakaya_view && ui_has_ereshkigal_view && ui_has_tool_help && ui_has_provider_view && ui_has_local_base
+  ui_up && dashboard_ok && izakaya_ok && semif_api_ok && runtime_ok && runtime_attach_ok && ui_has_runtime_view && ui_has_izakaya_view && ui_has_ereshkigal_view && ui_has_tool_help && ui_has_provider_view && ui_has_elucifia_view && ui_has_local_base
 }
 
 # Print which healthy() probe failed (for timeout / stale-restart diagnostics).
@@ -363,6 +371,7 @@ healthy_fail_reason() {
   ui_has_ereshkigal_view || { echo "wiki/dist Ereshkigal UI"; return; }
   ui_has_tool_help || { echo "wiki/dist TOOL_HELP"; return; }
   ui_has_provider_view || { echo "wiki/dist Providers UI"; return; }
+  ui_has_elucifia_view || { echo "wiki/dist Seraphina Elucifia"; return; }
   ui_has_local_base || { echo "wiki/dist lab base"; return; }
   echo "unknown"
 }
@@ -370,6 +379,40 @@ healthy_fail_reason() {
 alive_pid() {
   local pid="$1"
   [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null
+}
+
+ELUCIFIA_PID="$STATE_DIR/elucifia.pid"
+ELUCIFIA_LOG="$STATE_DIR/elucifia.log"
+
+stop_elucifia() {
+  local pid=""
+  if [[ -f "$ELUCIFIA_PID" ]]; then
+    pid="$(cat "$ELUCIFIA_PID" 2>/dev/null || true)"
+  fi
+  if alive_pid "$pid"; then
+    kill "$pid" 2>/dev/null || true
+  fi
+  rm -f "$ELUCIFIA_PID"
+  if command -v ss >/dev/null 2>&1 && ss -ltn 2>/dev/null | grep -q '127.0.0.1:8791'; then
+    pkill -f 'elucifia.*serve.*127.0.0.1:8791' 2>/dev/null || true
+    sleep 0.2
+  fi
+}
+
+ensure_elucifia_studio() {
+  local bin="$ROOT/tools/elucifia/target/debug/elucifia"
+  if ! (cd "$ROOT/tools/elucifia" && CARGO_TARGET_DIR="$ROOT/tools/elucifia/target" cargo build -p elucifia-cli --quiet); then
+    echo "[wordkeep:wiki] elucifia build failed; studio on :8791 stays down" >&2
+    return 0
+  fi
+  if command -v ss >/dev/null 2>&1 && ss -ltn 2>/dev/null | grep -q '127.0.0.1:8791'; then
+    echo "[wordkeep:wiki] studio already on http://127.0.0.1:8791"
+    return 0
+  fi
+  mkdir -p "$STATE_DIR"
+  setsid "$bin" --root "$ROOT" serve --bind 127.0.0.1:8791 >>"$ELUCIFIA_LOG" 2>&1 </dev/null &
+  echo $! >"$ELUCIFIA_PID"
+  echo "[wordkeep:wiki] studio: http://127.0.0.1:8791"
 }
 
 stop_existing() {
@@ -394,6 +437,7 @@ stop_existing() {
     sleep 0.3
   fi
   rm -f "$PIDFILE"
+  stop_elucifia
 }
 
 if [[ "$FORCE" -eq 1 ]]; then
@@ -527,6 +571,7 @@ fi
 
 if healthy; then
   echo "[wordkeep:wiki] already serving http://${BIND} ($BIN)"
+  ensure_elucifia_studio
   exit 0
 fi
 
@@ -559,6 +604,7 @@ echo $! >"$PIDFILE"
 for _ in $(seq 1 40); do
   if healthy; then
     echo "[wordkeep:wiki] UI: http://${BIND}"
+    ensure_elucifia_studio
     exit 0
   fi
   if ! alive_pid "$(cat "$PIDFILE")"; then

@@ -371,3 +371,68 @@ article h1, article h2, article h3 { scroll-margin-top: 4rem; }
     grid-template-columns: 1fr;
   }
 }
+
+/* Elucifia studio press. Hover stays silent. The ripple is the press. */
+.elucifia-studio button {
+  cursor: pointer;
+  transition:
+    background 0.15s ease,
+    border-color 0.15s ease,
+    box-shadow 0.15s ease,
+    color 0.15s ease,
+    transform 0.15s ease;
+}
+.elucifia-studio button:hover {
+  border-color: #ff8c42;
+  background: rgba(255, 140, 66, 0.14);
+}
+.elucifia-studio button:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 1px #ff8c42;
+}
+.elucifia-studio button:active {
+  transform: scale(0.98);
+}
+.elucifia-studio .sao-orb {
+  width: 2.75rem;
+  height: 2.75rem;
+  border-radius: 999px;
+  display: grid;
+  place-items: center;
+  padding: 0;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+}
+.elucifia-studio .sao-orb.on {
+  transform: scale(1.06);
+  border-color: #ff8c42;
+  background: rgba(255, 140, 66, 0.22);
+  box-shadow: 0 0 0 2px rgba(255, 140, 66, 0.44);
+  animation: sao-orb-pulse 5.8s ease-out infinite;
+}
+@keyframes sao-orb-pulse {
+  0%,
+  10% {
+    box-shadow:
+      0 0 0 2px rgba(255, 140, 66, 0.44),
+      0 0 0 0 rgba(255, 140, 66, 0.35);
+  }
+  38% {
+    box-shadow:
+      0 0 0 2px rgba(255, 140, 66, 0.44),
+      0 0 0 13px rgba(255, 140, 66, 0),
+      0 0 14px rgba(255, 140, 66, 0.28);
+  }
+  100% {
+    box-shadow: 0 0 0 2px rgba(255, 140, 66, 0.2);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .elucifia-studio .sao-orb.on {
+    animation: none;
+  }
+  .elucifia-studio button,
+  .elucifia-studio .edge svg {
+    transition: none;
+  }
+}

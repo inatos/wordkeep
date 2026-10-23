@@ -1,4 +1,5 @@
 mod config;
+mod elucifia;
 mod dashboard;
 mod garden;
 mod indexer;

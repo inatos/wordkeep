@@ -791,3 +791,103 @@ export function snippetOf(hit: SearchHit): string {
 export function htmlIdForAnchor(anchor?: string): string {
   return (anchor || '').replace(/#/g, '-');
 }
+
+export type ElucifiaTurn = {
+  role: string;
+  content: string;
+  mood?: string;
+  thoughts?: string;
+  salience?: string;
+  tok_per_sec?: number;
+  latency_ms?: number;
+  context_refs?: string[];
+};
+
+export type ElucifiaBranch = {
+  id: string;
+  name: string;
+  parent_id?: string;
+  turn_count?: number;
+};
+
+export type ElucifiaThread = {
+  id: string;
+  title?: string;
+  model?: string;
+  group_id?: string;
+  tags?: string[];
+  current_branch?: string;
+  branches?: ElucifiaBranch[];
+  turns?: ElucifiaTurn[];
+  turn_count?: number;
+  updated?: string;
+};
+
+export type ElucifiaStatus = {
+  name?: string;
+  model?: string;
+  models?: string[];
+  peer_up?: boolean;
+  chat_lane?: string;
+  mood?: string;
+  voice?: string;
+  voice_lane?: string;
+  lora_pairs?: number;
+  error?: string;
+};
+
+export type ElucifiaPeerEvent = {
+  seq?: number;
+  source?: string;
+  line?: string;
+};
+
+export type ElucifiaPeer = {
+  reachable?: boolean;
+  ollama_up?: boolean;
+  model?: string;
+  menu_model?: string;
+  context?: number;
+  vram_used_mib?: number;
+  vram_total_mib?: number;
+  gpu_pct?: number;
+  reconcile?: string;
+  events?: ElucifiaPeerEvent[];
+  kind?: string;
+  gen?: number;
+  line?: string;
+  seq?: number;
+};
+
+export type ElucifiaJob = {
+  name: string;
+  status?: string;
+  artifact?: string;
+  note?: string;
+  task_id?: string;
+  safe_mesh?: boolean;
+};
+
+export function fetchElucifiaStatus() {
+  return getJson<ElucifiaStatus>(`${API_BASE}/elucifia/status`);
+}
+
+export function fetchElucifiaPeer() {
+  return getJson<ElucifiaPeer>(`${API_BASE}/elucifia/peer`);
+}
+
+export function elucifiaPeerEventsUrl() {
+  return `${API_BASE}/elucifia/peer/events`;
+}
+
+export function fetchElucifiaThreads() {
+  return getJson<{ threads: ElucifiaThread[] }>(`${API_BASE}/elucifia/threads`);
+}
+
+export function fetchElucifiaJobs() {
+  return getJson<{ jobs: ElucifiaJob[] }>(`${API_BASE}/elucifia/jobs`);
+}
+
+export function postElucifia<T>(route: string, body: Record<string, unknown>) {
+  return postJson<T>(`${API_BASE}/elucifia/${route}`, body);
+}

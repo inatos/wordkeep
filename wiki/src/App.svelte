@@ -87,7 +87,12 @@
   const DASH_BASELINE_KEY = 'wordkeep-wiki-dash-baseline';
   const DASH_POLL_MS = 2000;
 
-  let tab = $state<Tab>('search');
+  let tab = $state<Tab>(
+    typeof location !== 'undefined' &&
+      (TABS as string[]).includes(new URLSearchParams(location.search).get('tab') || '')
+      ? (new URLSearchParams(location.search).get('tab') as Tab)
+      : 'search'
+  );
   let healthView = $state<'runtime' | 'knowledge'>('runtime');
   let dashView = $state<'telemetry' | 'izakaya' | 'ereshkigal' | 'providers'>('telemetry');
   let dashQuery = $state('');
@@ -1348,8 +1353,16 @@
         label: event.tool,
       })),
   );
+  const studioStandalone =
+    typeof location !== 'undefined' &&
+    (location.port === '8791' || new URLSearchParams(location.search).get('standalone') === '1');
 </script>
 
+{#if studioStandalone}
+  <div class="studio-standalone">
+    <ElucifiaBoard />
+  </div>
+{:else}
 <div
   class="shell"
   class:resizing
@@ -3336,7 +3349,7 @@
         />
       </section>
     {:else if tab === 'elucifia'}
-      <section class="dashboard panel enter">
+      <section class="dashboard panel enter studio-pane">
         <ElucifiaBoard />
       </section>
     {:else}
@@ -3534,8 +3547,42 @@
     </div>
   </main>
 </div>
+{/if}
 
 <style>
+  .studio-standalone {
+    height: 100dvh;
+    min-height: 100dvh;
+    display: flex;
+    overflow: hidden;
+    background: #0d0912;
+  }
+  .studio-standalone :global(.studio) {
+    flex: 1;
+    min-height: 0;
+    height: 100%;
+  }
+  main:has(.studio-pane) { overflow: hidden; }
+  .main-body:has(> .studio-pane) {
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+    overflow: hidden;
+    padding: 0;
+  }
+  .studio-pane {
+    flex: 1 1 auto;
+    min-height: 0;
+    display: flex;
+    overflow: hidden;
+    padding: 0;
+  }
+  .studio-pane :global(.studio) {
+    flex: 1;
+    min-height: 0;
+    height: 100%;
+  }
+
   .shell {
     --sidebar-width: 20rem;
     --sidebar-transition: 0.36s var(--ease-snap);

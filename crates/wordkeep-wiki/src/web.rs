@@ -9,10 +9,10 @@ use crate::runtime::maps;
 use crate::runtime::peek::{self, MAX_PEEK};
 use crate::runtime::RuntimeHub;
 use crate::telemetry;
-use axum::extract::{Query, State};
+use axum::extract::{Path as RoutePath, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
-use axum::response::Html;
+use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use pulldown_cmark::{html, Event, Options, Parser, Tag};
@@ -115,6 +115,18 @@ pub(crate) async fn serve(
         .route("/api/runtime/attach", post(runtime_attach_api))
         .route("/api/runtime/peek", post(runtime_peek))
         .route("/api/runtime/ecs-optimize", post(runtime_ecs))
+        .route("/api/elucifia/status", get(elucifia_status))
+        .route("/api/elucifia/peer", get(elucifia_peer))
+        .route("/api/elucifia/peer/events", get(elucifia_peer_events))
+        .route("/api/elucifia/threads", get(elucifia_threads))
+        .route("/api/elucifia/jobs", get(elucifia_jobs).post(elucifia_jobs_post))
+        .route("/api/elucifia/chat", post(elucifia_chat))
+        .route("/api/elucifia/distill", post(elucifia_distill))
+        .route("/api/elucifia/dream", post(elucifia_dream))
+        .route("/api/elucifia/mood", post(elucifia_mood))
+        .route("/api/elucifia/speak", post(elucifia_speak))
+        .route("/api/elucifia/gallery/:job/:name", get(elucifia_gallery_file))
+        .route("/api/elucifia/:route", get(elucifia_route_get).post(elucifia_route_post))
         .with_state(state);
 
     let dist = resolve_wiki_dist();
@@ -978,6 +990,123 @@ async fn runtime_ecs(
         "reordered": sug.reordered.iter().map(|f| json!({"ty": f.ty, "name": f.name, "est_size": f.est_size})).collect::<Vec<_>>(),
         "quality": "estimated"
     })))
+}
+
+async fn elucifia_status(State(state): State<AppState>) -> Json<Value> {
+    Json(crate::elucifia::handle(&state.root, "GET", "/status", "").1)
+}
+
+async fn elucifia_peer(State(state): State<AppState>) -> Json<Value> {
+    Json(crate::elucifia::peer_status(&state.root))
+}
+
+async fn elucifia_peer_events(State(state): State<AppState>) -> Response {
+    let root = state.root.clone();
+    let (tx, rx) = tokio::sync::mpsc::channel::<String>(32);
+    tokio::task::spawn_blocking(move || {
+        let tx = tx;
+        if crate::elucifia::stream_peer(&root, |chunk| tx.blocking_send(chunk.to_string()).is_ok()).is_err()
+        {
+            let menu = elucifia_core::menu_model(&root);
+            let _ = tx.blocking_send(elucifia_core::unreachable_peer(&menu).to_string());
+        }
+    });
+    let stream = tokio_stream::wrappers::ReceiverStream::new(rx)
+        .map(|data| Ok::<_, Infallible>(SseEvent::default().data(data)));
+    Sse::new(stream).into_response()
+}
+
+async fn elucifia_threads(State(state): State<AppState>) -> Json<Value> {
+    Json(crate::elucifia::handle(&state.root, "GET", "/threads", "").1)
+}
+
+async fn elucifia_jobs(State(state): State<AppState>) -> Json<Value> {
+    Json(crate::elucifia::handle(&state.root, "GET", "/jobs", "").1)
+}
+
+fn elucifia_json(root: &Path, route: &str, body: &Value) -> ApiResult {
+    let (code, value) = crate::elucifia::handle(root, "POST", route, &body.to_string());
+    if code >= 400 {
+        let msg = value
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("elucifia error");
+        let status = StatusCode::from_u16(code).unwrap_or(StatusCode::BAD_REQUEST);
+        Err(api_error(status, msg))
+    } else {
+        Ok(Json(value))
+    }
+}
+
+async fn elucifia_jobs_post(State(state): State<AppState>, Json(body): Json<Value>) -> ApiResult {
+    elucifia_json(&state.root, "/jobs", &body)
+}
+
+async fn elucifia_distill(State(state): State<AppState>, Json(body): Json<Value>) -> ApiResult {
+    elucifia_json(&state.root, "/distill", &body)
+}
+
+async fn elucifia_dream(State(state): State<AppState>, Json(body): Json<Value>) -> ApiResult {
+    elucifia_json(&state.root, "/dream", &body)
+}
+
+async fn elucifia_mood(State(state): State<AppState>, Json(body): Json<Value>) -> ApiResult {
+    elucifia_json(&state.root, "/mood", &body)
+}
+
+async fn elucifia_speak(State(state): State<AppState>, Json(body): Json<Value>) -> ApiResult {
+    elucifia_json(&state.root, "/speak", &body)
+}
+
+async fn elucifia_gallery_file(
+    State(state): State<AppState>,
+    RoutePath((job, name)): RoutePath<(String, String)>,
+) -> Response {
+    match elucifia_core::read_gallery_file(&state.root, &job, &name) {
+        Some((content_type, bytes)) => {
+            ([(axum::http::header::CONTENT_TYPE, content_type)], bytes).into_response()
+        }
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+async fn elucifia_route_get(State(state): State<AppState>, RoutePath(route): RoutePath<String>) -> Json<Value> {
+    Json(crate::elucifia::handle(&state.root, "GET", &format!("/{route}"), "").1)
+}
+
+async fn elucifia_route_post(
+    State(state): State<AppState>,
+    RoutePath(route): RoutePath<String>,
+    Json(body): Json<Value>,
+) -> ApiResult {
+    elucifia_json(&state.root, &format!("/{route}"), &body)
+}
+
+async fn elucifia_chat(State(state): State<AppState>, Json(body): Json<Value>) -> Response {
+    let stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
+    if !stream {
+        return match elucifia_json(&state.root, "/chat", &body) {
+            Ok(json) => json.into_response(),
+            Err(err) => err.into_response(),
+        };
+    }
+    let root = state.root.clone();
+    let raw = body.to_string();
+    let (tx, rx) = tokio::sync::mpsc::channel::<String>(64);
+    tokio::task::spawn_blocking(move || {
+        let tx = tx;
+        let result = crate::elucifia::chat_stream(&root, &raw, &mut |tok| {
+            let _ = tx.blocking_send(json!({"token": tok}).to_string());
+        });
+        let done = match result {
+            Ok(value) => value.to_string(),
+            Err(err) => json!({"done": true, "error": err}).to_string(),
+        };
+        let _ = tx.blocking_send(done);
+    });
+    let stream = tokio_stream::wrappers::ReceiverStream::new(rx)
+        .map(|data| Ok::<_, Infallible>(SseEvent::default().data(data)));
+    Sse::new(stream).into_response()
 }
 
 fn read_page(state: &AppState, requested: &str) -> Result<(String, String), ApiError> {
