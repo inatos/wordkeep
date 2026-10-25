@@ -833,6 +833,8 @@ export type ElucifiaStatus = {
   voice?: string;
   voice_lane?: string;
   lora_pairs?: number;
+  dpo_pairs?: number;
+  memory?: { episodic?: number; semantic?: number; procedural?: number; dreams?: number };
   error?: string;
 };
 

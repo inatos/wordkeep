@@ -115,6 +115,7 @@ newest_wiki_src_mtime() {
   done < <(
     {
       find "$WK/crates/wordkeep-wiki" "$WK/crates/wordkeep-knowledge" \
+        "$WK/../elucifia/elucifia-core" \
         -type f \( -name '*.rs' -o -name 'Cargo.toml' -o -name 'build.rs' \) \
         -printf '%T@\n' 2>/dev/null || true
       for f in "$WK/Cargo.toml" "$WK/Cargo.lock"; do
