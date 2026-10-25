@@ -21,16 +21,18 @@
     postElucifia,
     type ElucifiaJob,
     type ElucifiaPeer,
+    type ElucifiaStatus,
     type ElucifiaThread,
     type ElucifiaTurn,
   } from './api';
+  import type { SparkPoint } from './charts/utils';
 
   type Mood = 'Attentive' | 'Excited' | 'Skeptical' | 'Tender' | 'Playful';
   type View = 'chats' | 'canvas' | 'dreams' | 'journal' | 'personas' | 'logs' | 'config';
   type CanvasTab = 'graph' | 'gen2d' | 'gal2d' | 'gen3d' | 'gal3d';
   const MOODS: Mood[] = ['Attentive', 'Excited', 'Skeptical', 'Tender', 'Playful'];
-  const MODELS = ['gemma4:12b', 'gemma4:e4b', 'gemma4:26b', 'gemma3:12b'];
-  const JOBS = ['image-scout', 'image-refine', 'video-previx', 'hunyuan-img2mesh', 'lora-train-anima'];
+  const MODELS = ['gemma4:12b', 'gemma4:e4b', 'gemma4:26b', 'gemma3:12b', 'elucifia-gemma4:12b'];
+  const JOBS = ['image-scout', 'image-refine', 'video-previx', 'hunyuan-img2mesh', 'lora-train-anima', 'elucifia-lora-train'];
   const VIEWS: { id: View; label: string; glyph: string; letter: string }[] = [
     { id: 'chats', label: 'Chats', glyph: '✉', letter: 'C' },
     { id: 'canvas', label: 'Canvas', glyph: '◈', letter: 'K' },
@@ -52,6 +54,7 @@
     { name: 'Hunyuan 3D Mesh', job: 'hunyuan-img2mesh' },
     { name: 'Video Previx', job: 'video-previx' },
     { name: 'Voice LoRA', job: 'lora-train-anima' },
+    { name: 'Elucifia LoRA', job: 'elucifia-lora-train' },
   ];
   const CONTEXT = ['@vault', '@lorekeep', '@continuity', '@peer', '@thread', '@page'];
 
@@ -59,6 +62,7 @@
   let model = $state('gemma4:12b');
   let peerUp = $state(false);
   let voice = $state('hexgrad/Kokoro-82M');
+  let voiceLane = $state('');
   let lane = $state('stub');
   let loraPairs = $state(0);
   let speaking = $state(false);
@@ -142,11 +146,44 @@
     gpu_pct: 0,
   });
   let peerLines = $state<string[]>([]);
+  let gpuSeries = $state<SparkPoint[]>([]);
+  let episodicCount = $state(0);
+  let semanticCount = $state(0);
+  let proceduralCount = $state(0);
+  let crystal = $state(false);
+  let pinging = $state(false);
+  let peerLatched = $state(false);
+  let restarting = $state(false);
+  let restartArmed = $state(false);
+  let receipt = $state<{ lane: string; ok: boolean; detail: string }[]>([]);
+  let receiptTick = $state(0);
+  let beatTimer = 0;
+  let retryStep = 0;
+  let receiptTimer = 0;
+  let feedSource: EventSource | null = null;
+  const feedSeen = new Set<number>();
 
   const active = $derived(threads.find((t) => t.id === threadId));
   const reconcileLine = $derived(reconcile(model, peer.model, peer.reachable));
   const energy = $derived(Math.max(8, 100 - (peer.gpu_pct || 0)));
   const focus = $derived(Math.min(100, 40 + turns.length * 8));
+  const memoryCounts = $derived({
+    dreams: dreams.length,
+    episodic: episodicCount,
+    semantic: semanticCount,
+    procedural: proceduralCount,
+    loraPairs,
+  });
+  const perfSeries = $derived(
+    turns
+      .filter((turn) => turn.role === 'assistant' && typeof turn.tok_per_sec === 'number' && (turn.tok_per_sec || 0) > 0)
+      .slice(-24)
+      .map((turn, index, all) => ({
+        ts: Math.floor(Date.now() / 1000) - (all.length - 1 - index) * 4,
+        value: turn.tok_per_sec || 0,
+        label: turn.latency_ms ? `${Math.round(turn.latency_ms)} ms` : 'turn',
+      })),
+  );
   const filteredThreads = $derived(
     threads.filter((t) => {
       const blob = `${t.title || ''} ${t.id} ${(t.tags || []).join(' ')}`.toLowerCase();
@@ -173,6 +210,25 @@
     peerLines = [...peerLines, line].slice(-40);
   }
 
+  function pushSample(series: SparkPoint[], value: number, label: string): SparkPoint[] {
+    const ts = Math.floor(Date.now() / 1000);
+    const last = series[series.length - 1];
+    if (last && last.ts === ts && last.value === value) return series;
+    return [...series, { ts, value, label }].slice(-24);
+  }
+
+  function applyStatus(status: ElucifiaStatus) {
+    if (status.mood && MOODS.includes(status.mood as Mood)) mood = status.mood as Mood;
+    if (status.model) model = status.model;
+    peerUp = Boolean(status.peer_up);
+    voice = status.voice || voice;
+    lane = status.chat_lane || lane;
+    voiceLane = status.voice_lane || voiceLane;
+    loraPairs = status.lora_pairs || 0;
+    const layers = status.memory;
+    if (layers?.procedural != null) proceduralCount = layers.procedural;
+  }
+
   function applyPeer(data: ElucifiaPeer) {
     peer = {
       reachable: Boolean(data.reachable),
@@ -183,6 +239,7 @@
       vram_total_mib: data.vram_total_mib || 0,
       gpu_pct: data.gpu_pct || 0,
     };
+    gpuSeries = pushSample(gpuSeries, data.gpu_pct || 0, 'GPU %');
     if (data.events) {
       const seen = new Set(peerLines);
       const next = [...peerLines];
@@ -193,6 +250,178 @@
         }
       }
       peerLines = next.slice(-40);
+    }
+  }
+
+  async function pingPeer() {
+    await probe(true);
+  }
+
+  function showReceipt(lines: { lane: string; ok: boolean; detail: string }[]) {
+    receipt = lines;
+    receiptTick += 1;
+    window.clearTimeout(receiptTimer);
+    const reduce = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    receiptTimer = window.setTimeout(() => {
+      receipt = [];
+    }, reduce ? 4000 : 4400);
+  }
+
+  function scheduleBeat() {
+    window.clearTimeout(beatTimer);
+    if (peerLatched) {
+      const windows = [8000, 20000, 45000];
+      if (retryStep >= windows.length) return;
+      const wait = windows[retryStep];
+      retryStep += 1;
+      beatTimer = window.setTimeout(() => {
+        void probe(false);
+      }, wait);
+      return;
+    }
+    retryStep = 0;
+    beatTimer = window.setTimeout(() => {
+      void probe(false);
+    }, 4000);
+  }
+
+  function noteReachable(ok: boolean) {
+    const down = !ok;
+    if (peerLatched === down) return;
+    peerLatched = down;
+    if (ok) retryStep = 0;
+    scheduleBeat();
+  }
+
+  function bindFeed() {
+    feedSource?.close();
+    const source = new EventSource(elucifiaPeerEventsUrl());
+    feedSource = source;
+    source.onmessage = (ev) => {
+      let data: ElucifiaPeer;
+      try {
+        data = JSON.parse(ev.data) as ElucifiaPeer;
+      } catch {
+        return;
+      }
+      if (data.kind === 'facts') {
+        const ok = data.reachable !== false;
+        applyPeer({ ...data, reachable: ok });
+        noteReachable(ok);
+        return;
+      }
+      if (data.kind === 'line' && data.line) {
+        if (data.seq !== undefined && feedSeen.has(data.seq)) return;
+        if (data.seq !== undefined) feedSeen.add(data.seq);
+        rememberLine(data.line);
+        return;
+      }
+      if (data.reachable === false) {
+        peer = { ...peer, reachable: false };
+        noteReachable(false);
+      }
+    };
+  }
+
+  async function probe(manual: boolean) {
+    const started = performance.now();
+    const wasLatched = peerLatched;
+    if (manual) {
+      pinging = true;
+      playClip('tick');
+      retryStep = 0;
+    }
+    let ok = false;
+    let modelName = '';
+    try {
+      const [status, facts] = await Promise.all([fetchElucifiaStatus(), fetchElucifiaPeer()]);
+      applyStatus(status);
+      ok = facts.reachable !== false;
+      modelName = facts.model || '';
+      applyPeer({ ...facts, reachable: ok });
+    } catch {
+      peer = { ...peer, reachable: false, ollama_up: false };
+      ok = false;
+    }
+    const elapsed = Math.round(performance.now() - started);
+    peerLatched = !ok;
+    if (manual) {
+      showReceipt([
+        {
+          lane: 'peer',
+          ok,
+          detail: ok
+            ? `Peer up${modelName ? ` · ${modelName}` : ''} · ${elapsed} ms`
+            : `Laptop silent · ${elapsed} ms`,
+        },
+      ]);
+      if (ok) playClip('chime');
+      else tone(180, 0.18, 0.03);
+      const remain = 400 - (performance.now() - started);
+      if (remain > 0) await new Promise((resolve) => window.setTimeout(resolve, remain));
+      pinging = false;
+    } else if (wasLatched && ok) {
+      showReceipt([{ lane: 'peer', ok: true, detail: `Peer up${modelName ? ` · ${modelName}` : ''} · ${elapsed} ms` }]);
+      playClip('chime');
+      retryStep = 0;
+    }
+    scheduleBeat();
+  }
+
+  async function restartPeer() {
+    if (restarting) return;
+    if (!restartArmed) {
+      restartArmed = true;
+      playClip('tick');
+      return;
+    }
+    restartArmed = false;
+    restarting = true;
+    playClip('tick');
+    const started = performance.now();
+    try {
+      const report = await postElucifia<{
+        reachable?: boolean;
+        lines?: { lane: string; ok: boolean; detail: string }[];
+      }>('peer/restart', {});
+      const lines = [...(report.lines || [])];
+      if (report.reachable) {
+        bindFeed();
+        if (!lines.some((line) => line.lane === 'feed')) {
+          lines.unshift({ lane: 'feed', ok: true, detail: 'Event stream reconnected' });
+        }
+        try {
+          const facts = await fetchElucifiaPeer();
+          const ok = facts.reachable !== false;
+          applyPeer({ ...facts, reachable: ok });
+          peerLatched = !ok;
+          if (ok) retryStep = 0;
+        } catch {
+          peerLatched = true;
+        }
+      } else {
+        peer = { ...peer, reachable: false, ollama_up: false };
+        peerLatched = true;
+      }
+      for (const line of lines) rememberLine(`${line.lane}: ${line.detail}`);
+      showReceipt(lines);
+      if (lines.length && lines.every((line) => line.ok)) playClip('chime');
+      else tone(180, 0.18, 0.03);
+    } catch {
+      peerLatched = true;
+      const lines = [
+        { lane: 'feed', ok: false, detail: 'no peer to restart' },
+        { lane: 'ollama', ok: false, detail: 'no peer to restart' },
+        { lane: 'copper', ok: false, detail: 'no peer to restart' },
+        { lane: 'voice', ok: false, detail: 'no peer to restart' },
+      ];
+      showReceipt(lines);
+      tone(180, 0.18, 0.03);
+    } finally {
+      const remain = 400 - (performance.now() - started);
+      if (remain > 0) await new Promise((resolve) => window.setTimeout(resolve, remain));
+      restarting = false;
+      scheduleBeat();
     }
   }
 
@@ -246,12 +475,7 @@
   async function refresh() {
     try {
       const status = await fetchElucifiaStatus();
-      if (status.mood && MOODS.includes(status.mood as Mood)) mood = status.mood as Mood;
-      if (status.model) model = status.model;
-      peerUp = Boolean(status.peer_up);
-      voice = status.voice || voice;
-      lane = status.chat_lane || lane;
-      loraPairs = status.lora_pairs || 0;
+      applyStatus(status);
       const listed = await fetchElucifiaThreads();
       threads = listed.threads || [];
       const board = await fetchElucifiaJobs();
@@ -268,7 +492,10 @@
       if (typeof shelf.send_on_enter === 'boolean') sendOnEnter = shelf.send_on_enter;
       dreams = (await fetch(`${asset('api/elucifia/')}dreams`).then((r) => r.json())).notes || [];
       const pages = await fetch(`${asset('api/elucifia/')}journal`).then((r) => r.json());
-      journal = [...(pages.episodic || []), ...(pages.semantic || [])];
+      episodicCount = (pages.episodic || []).length;
+      semanticCount = (pages.semantic || []).length;
+      proceduralCount = (pages.procedural || []).length;
+      journal = [...(pages.episodic || []), ...(pages.semantic || []), ...(pages.procedural || [])];
       gallery = (await fetch(`${asset('api/elucifia/')}gallery`).then((r) => r.json())).items || [];
       savedGraphs = (await fetch(`${asset('api/elucifia/')}graphs`).then((r) => r.json())).graphs || [];
       const pack = await fetch(`${asset('api/elucifia/')}context`).then((r) => r.json());
@@ -428,8 +655,12 @@
     }
     busy = 'distill';
     try {
-      await postElucifia('distill', { thread_id: threadId });
+      const report = await postElucifia<{ semantic?: number; episodic?: number }>('distill', { thread_id: threadId });
       playClip('chime');
+      if ((report.semantic || 0) > 0 || (report.episodic || 0) > 0) {
+        crystal = true;
+        setTimeout(() => (crystal = false), 1400);
+      }
       await refresh();
     } catch (err) {
       notice = err instanceof Error ? err.message : 'distill failed';
@@ -633,6 +864,15 @@
     modal = 'profile';
     modalTitle = found?.name || name;
     modalBody = found?.system_prompt || found?.description || '';
+    playClip('tick');
+  }
+
+  async function deleteTurn(index: number) {
+    if (!threadId || index < 0) return;
+    await postElucifia('threads', { id: threadId, turn_index: index, delete_turn: true });
+    modal = '';
+    await refresh();
+    selectThread(threadId);
   }
 
   function beginEdit(index: number) {
@@ -686,41 +926,76 @@
     }
     if (params.get('rail') === 'closed') railOpen = false;
     if (params.get('inspector') === '1') inspector = true;
+    const askedRoom = params.get('room');
+    if (askedRoom === 'vault' || askedRoom === 'workshop') room = askedRoom;
     if (params.get('preview') === '1') {
       titleDraft = 'Atheneum';
-      turns = [
+      const seeded: ElucifiaTurn[] = [
         { role: 'user', content: 'The vault is open.' },
-        { role: 'assistant', content: 'Wispfire is the active book. I am here.', mood: 'Attentive' },
+        { role: 'assistant', content: 'Wispfire is the active book. I am here.', mood: 'Attentive', tok_per_sec: 42, latency_ms: 180 },
       ];
+      if (params.get('fade') === '1') {
+        for (let i = 0; i < 14; i += 1) {
+          seeded.push({
+            role: i % 2 ? 'assistant' : 'user',
+            content: `Line ${i}. The Atheneum keeps the long thread so the top of the chat can fade.`,
+            tok_per_sec: i % 2 ? 28 + i : undefined,
+            latency_ms: i % 2 ? 140 + i * 12 : undefined,
+          });
+        }
+      }
+      turns = seeded;
     }
-    void refresh();
-    void fetchElucifiaPeer().then(applyPeer).catch(() => {
-      peer = { ...peer, reachable: false };
-    });
-    window.addEventListener('keydown', onGlobal);
-    const seen = new Set<number>();
-    const source = new EventSource(elucifiaPeerEventsUrl());
-    source.onmessage = (ev) => {
-      let data: ElucifiaPeer;
-      try {
-        data = JSON.parse(ev.data) as ElucifiaPeer;
-      } catch {
-        return;
+    const paintCapture = () => {
+      if (params.get('ping') === 'pending') pinging = true;
+      if (params.get('ping') === 'result') {
+        showReceipt([{ lane: 'peer', ok: true, detail: 'Peer up · gemma4:12b · 42 ms' }]);
       }
-      if (data.kind === 'facts') {
-        applyPeer({ ...data, reachable: data.reachable !== false });
-        return;
+      if (params.get('ping') === 'latched') {
+        peer = { ...peer, reachable: false, ollama_up: false };
+        peerLatched = true;
       }
-      if (data.kind === 'line' && data.line) {
-        if (data.seq !== undefined && seen.has(data.seq)) return;
-        if (data.seq !== undefined) seen.add(data.seq);
-        rememberLine(data.line);
-        return;
+      if (params.get('restart') === 'armed') restartArmed = true;
+      if (params.get('restart') === 'stub') {
+        showReceipt([
+          { lane: 'feed', ok: false, detail: 'no peer to restart' },
+          { lane: 'ollama', ok: false, detail: 'no peer to restart' },
+          { lane: 'copper', ok: false, detail: 'no peer to restart' },
+          { lane: 'voice', ok: false, detail: 'no peer to restart' },
+        ]);
       }
-      if (data.reachable === false) peer = { ...peer, reachable: false };
     };
+    void refresh();
+    void fetchElucifiaPeer().then((facts) => {
+      const ok = facts.reachable !== false;
+      applyPeer({ ...facts, reachable: ok });
+      peerLatched = !ok;
+      scheduleBeat();
+      paintCapture();
+    }).catch(() => {
+      peer = { ...peer, reachable: false };
+      peerLatched = true;
+      scheduleBeat();
+      paintCapture();
+    });
+    paintCapture();
+    window.addEventListener('keydown', onGlobal);
+    bindFeed();
+    if (params.get('fade') === '1') {
+      const nudge = () => {
+        const stream = document.querySelector('.elucifia-studio .stream');
+        if (stream instanceof HTMLElement && stream.scrollHeight > stream.clientHeight) {
+          stream.scrollTop = 220;
+          stream.dispatchEvent(new Event('scroll'));
+        }
+      };
+      requestAnimationFrame(nudge);
+      window.setTimeout(nudge, 50);
+    }
     return () => {
-      source.close();
+      window.clearTimeout(beatTimer);
+      window.clearTimeout(receiptTimer);
+      feedSource?.close();
       window.removeEventListener('keydown', onGlobal);
     };
   });
@@ -739,6 +1014,16 @@
   data-streaming={streaming}
   data-testid="elucifia-board"
 >
+  <div class="wash" aria-hidden="true">
+    <span class="blob a"></span>
+    <span class="blob b"></span>
+    <span class="stars"></span>
+    <span class="floor"><span class="grid"></span></span>
+    <span class="hum"></span>
+    <span class="hum r2"></span>
+    <span class="node"></span>
+    <span class="scan"></span>
+  </div>
   <ElucifiaSidebar
     {railOpen}
     {view}
@@ -776,17 +1061,7 @@
     onclear={() => { turns = []; draft = ''; }}
   />
 
-  <main class="stage">
-    <div class="wash" aria-hidden="true">
-      <span class="blob a"></span>
-      <span class="blob b"></span>
-      <span class="stars"></span>
-      <span class="floor"><span class="grid"></span></span>
-      <span class="hum"></span>
-      <span class="hum r2"></span>
-      <span class="node"></span>
-      <span class="scan"></span>
-    </div>
+  <main class="stage" class:crystal>
     <div class="stage-body">
     {#if view === 'canvas'}
       <ElucifiaCanvas
@@ -879,6 +1154,7 @@
         onprofile={openProfile}
         onspeak={(text, event) => speakText(text, event)}
         onfork={beginEdit}
+        ondelete={deleteTurn}
         onregen={(text) => send(text)}
         onpin={(event) => distill(event)}
       />
@@ -929,12 +1205,30 @@
       {voice}
       {jobs}
       {peerLines}
+      {peerUp}
+      chatLane={lane}
+      {voiceLane}
+      {model}
+      {streaming}
+      {speaking}
+      {gpuSeries}
+      {perfSeries}
+      {memoryCounts}
+      {turns}
+      {pinging}
+      {peerLatched}
+      {restarting}
+      {restartArmed}
+      {receipt}
+      {receiptTick}
       onroom={(next) => (room = next)}
       onclose={() => (inspector = false)}
       onopen={() => (inspector = true)}
       onmood={(next, event) => setMood(next as Mood, event)}
       ondistill={(event) => distill(event)}
       ondream={dream}
+      onping={() => void pingPeer()}
+      onrestart={() => void restartPeer()}
     />
   {/if}
 
@@ -968,7 +1262,7 @@
 <style>
   .studio {
     --obsidian: #0d0912;
-    --glass: rgba(22, 15, 29, 0.88);
+    --glass: rgba(22, 15, 29, 0.77);
     --serif: "Cormorant Garamond", Cinzel, "Iowan Old Style", Palatino, Georgia, serif;
     position: relative;
     display: grid;
@@ -1001,7 +1295,22 @@
   .card { display: grid; width: 100%; text-align: left; padding: 0.45rem 0.55rem; margin: 0.25rem 0; }
   .card span, .lede, .mark-line, .think { color: #cbb8d0; font-size: 0.78rem; }
   .chip-row i { width: 0.55rem; height: 0.55rem; border-radius: 99px; display: inline-block; }
-  .stage { isolation: isolate; position: relative; display: flex; flex-direction: column; min-width: 0; min-height: 0; height: 100%; overflow: hidden; padding: 0.75rem 2.1rem 0.6rem; }
+  .stage { position: relative; z-index: 1; display: flex; flex-direction: column; min-width: 0; min-height: 0; height: 100%; overflow: hidden; padding: 0.75rem 2.1rem 0.6rem; }
+  .stage.crystal::after {
+    content: "✦";
+    position: absolute;
+    top: 1.2rem;
+    right: 2.4rem;
+    color: #e7d6f2;
+    font-size: 1.4rem;
+    pointer-events: none;
+    animation: crystal-pop 1.3s ease;
+  }
+  @keyframes crystal-pop {
+    0% { opacity: 0; transform: scale(0.6); }
+    35% { opacity: 1; transform: scale(1); }
+    100% { opacity: 0; transform: translateY(-8px); }
+  }
   .stage-body { position: relative; z-index: 1; display: flex; flex-direction: column; flex: 1 1 auto; min-height: 0; min-width: 0; overflow: hidden; }
   .wash { position: absolute; inset: 0; z-index: 0; overflow: hidden; pointer-events: none; }
   .stage > :global(:not(.wash)) { position: relative; z-index: 1; }

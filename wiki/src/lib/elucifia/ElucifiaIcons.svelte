@@ -59,5 +59,17 @@
     <circle cx="12" cy="8" r="3" fill="none" stroke="currentColor" stroke-width="2" /><path d="M5 19c1.5-3 3.5-4 7-4s5.5 1 7 4" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" />
   {:else if name === 'spark'}
     <path d="M12 3l1.5 5.5L19 10l-5.5 1.5L12 17l-1.5-5.5L5 10l5.5-1.5L12 3z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" />
+  {:else if name === 'close'}
+    <path d="M6 6l12 12M18 6L6 18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" />
+  {:else if name === 'gpu'}
+    <rect x="3" y="7" width="18" height="10" rx="2" fill="none" stroke="currentColor" stroke-width="2" /><path d="M7 11h4M7 14h2M14 11h3M14 14h3" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" />
+  {:else if name === 'pulse'}
+    <path d="M3 12h4l2-5 4 10 2-5h6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
+  {:else if name === 'memory'}
+    <path d="M7 4h10v16H7zM10 8h4M10 12h4M10 16h4" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" />
+  {:else if name === 'clock'}
+    <circle cx="12" cy="12" r="8" fill="none" stroke="currentColor" stroke-width="2" /><path d="M12 8v5l3 2" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" />
+  {:else if name === 'layers'}
+    <path d="M12 4l8 4-8 4-8-4 8-4zM4 12l8 4 8-4M4 16l8 4 8-4" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" />
   {/if}
 </svg>

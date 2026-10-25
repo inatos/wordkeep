@@ -25,14 +25,14 @@
   }
 
   const tools = [
-    { name: 'bold', title: 'Bold', before: '**', after: '**' },
-    { name: 'italic', title: 'Italic', before: '*', after: '*' },
-    { name: 'code', title: 'Inline code', before: '`', after: '`' },
-    { name: 'code', title: 'Code block', before: '```\n', after: '\n```' },
-    { name: 'heading', title: 'Heading', before: '## ', after: '' },
-    { name: 'list', title: 'Bullet list', before: '- ', after: '' },
-    { name: 'quote', title: 'Quote', before: '> ', after: '' },
-    { name: 'link', title: 'Link', before: '[', after: '](https://)' },
+    { name: 'bold', title: 'Bold. Wraps the selection in **.', before: '**', after: '**' },
+    { name: 'italic', title: 'Italic. Wraps the selection in *.', before: '*', after: '*' },
+    { name: 'code', title: 'Inline code. Wraps the selection in backticks.', before: '`', after: '`' },
+    { name: 'code', title: 'Code block. Wraps the selection in a fenced block.', before: '```\n', after: '\n```' },
+    { name: 'heading', title: 'Heading. Prefixes the selection with ##.', before: '## ', after: '' },
+    { name: 'list', title: 'Bullet list. Prefixes the selection with a dash.', before: '- ', after: '' },
+    { name: 'quote', title: 'Quote. Prefixes the selection with >.', before: '> ', after: '' },
+    { name: 'link', title: 'Link. Wraps the selection as link text.', before: '[', after: '](https://)' },
   ];
 </script>
 
@@ -42,7 +42,7 @@
       <Icon name={tool.name} size="0.95rem" />
     </button>
   {/each}
-  <button type="button" class="icon-btn preview" class:on={preview} title={preview ? 'Write' : 'Preview'} aria-label={preview ? 'Write' : 'Preview'} onclick={() => (preview = !preview)}>
+  <button type="button" class="icon-btn preview" class:on={preview} title={preview ? 'Return to the editor.' : 'Show the rendered draft.'} aria-label={preview ? 'Return to the editor' : 'Show the rendered draft'} onclick={() => (preview = !preview)}>
     <Icon name={preview ? 'pencil' : 'eye'} size="0.95rem" />
     <span>{preview ? 'Write' : 'Preview'}</span>
   </button>

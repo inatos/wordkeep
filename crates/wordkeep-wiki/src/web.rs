@@ -117,6 +117,7 @@ pub(crate) async fn serve(
         .route("/api/runtime/ecs-optimize", post(runtime_ecs))
         .route("/api/elucifia/status", get(elucifia_status))
         .route("/api/elucifia/peer", get(elucifia_peer))
+        .route("/api/elucifia/peer/restart", post(elucifia_peer_restart))
         .route("/api/elucifia/peer/events", get(elucifia_peer_events))
         .route("/api/elucifia/threads", get(elucifia_threads))
         .route("/api/elucifia/jobs", get(elucifia_jobs).post(elucifia_jobs_post))
@@ -998,6 +999,20 @@ async fn elucifia_status(State(state): State<AppState>) -> Json<Value> {
 
 async fn elucifia_peer(State(state): State<AppState>) -> Json<Value> {
     Json(crate::elucifia::peer_status(&state.root))
+}
+
+async fn elucifia_peer_restart(State(state): State<AppState>) -> Json<Value> {
+    let root = state.root.clone();
+    let value = tokio::task::spawn_blocking(move || crate::elucifia::peer_restart(&root))
+        .await
+        .unwrap_or_else(|_| {
+            json!({
+                "reachable": false,
+                "ok": false,
+                "lines": [{"lane": "feed", "ok": false, "detail": "no peer to restart"}]
+            })
+        });
+    Json(value)
 }
 
 async fn elucifia_peer_events(State(state): State<AppState>) -> Response {

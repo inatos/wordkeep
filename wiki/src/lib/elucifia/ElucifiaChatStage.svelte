@@ -29,6 +29,7 @@
     onprofile,
     onspeak,
     onfork,
+    ondelete,
     onregen,
     onpin,
   }: {
@@ -58,9 +59,21 @@
     onprofile: (name: string) => void;
     onspeak: (text: string, event: MouseEvent) => void;
     onfork: (index: number) => void;
+    ondelete: (index: number) => void;
     onregen: (text: string) => void;
     onpin: (event: MouseEvent) => void;
   } = $props();
+
+  let armed = $state(-1);
+  let scroller: HTMLDivElement | null = $state(null);
+  let fade = $state(
+    typeof location !== 'undefined' && new URLSearchParams(location.search).get('fade') === '1' ? 1 : 0,
+  );
+
+  function onScroll() {
+    const top = scroller?.scrollTop ?? 0;
+    fade = Math.max(0, Math.min(1, top / 50));
+  }
 </script>
 
 <div class="column">
@@ -80,7 +93,7 @@
   </div>
   <TagBar {tags} {palette} onchange={ontags} onpalette={ontagpalette} />
 </header>
-<div class="stream">
+<div class="stream" bind:this={scroller} onscroll={onScroll} style:--fade={fade}>
   {#if !turns.length}
     <div class="welcome"><span>✦</span><h2>Seraphina Elucifia</h2><p>The Atheneum is listening. {book} is the active book.</p></div>
   {/if}
@@ -97,11 +110,12 @@
         {#if showThinking && turn.thoughts}<pre class="think">{turn.thoughts}</pre>{/if}
         <footer class="bubble-foot">
           <div class="acts">
-            <button type="button" onclick={(e) => onspeak(turn.content, e)}><Icon name="speak" size="0.85rem" /> Speak</button>
-            <button type="button" onclick={() => onfork(index)}><Icon name="fork" size="0.85rem" /> Edit & Fork</button>
-            <button type="button" onclick={() => onregen(turn.role === 'user' ? turn.content : 'Continue from the last line.')}><Icon name="regen" size="0.85rem" /> Regenerate</button>
-            <button type="button" onclick={() => navigator.clipboard.writeText(turn.content)}><Icon name="copy" size="0.85rem" /> Copy</button>
-            <button type="button" onclick={onpin}><Icon name="pin" size="0.85rem" /> Pin to Lorekeep</button>
+            <button type="button" title="Read this message aloud" onclick={(e) => onspeak(turn.content, e)}><Icon name="speak" size="0.85rem" /> Speak</button>
+            <button type="button" title="Rewrite this message and drop every reply after it, including forks that continued from here" onclick={() => onfork(index)}><Icon name="fork" size="0.85rem" /> Edit</button>
+            <button type="button" title="Remove this message and every reply after it, including forks that continued from here" onclick={() => { if (armed === index) { armed = -1; ondelete(index); } else armed = index; }}>{armed === index ? 'Drop chain' : 'Delete'}</button>
+            <button type="button" title="Ask again from this message" onclick={() => onregen(turn.role === 'user' ? turn.content : 'Continue from the last line.')}><Icon name="regen" size="0.85rem" /> Regenerate</button>
+            <button type="button" title="Copy this message" onclick={() => navigator.clipboard.writeText(turn.content)}><Icon name="copy" size="0.85rem" /> Copy</button>
+            <button type="button" title="Distill this thread into Lorekeep" onclick={onpin}><Icon name="pin" size="0.85rem" /> Pin to Lorekeep</button>
           </div>
           <span class="mark-line">{turn.role === 'user' ? 'Inatos' : 'Seraphina Elucifia'} · {model} · {turn.mood || mood} · {turn.tok_per_sec || lane}</span>
         </footer>
@@ -126,15 +140,15 @@
   .avatar.hers:hover { filter: brightness(1.2); box-shadow: 0 0 22px #ff8c42; }
   button { border: 1px solid rgba(201, 111, 208, 0.35); background: rgba(13, 9, 18, 0.55); color: inherit; border-radius: 0.7rem; }
   .on { border-color: #ff8c42; }
-  .stream { flex: 1 1 auto; min-height: 0; overflow: auto; width: min(850px, 100%); margin: 0 auto; display: grid; align-content: start; gap: 0.8rem; padding-top: 0.35rem; }
+  .stream { --fade: 0; flex: 1 1 auto; min-height: 0; overflow: auto; width: min(850px, 100%); margin: 0 auto; display: grid; align-content: start; gap: 0.8rem; padding: 2.6rem 2.4rem 2.8rem; -webkit-mask-image: linear-gradient(to bottom, rgba(0, 0, 0, calc(1 - var(--fade))) 0, #000 calc(var(--fade) * 3.85rem)); mask-image: linear-gradient(to bottom, rgba(0, 0, 0, calc(1 - var(--fade))) 0, #000 calc(var(--fade) * 3.85rem)); }
   .welcome { text-align: center; padding: 2rem 0 1rem; }
   .welcome p { color: #f3e6d4; font-family: "Cormorant Garamond", Georgia, serif; font-size: 1.15rem; }
-  .welcome span { font-size: 2rem; color: #ff8c42; text-shadow: 0 0 18px #ff8c42; }
+  .welcome span { display: inline-grid; place-items: center; width: 3.1rem; height: 3.1rem; border-radius: 999px; font-size: 1.35rem; color: #1a0d12; background: #ff8c42; box-shadow: 0 0 28px 8px rgba(255, 140, 66, 0.85); }
   .msg { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 0.6rem; justify-items: start; }
   .msg.user { grid-template-columns: minmax(0, 1fr) auto; justify-items: end; }
   .msg.user .avatar { grid-column: 2; grid-row: 1; }
   .msg.user .bubble { grid-column: 1; grid-row: 1; justify-self: end; }
-  .avatar { width: 2.4rem; height: 2.4rem; border-radius: 999px; border: 0; color: #1a0d12; background: var(--bubble); box-shadow: 0 0 16px var(--bubble); }
+  .avatar { width: 2.4rem; height: 2.4rem; border-radius: 999px; border: 0; color: #1a0d12; background: var(--bubble); box-shadow: 0 0 22px 4px var(--bubble); }
   .bubble { max-width: min(760px, 100%); padding: 0.75rem 0.9rem 0.55rem; border-radius: 1rem; background: rgba(22, 15, 29, 0.78); border: 1px solid rgba(255, 140, 66, 0.2); }
   .bubble-foot { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: flex-end; gap: 0.45rem; margin-top: 0.55rem; }
   .acts { display: flex; flex-wrap: wrap; gap: 0.25rem; }

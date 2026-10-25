@@ -177,7 +177,7 @@
 <style>
   .rail { position: relative; z-index: 4; align-self: stretch; width: 18rem; height: 100%; min-height: 0; overflow: visible; transition: width 0.22s cubic-bezier(0.4, 0, 0.2, 1); }
   .rail.collapsed { width: 4.35rem; }
-  .drawer { display: flex; flex-direction: column; width: 100%; height: 100%; min-height: 0; padding: 0; background: rgba(22, 15, 29, 0.88); backdrop-filter: blur(14px); border-right: 1px solid rgba(201, 111, 208, 0.28); overflow: hidden; color: #f4ecf6; font-family: "IBM Plex Sans", sans-serif; }
+  .drawer { display: flex; flex-direction: column; width: 100%; height: 100%; min-height: 0; padding: 0; background: rgba(22, 15, 29, 0.77); backdrop-filter: blur(14px); border-right: 1px solid rgba(201, 111, 208, 0.28); overflow: hidden; color: #f4ecf6; font-family: "IBM Plex Sans", sans-serif; }
   .scroll { flex: 1; min-height: 0; overflow: auto; padding: 0.8rem; }
   .rail.collapsed .scroll { padding-inline: 0.4rem; }
   .edge { position: absolute; left: calc(100% - 1px); top: 1.15rem; width: 1.35rem; height: 2.75rem; padding: 0; display: grid; place-items: center; border-radius: 0 10px 10px 0; border: 1px solid rgba(201, 111, 208, 0.55); border-left: 0; background: rgba(22, 15, 29, 0.94); color: #ff8c42; z-index: 5; pointer-events: auto; transition: width 0.2s cubic-bezier(0.22, 1, 0.36, 1); }
@@ -186,10 +186,11 @@
   .edge.open svg { transform: rotate(180deg); }
   .edge:hover svg { transform: translateX(2px); }
   .edge.open:hover svg { transform: translateX(-2px) rotate(180deg); }
-  .tabs { display: grid; grid-template-columns: 1fr 1fr; gap: 0.35rem; margin-bottom: 0.7rem; }
-  .tabs.orbs { grid-template-columns: 1fr; justify-items: center; }
-  button, .find, .field, select { border: 1px solid rgba(201, 111, 208, 0.35); background: rgba(13, 9, 18, 0.72); color: #f4ecf6; border-radius: 0.7rem; color-scheme: dark; }
-  .tabs button { display: grid; justify-items: center; padding: 0.35rem; font-size: 0.72rem; }
+  .tabs { display: grid; grid-template-columns: 1fr; gap: 0.35rem; margin-bottom: 0.7rem; }
+  .tabs.orbs { justify-items: center; }
+  button, .find, .field, select { border: 1px solid rgba(201, 111, 208, 0.35); background: rgba(13, 9, 18, 0.42); color: #f4ecf6; border-radius: 0.7rem; color-scheme: dark; }
+  .tabs button { display: flex; align-items: center; justify-content: flex-start; gap: 0.45rem; padding: 0.4rem 0.65rem; font-size: 0.78rem; }
+  .tabs.orbs button { justify-content: center; padding: 0.35rem; }
   .tabs em { font-style: normal; }
   .on { border-color: #ff8c42; box-shadow: 0 0 16px rgba(255, 140, 66, 0.35); }
   .new, .find, .field, select { width: 100%; margin: 0.25rem 0; padding: 0.45rem 0.6rem; }

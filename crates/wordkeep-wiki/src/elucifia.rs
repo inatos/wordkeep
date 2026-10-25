@@ -2,7 +2,7 @@
 
 use elucifia_core::{
     aeron_host, chat_turn, dispatch, fetch_peer_status, menu_model, peer_base, post_peer_note,
-    stream_peer_events, unreachable_peer, ChatRequest,
+    post_peer_restart, stream_peer_events, unreachable_peer, ChatRequest,
 };
 use serde_json::{json, Value};
 use std::path::Path;
@@ -21,6 +21,37 @@ pub fn peer_status(root: &Path) -> Value {
 
 pub fn stream_peer(root: &Path, on_chunk: impl FnMut(&str) -> bool) -> Result<(), String> {
     stream_peer_events(&peer_base(&aeron_host(root)), on_chunk)
+}
+
+pub fn peer_restart(root: &Path) -> Value {
+    match post_peer_restart(&peer_base(&aeron_host(root))) {
+        Ok(mut value) => {
+            if let Some(lines) = value.get_mut("lines").and_then(Value::as_array_mut) {
+                lines.insert(
+                    0,
+                    json!({
+                        "lane": "feed",
+                        "ok": true,
+                        "detail": "Event stream reconnected"
+                    }),
+                );
+            }
+            if let Some(obj) = value.as_object_mut() {
+                obj.insert("reachable".into(), json!(true));
+            }
+            value
+        }
+        Err(_) => json!({
+            "reachable": false,
+            "ok": false,
+            "lines": [
+                {"lane": "feed", "ok": false, "detail": "no peer to restart"},
+                {"lane": "ollama", "ok": false, "detail": "no peer to restart"},
+                {"lane": "copper", "ok": false, "detail": "no peer to restart"},
+                {"lane": "voice", "ok": false, "detail": "no peer to restart"}
+            ]
+        }),
+    }
 }
 
 pub fn chat_stream(root: &Path, body: &str, on_token: &mut dyn FnMut(&str)) -> Result<Value, String> {

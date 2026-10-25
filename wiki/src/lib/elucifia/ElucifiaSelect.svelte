@@ -9,6 +9,7 @@
     label = '',
     up = false,
     ariaLabel = 'Choose',
+    title = '',
     startOpen = false,
     onchange,
   }: {
@@ -17,6 +18,7 @@
     label?: string;
     up?: boolean;
     ariaLabel?: string;
+    title?: string;
     startOpen?: boolean;
     onchange?: (value: string) => void;
   } = $props();
@@ -66,7 +68,7 @@
 
 <div class="combo" class:up>
   {#if label}<span class="label">{label}</span>{/if}
-  <button type="button" class="face" aria-label={ariaLabel} aria-expanded={open} onclick={toggle}>
+  <button type="button" class="face" aria-label={ariaLabel} title={title || ariaLabel} aria-expanded={open} onclick={toggle}>
     <span>{current?.label || value || 'Choose'}</span>
     <Icon name="search" size="0.8rem" />
   </button>
@@ -96,6 +98,7 @@
 
 <style>
   .combo { position: relative; display: grid; gap: 0.2rem; min-width: 8rem; }
+  .combo.up { position: static; }
   .label { color: #a894ab; font-size: 0.75rem; }
   .face, input, .pop button {
     border: 1px solid rgba(201, 111, 208, 0.45);
@@ -118,7 +121,7 @@
     border-radius: 0.8rem;
     box-shadow: 0 14px 34px rgba(0, 0, 0, 0.65);
   }
-  .up .pop { top: auto; bottom: calc(100% + 0.25rem); }
+  .up .pop { top: 3.6rem; right: 0.65rem; bottom: 0.55rem; left: 0.65rem; width: auto; max-height: none; overflow: auto; }
   input { padding: 0.3rem 0.45rem; }
   ul { list-style: none; margin: 0; padding: 0; max-height: 12rem; overflow: auto; }
   .pop button { display: flex; align-items: center; gap: 0.3rem; width: 100%; text-align: left; padding: 0.3rem 0.45rem; }
