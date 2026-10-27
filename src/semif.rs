@@ -442,20 +442,15 @@ impl Scorer for RemoteCopperScorer {
             }
         });
 
-        // Caps missing → do not hot-loop AF_PACKET.
+        // Caps missing → do not hot-loop AF_PACKET; cascade Aeron → GGUF → heuristic.
         if let Some(h) = copper_health::read_cached(&self.root) {
             if !h.can_probe() {
-                eprintln!(
-                    "[wordkeep] remote-copper caps={}; heuristic fallback (no ping spin)",
-                    h.caps
+                copper_health::mark_down_cooldown(&self.root);
+                return cascade_after_copper_fail(
+                    &self.root,
+                    req,
+                    &format!("caps_missing:{}", h.caps),
                 );
-                semif_telemetry::record_event(serde_json::json!({
-                    "kind": "copper_blip",
-                    "backend": "remote-copper",
-                    "fallback": "heuristic",
-                    "reason": "caps_missing",
-                }));
-                return HeuristicScorer.score_one(req);
             }
         }
 
@@ -536,17 +531,82 @@ impl Scorer for RemoteCopperScorer {
         }
 
         copper_health::mark_down_cooldown(&self.root);
+        cascade_after_copper_fail(
+            &self.root,
+            req,
+            &format!("backoff_exhausted:{last_err}"),
+        )
+    }
+}
+
+/// After Copper mid-call / caps failure: re-resolve Aeron → GGUF → heuristic.
+/// Explicit `WORDKEEP_SEMIF_BACKEND=remote-copper|copper` stays heuristic-only (no cascade).
+fn cascade_after_copper_fail(
+    root: &Path,
+    req: &DecisionRequest,
+    reason: &str,
+) -> Result<Vec<(String, f64)>, String> {
+    let backend = config::semif_backend(root);
+    if matches!(backend.as_str(), "remote-copper" | "copper") {
         eprintln!(
-            "[wordkeep] remote-copper failed after backoff ({last_err}); heuristic fallback"
+            "[wordkeep] remote-copper pinned; heuristic fallback ({reason})"
         );
         semif_telemetry::record_event(serde_json::json!({
             "kind": "copper_blip",
             "backend": "remote-copper",
             "fallback": "heuristic",
-            "reason": last_err,
+            "reason": reason,
+            "cascade": false,
         }));
-        HeuristicScorer.score_one(req)
+        return HeuristicScorer.score_one(req);
     }
+
+    if copper_health::prefer_aeron(root) {
+        eprintln!("[wordkeep] remote-copper failed; cascade → remote-aeron ({reason})");
+        semif_telemetry::record_event(serde_json::json!({
+            "kind": "copper_blip",
+            "backend": "remote-copper",
+            "fallback": "remote-aeron",
+            "reason": reason,
+            "cascade": true,
+        }));
+        match aeron_scorer(root).score_one(req) {
+            Ok(scores) => return Ok(scores),
+            Err(e) => {
+                eprintln!("[wordkeep] remote-aeron cascade failed: {e}");
+            }
+        }
+    }
+
+    #[cfg(feature = "ereshkigal")]
+    {
+        match resolve_ereshkigal(root, true) {
+            ResolvedScorer::Ready(s, _) => {
+                eprintln!("[wordkeep] remote-copper failed; cascade → ereshkigal ({reason})");
+                semif_telemetry::record_event(serde_json::json!({
+                    "kind": "copper_blip",
+                    "backend": "remote-copper",
+                    "fallback": "ereshkigal",
+                    "reason": reason,
+                    "cascade": true,
+                }));
+                return s.score_one(req);
+            }
+            ResolvedScorer::Unavailable(e) => {
+                eprintln!("[wordkeep] ereshkigal cascade unavailable: {e}");
+            }
+        }
+    }
+
+    eprintln!("[wordkeep] remote-copper failed; cascade → heuristic ({reason})");
+    semif_telemetry::record_event(serde_json::json!({
+        "kind": "copper_blip",
+        "backend": "remote-copper",
+        "fallback": "heuristic",
+        "reason": reason,
+        "cascade": true,
+    }));
+    HeuristicScorer.score_one(req)
 }
 
 fn resolve_ereshkigal(root: &Path, for_decide: bool) -> ResolvedScorer {
@@ -1502,6 +1562,41 @@ mod tests {
         let r = decide_one(scorer.as_ref(), &support_req(), unknown);
         assert!(r.fallback);
         assert_eq!(r.chosen, "yes");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn copper_fail_cascade_pinned_stays_heuristic() {
+        let dir = std::env::temp_dir().join(format!("wk_semif_cu_pin_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".wordkeep")).unwrap();
+        std::fs::write(
+            dir.join(".wordkeep/config.json"),
+            r#"{"semif":{"enabled":true,"backend":"remote-copper"}}"#,
+        )
+        .unwrap();
+        let scores = cascade_after_copper_fail(&dir, &support_req(), "test_pinned")
+            .expect("heuristic cascade");
+        assert!(!scores.is_empty());
+        let ids: Vec<_> = scores.iter().map(|(id, _)| id.as_str()).collect();
+        assert!(ids.contains(&"yes") || ids.contains(&"no"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn copper_fail_cascade_auto_reaches_heuristic_without_aeron() {
+        let dir = std::env::temp_dir().join(format!("wk_semif_cu_auto_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".wordkeep")).unwrap();
+        std::fs::write(
+            dir.join(".wordkeep/config.json"),
+            r#"{"semif":{"enabled":true,"backend":"auto"}}"#,
+        )
+        .unwrap();
+        // No aeron-cli / ereshkigal in temp tree → cascade ends at heuristic.
+        let scores = cascade_after_copper_fail(&dir, &support_req(), "test_auto")
+            .expect("heuristic cascade");
+        assert!(!scores.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
