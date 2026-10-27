@@ -20,6 +20,8 @@ tower-http = { version = "0.6", features = ["fs"] }
 walkdir = "2"
 wordkeep-knowledge = { path = "../wordkeep-knowledge" }
 elucifia-core = { path = "../../../elucifia/elucifia-core" }
+bellator-core = { path = "../../../bellator/crates/bellator-core" }
+bellator-runners = { path = "../../../bellator/crates/bellator-runners" }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [

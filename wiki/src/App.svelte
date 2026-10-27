@@ -57,9 +57,10 @@
   import EreshkigalBoard from './lib/EreshkigalBoard.svelte';
   import ShriftBoard from './lib/ShriftBoard.svelte';
   import ElucifiaBoard from './lib/ElucifiaBoard.svelte';
+  import BellatorBoard from './lib/BellatorBoard.svelte';
   import ProviderBoard from './lib/ProviderBoard.svelte';
 
-  type Tab = 'search' | 'reader' | 'dashboard' | 'health' | 'shrift' | 'elucifia';
+  type Tab = 'search' | 'reader' | 'dashboard' | 'health' | 'shrift' | 'elucifia' | 'bellator';
   type EditorTab = { path: string; pinned: boolean };
   type SortKey =
     | 'name'
@@ -76,7 +77,7 @@
     | 'peak_saved'
     | 'last_ts';
 
-  const TABS: Tab[] = ['search', 'reader', 'dashboard', 'health', 'shrift', 'elucifia'];
+  const TABS: Tab[] = ['search', 'reader', 'dashboard', 'health', 'shrift', 'elucifia', 'bellator'];
   const SIDEBAR_MIN = 240;
   const SIDEBAR_MAX = 720;
   const SIDEBAR_DEFAULT = 320;
@@ -94,7 +95,7 @@
       : 'search'
   );
   let healthView = $state<'runtime' | 'knowledge'>('runtime');
-  let dashView = $state<'telemetry' | 'izakaya' | 'ereshkigal' | 'providers'>('telemetry');
+  let dashView = $state<'telemetry' | 'izakaya' | 'ereshkigal' | 'bellator' | 'providers'>('telemetry');
   let dashQuery = $state('');
   let urlReady = $state(false);
   let query = $state('');
@@ -293,11 +294,13 @@
     else if (tab === 'health') url.searchParams.set('view', 'knowledge');
     else if (tab === 'dashboard' && dashView === 'izakaya') url.searchParams.set('view', 'izakaya');
     else if (tab === 'dashboard' && dashView === 'ereshkigal') url.searchParams.set('view', 'ereshkigal');
+    else if (tab === 'dashboard' && dashView === 'bellator') url.searchParams.set('view', 'bellator');
     else if (tab === 'dashboard' && dashView === 'providers') url.searchParams.set('view', 'providers');
     else url.searchParams.delete('view');
     if (tab === 'dashboard' && dashQuery.trim()) url.searchParams.set('dq', dashQuery.trim());
     else if (tab === 'shrift' && dashQuery.trim()) url.searchParams.set('dq', dashQuery.trim());
     else if (tab === 'elucifia' && dashQuery.trim()) url.searchParams.set('dq', dashQuery.trim());
+    else if (tab === 'bellator' && dashQuery.trim()) url.searchParams.set('dq', dashQuery.trim());
     else url.searchParams.delete('dq');
     const next = `${url.pathname}${url.search}${url.hash}`;
     const cur = `${location.pathname}${location.search}${location.hash}`;
@@ -472,6 +475,7 @@
     if (view === 'runtime' || view === 'knowledge') healthView = view;
     if (view === 'izakaya') dashView = 'izakaya';
     if (view === 'ereshkigal') dashView = 'ereshkigal';
+    if (view === 'bellator') dashView = 'bellator';
     if (view === 'providers') dashView = 'providers';
     const dq = params.get('dq');
     if (dq) dashQuery = dq;
@@ -1360,7 +1364,11 @@
 
 {#if studioStandalone}
   <div class="studio-standalone">
-    <ElucifiaBoard />
+    {#if tab === 'bellator'}
+      <BellatorBoard />
+    {:else}
+      <ElucifiaBoard />
+    {/if}
   </div>
 {:else}
 <div
@@ -1501,6 +1509,23 @@
             stroke="currentColor"
             stroke-width="2"
             stroke-linecap="round"
+          /></svg
+        >
+      </button>
+      <button
+        class="icon-btn"
+        class:active={tab === 'bellator'}
+        title="Bellator — Nexus Admin-Sec Control Plane, Scheduled Scans & ClamAV"
+        aria-label="Bellator Admin-Sec"
+        onclick={() => setTab('bellator')}
+      >
+        <svg viewBox="0 0 24 24" aria-hidden="true"
+          ><path
+            d="M12 3l7 3v6c0 4.5-3 7.8-7 9-4-1.2-7-4.5-7-9V6l7-3z"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="2"
+            stroke-linejoin="round"
           /></svg
         >
       </button>
@@ -2682,6 +2707,11 @@
           >
           <button
             class="subview-btn"
+            class:active={dashView === 'bellator'}
+            onclick={() => (dashView = 'bellator')}>Bellator</button
+          >
+          <button
+            class="subview-btn"
             class:active={dashView === 'providers'}
             onclick={() => (dashView = 'providers')}>{providerPageLabel}</button
           >
@@ -2715,6 +2745,11 @@
           />
         {:else if dashView === 'ereshkigal'}
           <EreshkigalBoard query={dashQuery} />
+        {:else if dashView === 'bellator'}
+          <BellatorBoard
+            query={dashQuery}
+            onOpenStudio={() => setTab('bellator')}
+          />
         {:else if dashView === 'providers'}
           {#if dashboardError}
             <p class="muted">Dashboard unavailable: <code>{dashboardError}</code></p>
@@ -3351,6 +3386,10 @@
     {:else if tab === 'elucifia'}
       <section class="dashboard panel enter studio-pane">
         <ElucifiaBoard />
+      </section>
+    {:else if tab === 'bellator'}
+      <section class="dashboard panel enter studio-pane">
+        <BellatorBoard query={dashQuery} />
       </section>
     {:else}
       <div class="health-wrap">

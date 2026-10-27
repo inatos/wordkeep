@@ -1,3 +1,4 @@
+mod bellator;
 mod config;
 mod elucifia;
 mod dashboard;

@@ -128,6 +128,24 @@ pub(crate) async fn serve(
         .route("/api/elucifia/speak", post(elucifia_speak))
         .route("/api/elucifia/gallery/:job/:name", get(elucifia_gallery_file))
         .route("/api/elucifia/:route", get(elucifia_route_get).post(elucifia_route_post))
+        .route("/api/bellator/dashboard", get(bellator_dashboard))
+        .route("/api/bellator/live", get(bellator_live))
+        .route("/api/bellator/events", get(bellator_events))
+        .route("/api/bellator/findings", get(bellator_findings))
+        .route("/api/bellator/triage", get(bellator_triage_get).put(bellator_triage_put))
+        .route("/api/bellator/runs", get(bellator_runs))
+        .route("/api/bellator/runs/compare", get(bellator_compare))
+        .route("/api/bellator/runs/:id", get(bellator_run_detail))
+        .route("/api/bellator/scans", post(bellator_start_scan))
+        .route("/api/bellator/scans/pause", post(bellator_pause_scan))
+        .route("/api/bellator/scans/cancel", post(bellator_cancel_scan))
+        .route("/api/bellator/schedule", get(bellator_schedule_get))
+        .route("/api/bellator/schedule/toggle", post(bellator_schedule_toggle))
+        .route("/api/bellator/schedule/install-user", post(bellator_schedule_install_user))
+        .route("/api/bellator/policy", get(bellator_policy_get))
+        .route("/api/bellator/suppressions/draft", post(bellator_suppressions_draft))
+        .route("/api/bellator/explain/:id", get(bellator_explain))
+        .route("/api/bellator/sync-defects", post(bellator_sync_defects))
         .with_state(state);
 
     let dist = resolve_wiki_dist();
@@ -1122,6 +1140,205 @@ async fn elucifia_chat(State(state): State<AppState>, Json(body): Json<Value>) -
     let stream = tokio_stream::wrappers::ReceiverStream::new(rx)
         .map(|data| Ok::<_, Infallible>(SseEvent::default().data(data)));
     Sse::new(stream).into_response()
+}
+
+#[derive(Default, Deserialize)]
+struct BellatorFindingsQuery {
+    run_id: Option<String>,
+    severity: Option<String>,
+    tool: Option<String>,
+    status: Option<String>,
+    q: Option<String>,
+}
+
+#[derive(Default, Deserialize)]
+struct BellatorCompareQuery {
+    base: String,
+    head: String,
+}
+
+fn require_bellator_mutation(headers: &HeaderMap) -> Result<(), ApiError> {
+    if !origin_ok(headers) {
+        return Err(api_error(StatusCode::FORBIDDEN, "origin not allowed"));
+    }
+    let csrf = headers
+        .get("x-bellator-csrf")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if csrf != "bellator-local" {
+        return Err(api_error(
+            StatusCode::FORBIDDEN,
+            "missing or invalid x-bellator-csrf header",
+        ));
+    }
+    Ok(())
+}
+
+async fn bellator_dashboard(State(state): State<AppState>) -> Json<Value> {
+    let root = state.root.clone();
+    let val = tokio::task::spawn_blocking(move || crate::bellator::dashboard(&root))
+        .await
+        .unwrap_or_else(|_| json!({"error": "bellator dashboard task panicked"}));
+    Json(val)
+}
+
+async fn bellator_live(State(state): State<AppState>) -> Json<Value> {
+    Json(crate::bellator::live(&state.root))
+}
+
+async fn bellator_events(State(state): State<AppState>) -> Response {
+    let root = state.root.clone();
+    let (tx, rx) = tokio::sync::mpsc::channel::<String>(32);
+    tokio::task::spawn_blocking(move || {
+        crate::bellator::stream_events(&root, |chunk| tx.blocking_send(chunk.to_string()).is_ok());
+    });
+    let stream = tokio_stream::wrappers::ReceiverStream::new(rx)
+        .map(|data| Ok::<_, Infallible>(SseEvent::default().data(data)));
+    Sse::new(stream).keep_alive(KeepAlive::default()).into_response()
+}
+
+async fn bellator_findings(
+    State(state): State<AppState>,
+    Query(q): Query<BellatorFindingsQuery>,
+) -> Json<Value> {
+    Json(crate::bellator::findings(
+        &state.root,
+        q.run_id.as_deref(),
+        q.severity.as_deref(),
+        q.tool.as_deref(),
+        q.status.as_deref(),
+        q.q.as_deref(),
+    ))
+}
+
+async fn bellator_triage_get(State(state): State<AppState>) -> Json<Value> {
+    Json(crate::bellator::triage_list(&state.root))
+}
+
+async fn bellator_triage_put(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> ApiResult {
+    require_bellator_mutation(&headers)?;
+    crate::bellator::triage_upsert(&state.root, &body)
+        .map(Json)
+        .map_err(|e| api_error(StatusCode::BAD_REQUEST, e))
+}
+
+async fn bellator_runs(State(state): State<AppState>) -> Json<Value> {
+    Json(crate::bellator::runs(&state.root))
+}
+
+async fn bellator_run_detail(
+    State(state): State<AppState>,
+    RoutePath(id): RoutePath<String>,
+) -> ApiResult {
+    crate::bellator::run_detail(&state.root, &id)
+        .map(Json)
+        .map_err(|e| api_error(StatusCode::NOT_FOUND, e))
+}
+
+async fn bellator_compare(
+    State(state): State<AppState>,
+    Query(q): Query<BellatorCompareQuery>,
+) -> ApiResult {
+    crate::bellator::compare(&state.root, &q.base, &q.head)
+        .map(Json)
+        .map_err(|e| api_error(StatusCode::NOT_FOUND, e))
+}
+
+async fn bellator_start_scan(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> ApiResult {
+    require_bellator_mutation(&headers)?;
+    crate::bellator::start_scan(&state.root, &body)
+        .map(Json)
+        .map_err(|e| api_error(StatusCode::CONFLICT, e))
+}
+
+async fn bellator_pause_scan(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> ApiResult {
+    require_bellator_mutation(&headers)?;
+    let pause = body.get("pause").and_then(Value::as_bool).unwrap_or(true);
+    Ok(Json(crate::bellator::pause_scan(&state.root, pause)))
+}
+
+async fn bellator_cancel_scan(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> ApiResult {
+    require_bellator_mutation(&headers)?;
+    let id = body.get("run_id").and_then(Value::as_str);
+    Ok(Json(crate::bellator::cancel_scan(&state.root, id)))
+}
+
+async fn bellator_schedule_get(State(state): State<AppState>) -> Json<Value> {
+    Json(crate::bellator::schedule_get(&state.root))
+}
+
+async fn bellator_schedule_toggle(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> ApiResult {
+    require_bellator_mutation(&headers)?;
+    crate::bellator::schedule_toggle(&state.root, &body)
+        .map(Json)
+        .map_err(|e| api_error(StatusCode::BAD_REQUEST, e))
+}
+
+async fn bellator_schedule_install_user(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> ApiResult {
+    require_bellator_mutation(&headers)?;
+    let root = state.root.clone();
+    let res = tokio::task::spawn_blocking(move || crate::bellator::schedule_install_user(&root))
+        .await
+        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    res.map(Json)
+        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e))
+}
+
+async fn bellator_policy_get(State(state): State<AppState>) -> Json<Value> {
+    Json(crate::bellator::policy_get(&state.root))
+}
+
+async fn bellator_suppressions_draft(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> ApiResult {
+    require_bellator_mutation(&headers)?;
+    crate::bellator::suppressions_draft(&state.root, &body)
+        .map(Json)
+        .map_err(|e| api_error(StatusCode::BAD_REQUEST, e))
+}
+
+async fn bellator_explain(
+    State(state): State<AppState>,
+    RoutePath(id): RoutePath<String>,
+) -> Json<Value> {
+    Json(crate::bellator::explain(&state.root, &id))
+}
+
+async fn bellator_sync_defects(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> ApiResult {
+    require_bellator_mutation(&headers)?;
+    let run_id = body.get("run_id").and_then(Value::as_str);
+    crate::bellator::sync_defects(&state.root, run_id)
+        .map(Json)
+        .map_err(|e| api_error(StatusCode::BAD_REQUEST, e))
 }
 
 fn read_page(state: &AppState, requested: &str) -> Result<(String, String), ApiError> {
