@@ -68,6 +68,10 @@
   let suppRuleId = $state('');
   let suppReason = $state('');
   let suppOwner = $state('inatos');
+
+  // Two-step arm for advisory refresh
+  let refreshArmed = $state(false);
+  let refreshBusy = $state(false);
   let suppExpires = $state('2026-12-31');
 
   function playCue(kind: 'tick' | 'arm' | 'chime' | 'alert') {
@@ -280,6 +284,40 @@
       }
     } catch (e) {
       showReceipt(`Timer install error: ${e}`, 'alert');
+    }
+  }
+
+  async function handleAdvisoryRefresh() {
+    if (!refreshArmed) {
+      refreshArmed = true;
+      playCue('arm');
+      showReceipt('Armed — click again to refresh advisories / signatures / CISA KEV', 'arm');
+      setTimeout(() => {
+        refreshArmed = false;
+      }, 8000);
+      return;
+    }
+    refreshArmed = false;
+    refreshBusy = true;
+    try {
+      const res = await fetch('/api/bellator/schedule/refresh', {
+        method: 'POST',
+        headers: CSRF_HEADERS,
+      });
+      const data = await res.json();
+      if (res.ok) {
+        showReceipt(
+          `Advisory refresh done (${data.findings ?? 0} findings${data.advisory_stale ? ', still stale' : ''})`,
+          data.advisory_stale ? 'alert' : 'chime'
+        );
+        await refreshAll();
+      } else {
+        showReceipt(`Advisory refresh failed: ${data.error || res.statusText}`, 'alert');
+      }
+    } catch (e) {
+      showReceipt(`Advisory refresh error: ${e}`, 'alert');
+    } finally {
+      refreshBusy = false;
     }
   }
 
@@ -897,16 +935,36 @@
                   <code>CPUQuota=200%</code>, pausing automatically if Betwixt or Tracy starts.
                 </p>
               </div>
-              <button
-                type="button"
-                class="act-btn"
-                onclick={(e) => {
-                  rippleFromEvent(e);
-                  void handleInstallUserTimers();
-                }}
-              >
-                ↻ Reinstall & Enable User Timers
-              </button>
+              <div class="deck-actions">
+                <button
+                  type="button"
+                  class="act-btn"
+                  class:armed={refreshArmed}
+                  disabled={refreshBusy || busy}
+                  onclick={(e) => {
+                    rippleFromEvent(e);
+                    void handleAdvisoryRefresh();
+                  }}
+                >
+                  {#if refreshBusy}
+                    Refreshing…
+                  {:else if refreshArmed}
+                    Confirm refresh now
+                  {:else}
+                    Refresh advisories now
+                  {/if}
+                </button>
+                <button
+                  type="button"
+                  class="act-btn"
+                  onclick={(e) => {
+                    rippleFromEvent(e);
+                    void handleInstallUserTimers();
+                  }}
+                >
+                  ↻ Reinstall & Enable User Timers
+                </button>
+              </div>
             </header>
 
             <div class="toggle-grid">
@@ -921,6 +979,22 @@
                   <div>
                     <strong>Master Schedule Enabled</strong>
                     <span>Allow scheduled timers to execute `bellator schedule run-due`</span>
+                  </div>
+                </label>
+
+                <label class="toggle-card">
+                  <input
+                    type="checkbox"
+                    checked={dash.schedule.daily_advisory_refresh ?? true}
+                    onchange={(e) =>
+                      void toggleScheduleFlag(
+                        'daily_advisory_refresh',
+                        (e.currentTarget as HTMLInputElement).checked
+                      )}
+                  />
+                  <div>
+                    <strong>Daily Advisory / Signature / KEV Refresh</strong>
+                    <span>Refresh DBs + CISA KEV at 03:45 (and before scheduled scans)</span>
                   </div>
                 </label>
 
@@ -1008,13 +1082,27 @@
               </table>
             </div>
 
-            <h3>Advisory & Signature Database Freshness Receipts</h3>
+            <h3>
+              Advisory & Signature Database Freshness Receipts
+              {#if dash?.advisory_stale}
+                <span class="chip">stale</span>
+              {:else}
+                <span class="chip active">fresh</span>
+              {/if}
+            </h3>
+            <p class="sub">
+              Required sources:
+              {(dash?.advisory_stale_detail?.required_sources ?? ['clamav-db', 'rustsec-db', 'osv-db', 'cisa-kev']).join(', ')}
+              · window {dash?.stale_advisory_db_hours ?? 36}h
+            </p>
             <div class="table-wrap">
               <table class="dash-table">
                 <thead>
                   <tr>
                     <th>Source</th>
+                    <th>Required</th>
                     <th>Status</th>
+                    <th>Age (h)</th>
                     <th>Last Refreshed</th>
                     <th>Version / Note</th>
                   </tr>
@@ -1022,10 +1110,22 @@
                 <tbody>
                   {#each Object.values(dash?.advisory_receipts?.sources ?? {}) as rec}
                     {@const r = rec as any}
+                    {@const req = (dash?.advisory_stale_detail?.required_sources ?? []).includes(r.source)}
+                    {@const row = (dash?.advisory_stale_detail?.breakdown ?? []).find(
+                      (b: any) => b.source === r.source
+                    )}
                     <tr>
                       <td class="tool-name"><code>{r.source}</code></td>
+                      <td>{req ? 'yes' : 'optional'}</td>
                       <td>
-                        <span class="chip" class:active={r.ok}>{r.ok ? 'Fresh' : 'Error'}</span>
+                        <span class="chip" class:active={r.ok && !row?.stale}>
+                          {row?.stale ? 'Stale' : r.ok ? 'Fresh' : 'Error'}
+                        </span>
+                      </td>
+                      <td>
+                        <code
+                          >{row?.age_hours != null ? Number(row.age_hours).toFixed(1) : '—'}</code
+                        >
                       </td>
                       <td><code>{r.refreshed_at_iso}</code></td>
                       <td><code>{r.version_or_note ?? '-'}</code></td>
@@ -1637,9 +1737,11 @@
     font-size: 0.78rem;
     color: #a894ab;
   }
-  .head-actions {
+  .head-actions,
+  .deck-actions {
     display: flex;
     gap: 0.4rem;
+    flex-wrap: wrap;
   }
   .act-btn {
     border: 1px solid rgba(201, 111, 208, 0.4);
@@ -1653,6 +1755,11 @@
   .act-btn.primary {
     border-color: #ff8c42;
     background: rgba(255, 140, 66, 0.18);
+  }
+  .act-btn.armed {
+    border-color: #ff8c42;
+    background: rgba(255, 140, 66, 0.28);
+    color: #fff4e8;
   }
   .act-btn.danger-btn {
     border-color: #e06b7a;

@@ -142,6 +142,7 @@ pub(crate) async fn serve(
         .route("/api/bellator/schedule", get(bellator_schedule_get))
         .route("/api/bellator/schedule/toggle", post(bellator_schedule_toggle))
         .route("/api/bellator/schedule/install-user", post(bellator_schedule_install_user))
+        .route("/api/bellator/schedule/refresh", post(bellator_schedule_refresh))
         .route("/api/bellator/policy", get(bellator_policy_get))
         .route("/api/bellator/suppressions/draft", post(bellator_suppressions_draft))
         .route("/api/bellator/explain/:id", get(bellator_explain))
@@ -1305,6 +1306,19 @@ async fn bellator_schedule_install_user(
         .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     res.map(Json)
         .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e))
+}
+
+async fn bellator_schedule_refresh(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> ApiResult {
+    require_bellator_mutation(&headers)?;
+    let root = state.root.clone();
+    let res = tokio::task::spawn_blocking(move || crate::bellator::schedule_refresh(&root))
+        .await
+        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    res.map(Json)
+        .map_err(|e| api_error(StatusCode::CONFLICT, e))
 }
 
 async fn bellator_policy_get(State(state): State<AppState>) -> Json<Value> {

@@ -5,15 +5,15 @@
 //! scanner telemetry, SSE event stream, scheduled user timers, and `.wordkeep/defects.json` sync.
 
 use bellator_core::{
-    compare_runs, detect_external_clamscan, explain_finding, is_engine_or_tracy_active, iso_now,
-    new_run_id, prune_old_runs, sync_findings_to_wordkeep_defects, unix_now_ms,
-    write_wordkeep_telemetry_provider, Confidence, Finding, FindingCounts, JobStatus,
-    LiveScanTelemetry, PolicyPack, RunStore, RunnerExecMeta, Severity, Status, StoredRun,
-    TriageEntry, TriageState, TriageStore, RUN_RETENTION_DAYS,
+    advisory_sources_for_gate, compare_runs, detect_external_clamscan, explain_finding,
+    is_engine_or_tracy_active, iso_now, new_run_id, prune_old_runs,
+    sync_findings_to_wordkeep_defects, unix_now_ms, write_wordkeep_telemetry_provider, Confidence,
+    Finding, FindingCounts, JobStatus, LiveScanTelemetry, PolicyPack, RunStore, RunnerExecMeta,
+    Severity, Status, StoredRun, TriageEntry, TriageState, TriageStore, RUN_RETENTION_DAYS,
 };
 use bellator_runners::{
-    preset_runners, runner_catalog, runner_info, scan_selected_with_telemetry, set_process_paused,
-    verify_image_digest, RunnerResult, TelemetryCallback,
+    preset_runners, run_advisory_refresh, runner_catalog, runner_info, scan_selected_with_telemetry,
+    set_process_paused, verify_image_digest, RunnerResult, TelemetryCallback,
 };
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -148,6 +148,11 @@ pub fn query_user_timer(unit: &str, label: &str, cadence: &str) -> Value {
 pub fn all_timers() -> Vec<Value> {
     vec![
         query_user_timer(
+            "bellator-advisory-refresh.timer",
+            "Daily Advisory / Signature / KEV Refresh",
+            "Daily 03:45 (+10m jitter, idle cgroup)",
+        ),
+        query_user_timer(
             "bellator-quick-scan.timer",
             "Daily Quick ClamAV & Host Audit",
             "Daily 04:15 (+15m jitter, idle cgroup)",
@@ -158,6 +163,18 @@ pub fn all_timers() -> Vec<Value> {
             "Sun 03:30 (+30m jitter, idle cgroup)",
         ),
     ]
+}
+
+fn advisory_stale_bundle(receipts: &bellator_core::AdvisoryReceiptsFile, stale_limit: u32) -> (bool, Value) {
+    let sources = advisory_sources_for_gate(runner_info("trivy").available);
+    let stale = receipts.is_stale_for_sources(&sources, stale_limit);
+    (
+        stale,
+        json!({
+            "required_sources": sources,
+            "breakdown": receipts.stale_breakdown(&sources, stale_limit),
+        }),
+    )
 }
 
 pub fn resolve_live_telemetry(runs: &RunStore) -> Option<LiveScanTelemetry> {
@@ -213,7 +230,7 @@ pub fn dashboard(root: &Path) -> Value {
 
     let receipts = runs.load_advisory_receipts();
     let stale_limit = pack.schedule.stale_advisory_db_hours;
-    let advisory_stale = receipts.is_stale(stale_limit);
+    let (advisory_stale, advisory_stale_detail) = advisory_stale_bundle(&receipts, stale_limit);
     let timers = all_timers();
 
     let trend: Vec<_> = summaries
@@ -265,6 +282,7 @@ pub fn dashboard(root: &Path) -> Value {
         "last_green_delta": last_green_delta,
         "advisory_receipts": receipts,
         "advisory_stale": advisory_stale,
+        "advisory_stale_detail": advisory_stale_detail,
         "stale_advisory_db_hours": stale_limit,
         "timers": timers,
         "schedule": pack.schedule,
@@ -765,9 +783,7 @@ fn execute_scan_job(
             JobStatus::Completed
         };
 
-        if res.available && matches!(id.as_str(), "osv-scanner" | "cargo-audit" | "clamav-quick" | "clamav-full") {
-            let _ = runs.record_advisory_refresh(id, res.error.is_none(), info.version.clone());
-        }
+        // DB freshness is stamped only by `advisory-refresh`, not by scan completion.
 
         meta.push(RunnerExecMeta {
             id: id.clone(),
@@ -882,14 +898,85 @@ pub fn schedule_get(root: &Path) -> Value {
     };
     let receipts = runs.load_advisory_receipts();
     let stale_limit = pack.schedule.stale_advisory_db_hours;
+    let (advisory_stale, advisory_stale_detail) = advisory_stale_bundle(&receipts, stale_limit);
     json!({
         "schedule": pack.schedule,
         "timers": all_timers(),
         "advisory_receipts": receipts,
-        "advisory_stale": receipts.is_stale(stale_limit),
+        "advisory_stale": advisory_stale,
+        "advisory_stale_detail": advisory_stale_detail,
+        "stale_advisory_db_hours": stale_limit,
         "user_install_cmd": "bash tools/bellator/scripts/install_bellator_timers_user.sh",
         "root_opt_in_cmd": "sudo bash tools/bellator/scripts/install_bellator_root_sweep_opt_in.sh",
     })
+}
+
+pub fn schedule_refresh(root: &Path) -> Result<Value, String> {
+    let rt = hub();
+    if rt.busy.swap(true, Ordering::SeqCst) {
+        return Err("another Bellator job is already running".into());
+    }
+    let result = (|| {
+        let (pack, runs, _) = open_stores(root)?;
+        let prior = runs
+            .latest()
+            .map_err(|e| e.to_string())?
+            .map(|r| r.findings)
+            .unwrap_or_default();
+        let outcome = run_advisory_refresh(root, &prior);
+        for stamp in &outcome.receipts {
+            let _ = runs.record_advisory_refresh(&stamp.source, stamp.ok, stamp.note.clone());
+        }
+        let mut findings = outcome.result.findings;
+        pack.apply_suppressions(&mut findings);
+        let (gate_ok, gate_reasons) = pack.evaluate_gate(&findings);
+        let run_id = new_run_id();
+        let report_findings = findings.clone();
+        let mut stored = StoredRun::from_report(
+            bellator_core::ScanReport {
+                profile: "advisory-refresh".into(),
+                root: root.display().to_string(),
+                generated_at: iso_now(),
+                findings,
+                gate_ok,
+                gate_reasons: gate_reasons.clone(),
+                run_id: Some(run_id.clone()),
+                roots: vec![root.display().to_string()],
+                runners: vec!["advisory-refresh".into()],
+                duration_ms: Some(outcome.result.duration_ms),
+            },
+            vec![RunnerExecMeta {
+                id: "advisory-refresh".into(),
+                label: "Advisory & signature refresh".into(),
+                status: JobStatus::Completed,
+                finding_count: report_findings.len(),
+                duration_ms: outcome.result.duration_ms,
+                error: outcome.result.error.clone(),
+                available: true,
+            }],
+        );
+        stored.id = run_id.clone();
+        runs.save(&stored).map_err(|e| e.to_string())?;
+        let _ = write_wordkeep_telemetry_provider(root, &runs, None);
+        if pack.schedule.notify_on_new_high_plus {
+            let _ = sync_findings_to_wordkeep_defects(root, &report_findings);
+        }
+        let receipts = runs.load_advisory_receipts();
+        let (advisory_stale, advisory_stale_detail) =
+            advisory_stale_bundle(&receipts, pack.schedule.stale_advisory_db_hours);
+        Ok(json!({
+            "ok": gate_ok,
+            "run_id": run_id,
+            "findings": report_findings.len(),
+            "gate_reasons": gate_reasons,
+            "advisory_receipts": receipts,
+            "advisory_stale": advisory_stale,
+            "advisory_stale_detail": advisory_stale_detail,
+            "error": outcome.result.error,
+        }))
+    })();
+    rt.busy.store(false, Ordering::SeqCst);
+    result
 }
 
 pub fn schedule_toggle(root: &Path, body: &Value) -> Result<Value, String> {
