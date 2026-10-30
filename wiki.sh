@@ -499,6 +499,11 @@ docker_bash() {
 }
 
 ensure_meilisearch() {
+  # Already healthy (orphan host process, prior container, etc.) — do not fight :7700.
+  if curl -s -o /dev/null --max-time 1 "http://127.0.0.1:7700/health" 2>/dev/null; then
+    echo "[wordkeep:wiki] Meilisearch already healthy on 127.0.0.1:7700" >&2
+    return 0
+  fi
   if ! command -v docker >/dev/null 2>&1; then
     echo "[wordkeep:wiki] docker not found; starting without Meilisearch (search degraded)" >&2
     return 1
@@ -536,6 +541,11 @@ else
   fi
 fi
 "; then
+    # Compose race: another Meili already bound :7700 — accept if /health answers.
+    if curl -s -o /dev/null --max-time 1 "http://127.0.0.1:7700/health" 2>/dev/null; then
+      echo "[wordkeep:wiki] compose start raced :7700; reusing healthy Meilisearch" >&2
+      return 0
+    fi
     echo "[wordkeep:wiki] Meilisearch start failed; continuing without it (search degraded)" >&2
     return 1
   fi

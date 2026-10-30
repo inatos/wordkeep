@@ -1,8 +1,8 @@
 //! Wiki-facing helpers for the Elucifia tab. Routes are mounted in `web`.
 
 use elucifia_core::{
-    aeron_host, chat_turn, dispatch, fetch_peer_status, menu_model, peer_base, post_peer_note,
-    post_peer_restart, stream_peer_events, unreachable_peer, ChatRequest,
+    aeron_host, chat_turn, dispatch, fetch_peer_status, menu_model, peer_base, post_peer_restart,
+    stream_peer_events, unreachable_peer, ChatRequest,
 };
 use serde_json::{json, Value};
 use std::path::Path;
@@ -62,16 +62,6 @@ pub fn chat_stream(root: &Path, body: &str, on_token: &mut dyn FnMut(&str)) -> R
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_string();
-    if !force_stub {
-        let host = aeron_host(root);
-        let noted = if model.trim().is_empty() {
-            menu_model(root)
-        } else {
-            model.clone()
-        };
-        let line = format!("POST /api/chat {noted}");
-        std::thread::spawn(move || post_peer_note(&peer_base(&host), "desktop", &line));
-    }
     let outcome = chat_turn(
         root,
         &ChatRequest {

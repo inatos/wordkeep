@@ -5,9 +5,24 @@
 
   type Job = { job?: string; name?: string; kind?: string; status?: string; bytes?: number };
 
+  type WorkRow = {
+    seq: number;
+    at_ms: number;
+    source: string;
+    line: string;
+    work_id: number;
+    lane: string;
+    excerpt: string;
+    method: string;
+    path: string;
+    status: number;
+    dur_ms: number;
+    phase: string;
+  };
+
   let {
     mode,
-    lines,
+    rows,
     jobs,
     model = $bindable(''),
     models,
@@ -22,7 +37,7 @@
     onsave,
   }: {
     mode: 'logs' | 'config';
-    lines: string[];
+    rows: WorkRow[];
     jobs: Job[];
     model?: string;
     models: string[];
@@ -45,19 +60,25 @@
   let filter = $state('all');
   let search = $state('');
   const shown = $derived(
-    lines.filter((line) => {
-      const hit = !search || line.toLowerCase().includes(search.toLowerCase());
+    rows.filter((row) => {
+      const blob = `${row.line} ${row.lane} ${row.excerpt} ${row.source}`.toLowerCase();
+      const hit = !search || blob.includes(search.toLowerCase());
       if (!hit) return false;
-      if (filter === 'desktop') return /desktop|local|stub/i.test(line);
-      if (filter === 'peer') return /peer|myridos|laptop/i.test(line);
-      if (filter === 'jobs') return /job|palaestra/i.test(line);
+      if (filter === 'desktop') return /desktop|local|stub/i.test(blob);
+      if (filter === 'peer') return /peer|myridos|laptop|gin|ollama/i.test(blob) || row.lane === 'ollama';
+      if (filter === 'jobs') return /job|palaestra/i.test(blob);
       return true;
     }),
   );
 
+  function stamp(ms: number) {
+    if (!ms) return '';
+    return new Date(ms).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+  }
+
   async function copy() {
     try {
-      await navigator.clipboard.writeText(shown.join('\n'));
+      await navigator.clipboard.writeText(shown.map((row) => row.line || row.excerpt).join('\n'));
     } catch {
       /* clipboard stays with the page */
     }
@@ -76,7 +97,29 @@
       <button type="button" onclick={copy}><Icon name="copy" size="0.85rem" /> Copy</button>
       <button type="button" onclick={onclear}><Icon name="trash" size="0.85rem" /> Clear</button>
     </header>
-    <pre>{shown.join('\n')}</pre>
+    <div class="table-wrap">
+      <table class="dash-table" data-testid="elucifia-traffic">
+        <thead>
+          <tr><th>Time</th><th>Lane</th><th>Excerpt</th><th>Method</th><th>Path</th><th>Status</th><th>ms</th></tr>
+        </thead>
+        <tbody>
+          {#each shown as row, index (`${row.work_id}-${row.seq}-${index}`)}
+            <tr>
+              <td>{stamp(row.at_ms)}</td>
+              <td>{row.lane}</td>
+              <td>{row.excerpt || row.line}</td>
+              <td>{row.method}</td>
+              <td>{row.path}</td>
+              <td>{row.phase === 'open' ? 'open' : row.status || ''}</td>
+              <td>{row.dur_ms || ''}</td>
+            </tr>
+          {/each}
+          {#if !shown.length}
+            <tr><td colspan="7">Waiting for the laptop.</td></tr>
+          {/if}
+        </tbody>
+      </table>
+    </div>
     <div class="table-wrap">
       <table class="dash-table">
         <thead><tr><th>Job</th><th>Kind</th><th>Status</th><th>Bytes</th></tr></thead>
@@ -126,7 +169,6 @@
   button, input, select { border: 1px solid rgba(201, 111, 208, 0.35); background: rgba(13, 9, 18, 0.72); color: #f4ecf6; border-radius: 0.7rem; color-scheme: dark; }
   button { display: inline-flex; align-items: center; gap: 0.25rem; }
   .on { border-color: #ff8c42; }
-  pre { margin: 0; white-space: pre-wrap; font-family: "IBM Plex Mono", monospace; color: #7ec8e3; font-size: 0.78rem; }
   label { display: grid; gap: 0.25rem; color: #a894ab; }
   .switch { display: flex; align-items: center; gap: 0.4rem; }
   .deck { display: grid; grid-template-columns: 1fr 1fr; gap: 0.8rem; }

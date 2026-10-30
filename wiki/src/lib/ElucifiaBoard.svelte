@@ -21,7 +21,9 @@
     postElucifia,
     type ElucifiaJob,
     type ElucifiaPeer,
+    type ElucifiaPeerEvent,
     type ElucifiaStatus,
+    type ElucifiaWorkRow,
     type ElucifiaThread,
     type ElucifiaTrainQueue,
     type ElucifiaTurn,
@@ -147,7 +149,13 @@
     vram_total_mib: 0,
     gpu_pct: 0,
   });
-  let peerLines = $state<string[]>([]);
+  let workRows = $state<ElucifiaWorkRow[]>([]);
+  let clearedSeq = $state(0);
+  let trafficPulse = $state(false);
+  let trafficTimer = 0;
+  const peerLines = $derived(workRows.map((row) => row.line).filter((line) => line.length > 0));
+  const openWork = $derived([...workRows].reverse().find((row) => row.phase === 'open'));
+  const lastDone = $derived([...workRows].reverse().find((row) => row.phase === 'done'));
   let gpuSeries = $state<SparkPoint[]>([]);
   let episodicCount = $state(0);
   let semanticCount = $state(0);
@@ -207,9 +215,64 @@
     return `GPU holds ${loaded}. The next send still uses ${menu}.`;
   }
 
+  function toWorkRow(event: ElucifiaPeerEvent): ElucifiaWorkRow {
+    return {
+      seq: event.seq ?? 0,
+      at_ms: event.at_ms ?? 0,
+      source: event.source || '',
+      line: event.line || '',
+      work_id: event.work_id ?? 0,
+      lane: event.lane || '',
+      excerpt: event.excerpt || '',
+      method: event.method || '',
+      path: event.path || '',
+      status: event.status ?? 0,
+      dur_ms: event.dur_ms ?? 0,
+      phase: event.phase || '',
+    };
+  }
+
+  function trafficBeat() {
+    const reduce = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    if (!reduce) {
+      trafficPulse = true;
+      window.clearTimeout(trafficTimer);
+      trafficTimer = window.setTimeout(() => {
+        trafficPulse = false;
+      }, 700);
+    }
+    if (sfxOn) playClip('tick');
+  }
+
+  function ingestWork(event: ElucifiaPeerEvent, live: boolean) {
+    const row = toWorkRow(event);
+    if (row.phase === 'matched') return;
+    if (!row.line && !row.excerpt) return;
+    if (row.seq && row.seq <= clearedSeq) return;
+    if (row.work_id) {
+      const idx = workRows.findIndex((item) => item.work_id === row.work_id);
+      if (idx >= 0) {
+        const prev = workRows[idx];
+        if (row.seq && prev.seq && row.seq < prev.seq) return;
+        workRows = workRows.map((item, index) => (index === idx ? row : item));
+        if (live && row.phase === 'done' && prev.phase !== 'done') trafficBeat();
+        return;
+      }
+    }
+    if (row.seq && workRows.some((item) => item.seq === row.seq)) return;
+    if (!row.seq && workRows[workRows.length - 1]?.line === row.line) return;
+    workRows = [...workRows, row].slice(-40);
+    if (live && row.phase === 'done' && row.at_ms > 0 && Date.now() - row.at_ms < 8000) trafficBeat();
+  }
+
   function rememberLine(line: string) {
-    if (!line || peerLines[peerLines.length - 1] === line) return;
-    peerLines = [...peerLines, line].slice(-40);
+    ingestWork({ line, source: 'desktop' }, false);
+  }
+
+  function clearWork() {
+    const max = workRows.reduce((highest, row) => Math.max(highest, row.seq), clearedSeq);
+    clearedSeq = max;
+    workRows = [];
   }
 
   function pushSample(series: SparkPoint[], value: number, label: string): SparkPoint[] {
@@ -244,15 +307,7 @@
     };
     gpuSeries = pushSample(gpuSeries, data.gpu_pct || 0, 'GPU %');
     if (data.events) {
-      const seen = new Set(peerLines);
-      const next = [...peerLines];
-      for (const event of data.events) {
-        if (event.line && !seen.has(event.line)) {
-          seen.add(event.line);
-          next.push(event.line);
-        }
-      }
-      peerLines = next.slice(-40);
+      for (const event of data.events) ingestWork(event, false);
     }
   }
 
@@ -313,10 +368,10 @@
         noteReachable(ok);
         return;
       }
-      if (data.kind === 'line' && data.line) {
+      if (data.kind === 'line' && (data.line || data.excerpt)) {
         if (data.seq !== undefined && feedSeen.has(data.seq)) return;
         if (data.seq !== undefined) feedSeen.add(data.seq);
-        rememberLine(data.line);
+        ingestWork(data, true);
         return;
       }
       if (data.reachable === false) {
@@ -519,7 +574,6 @@
     const message = (messageOverride ?? draft).trim();
     if (!message || streaming) return;
     if (!messageOverride) draft = '';
-    rememberLine(`POST /api/chat ${model}`);
     const refs = CONTEXT.filter((chip) => message.includes(chip));
     turns = [...turns, { role: 'user', content: message, context_refs: refs }, { role: 'assistant', content: '' }];
     const index = turns.length - 1;
@@ -1115,7 +1169,7 @@
     {:else if view === 'logs' || view === 'config'}
       <ElucifiaDeskStage
         mode={view}
-        lines={peerLines}
+        rows={workRows}
         {jobs}
         bind:model
         models={MODELS}
@@ -1126,10 +1180,21 @@
         bind:sfxOn
         {continuity}
         vault={glance}
-        onclear={() => { peerLines = []; }}
+        onclear={clearWork}
         onsave={saveSettings}
       />
     {:else}
+      <div class="traffic" class:pulse={trafficPulse} data-testid="elucifia-traffic-strip">
+        <i class="dot" class:live={peer.reachable && peer.ollama_up} class:down={!peer.reachable || !peer.ollama_up}></i>
+        <span>{peer.ollama_up ? peer.model || 'Ollama up' : 'Ollama down'}</span>
+        {#if openWork}
+          <span class="work">working · {openWork.lane}{openWork.excerpt ? ` · ${openWork.excerpt}` : ''}</span>
+        {:else if lastDone}
+          <span class="work">{lastDone.lane || 'done'}{lastDone.excerpt ? ` · ${lastDone.excerpt}` : ''}{lastDone.dur_ms ? ` · ${lastDone.dur_ms} ms` : ''}</span>
+        {:else}
+          <span class="work">idle</span>
+        {/if}
+      </div>
       <ElucifiaChatStage
         {editingTitle}
         bind:titleDraft
@@ -1375,6 +1440,20 @@
   .veil { position: fixed; inset: 0; background: rgba(8, 5, 12, 0.62); display: grid; place-items: center; z-index: 20; }
   .glass { width: min(640px, 92vw); max-height: 80vh; overflow: auto; padding: 1rem 1.1rem; backdrop-filter: blur(16px); }
   .prose { font-family: var(--serif); font-size: 1.15rem; line-height: 1.45; }
+  .traffic { display: flex; align-items: center; gap: 0.55rem; min-width: 0; margin: 0 auto 0.45rem; width: min(880px, 100%); padding: 0.35rem 0.7rem; border-radius: 0.7rem; border: 1px solid rgba(201, 111, 208, 0.35); background: rgba(22, 15, 29, 0.88); color: #fff4e8; font-size: 0.78rem; }
+  .traffic .dot { width: 0.45rem; height: 0.45rem; border-radius: 50%; background: #6b5a72; flex: 0 0 auto; }
+  .traffic .dot.live { background: #6bcf8e; box-shadow: 0 0 8px rgba(107, 207, 142, 0.8); }
+  .traffic .dot.down { background: #e06b7a; }
+  .traffic .work { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #7ec8e3; }
+  .traffic.pulse { animation: traffic-pulse 0.7s ease; }
+  @keyframes traffic-pulse {
+    0% { box-shadow: 0 0 0 rgba(255, 140, 66, 0); }
+    40% { box-shadow: 0 0 16px rgba(255, 140, 66, 0.55); }
+    100% { box-shadow: 0 0 0 rgba(255, 140, 66, 0); }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .traffic.pulse { animation: none; }
+  }
   .log { white-space: pre-wrap; font-family: "IBM Plex Mono", monospace; font-size: 0.75rem; }
   .toast { position: fixed; bottom: 1rem; left: 50%; transform: translateX(-50%); background: #160f1d; padding: 0.4rem 0.7rem; border-radius: 999px; }
   .danger { color: #e06b7a; }

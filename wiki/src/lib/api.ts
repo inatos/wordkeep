@@ -890,8 +890,32 @@ export type ElucifiaStatus = {
 
 export type ElucifiaPeerEvent = {
   seq?: number;
+  at_ms?: number;
   source?: string;
   line?: string;
+  work_id?: number;
+  lane?: string;
+  excerpt?: string;
+  method?: string;
+  path?: string;
+  status?: number;
+  dur_ms?: number;
+  phase?: string;
+};
+
+export type ElucifiaWorkRow = {
+  seq: number;
+  at_ms: number;
+  source: string;
+  line: string;
+  work_id: number;
+  lane: string;
+  excerpt: string;
+  method: string;
+  path: string;
+  status: number;
+  dur_ms: number;
+  phase: string;
 };
 
 export type ElucifiaPeer = {
@@ -909,6 +933,16 @@ export type ElucifiaPeer = {
   gen?: number;
   line?: string;
   seq?: number;
+  at_ms?: number;
+  source?: string;
+  work_id?: number;
+  lane?: string;
+  excerpt?: string;
+  method?: string;
+  path?: string;
+  status?: number;
+  dur_ms?: number;
+  phase?: string;
 };
 
 export type ElucifiaJob = {
