@@ -1,5 +1,5 @@
 <script lang="ts">
-  import type { ElucifiaJob, ElucifiaTurn } from '../api';
+  import type { ElucifiaJob, ElucifiaTrainQueue, ElucifiaTurn } from '../api';
   import BarChart from '../charts/BarChart.svelte';
   import DonutChart from '../charts/DonutChart.svelte';
   import Sparkline from '../charts/Sparkline.svelte';
@@ -26,6 +26,7 @@
     peer,
     voice,
     jobs,
+    trainQueue,
     peerLines,
     peerUp,
     chatLane,
@@ -77,6 +78,7 @@
     };
     voice: string;
     jobs: ElucifiaJob[];
+    trainQueue: ElucifiaTrainQueue;
     peerLines: string[];
     peerUp: boolean;
     chatLane: string;
@@ -199,12 +201,35 @@
   }
 
   function jobIcon(status?: string) {
-    if (status === 'done') return 'check';
+    if (status === 'done' || status === 'ok') return 'check';
     if (status === 'running') return 'pulse';
-    if (status === 'cancelled') return 'close';
+    if (status === 'cancelled' || status === 'failed' || status === 'blocked') return 'close';
     if (status === 'lan-stub') return 'link';
     return 'layers';
   }
+
+  function flag(ok: boolean | undefined) {
+    if (ok === true) return 'yes';
+    if (ok === false) return 'no';
+    return '—';
+  }
+
+  function fmtLoss(n: number | undefined) {
+    if (n == null || Number.isNaN(n)) return '—';
+    return n.toFixed(2);
+  }
+
+  function fmtBytes(n: number | undefined) {
+    if (n == null || n <= 0) return '—';
+    const gib = n / (1024 ** 3);
+    if (gib >= 1) return `${gib.toFixed(1)} GiB`;
+    const mib = n / (1024 ** 2);
+    return `${mib.toFixed(0)} MiB`;
+  }
+
+  const peftJobs = $derived(jobs.filter((j) => j.receipt || j.name === 'elucifia-lora-train'));
+  const queuePending = $derived(trainQueue?.pending ?? 0);
+  const queuePendingEntries = $derived(trainQueue?.entries_pending ?? []);
 </script>
 
 <div class="rail" class:shut={!open} data-testid="elucifia-peer">
@@ -343,7 +368,35 @@
       </div>
     </CollapsibleSection>
 
-    <CollapsibleSection id="elucifia-jobs" titleAttr="Palaestra job states and the latest peer log lines.">
+    <CollapsibleSection id="elucifia-train-queue" titleAttr="Durable Myridos PEFT outbox. Pending survives Copper-down; LIVE arms enqueue.">
+      {#snippet heading()}
+        <Icon name="layers" size="0.85rem" /> Train queue
+      {/snippet}
+      <p class="lede" title="Outbox under .cache/elucifia/train_queue with a thin .wordkeep mirror. task_* is SoT after drain.">
+        pending {queuePending} · submitted {trainQueue?.submitted ?? 0} · LIVE {trainQueue?.jobs_live ? 'on' : 'off'} · Copper {trainQueue?.copper_prefers_peer ? 'prefer' : 'local'}
+      </p>
+      {#if trainQueue?.last_task_id}
+        <p class="meta" title="Last drained Palaestra task id.">last task {trainQueue.last_task_id}</p>
+      {/if}
+      {#if trainQueue?.last_error}
+        <p class="meta bad" title="Last drain or enqueue error.">{trainQueue.last_error}</p>
+      {/if}
+      {#if queuePendingEntries.length}
+        <ul class="jobs" title="Coalesced pending intents waiting for drain.">
+          {#each queuePendingEntries as entry}
+            <li>
+              <Icon name="pulse" size="0.8rem" />
+              <span>{entry.job || 'elucifia-lora-train'}</span>
+              <em>{entry.handoff_slugs?.length ? `${entry.handoff_slugs.length} handoff` : entry.id || 'pending'}</em>
+            </li>
+          {/each}
+        </ul>
+      {:else}
+        <p class="meta">No pending train intents.</p>
+      {/if}
+    </CollapsibleSection>
+
+    <CollapsibleSection id="elucifia-jobs" titleAttr="Palaestra job states, PEFT receipts, and the latest peer log lines.">
       {#snippet heading()}
         <Icon name="layers" size="0.85rem" /> Jobs & feed
       {/snippet}
@@ -361,13 +414,46 @@
       </div>
       <ul class="jobs">
         {#each jobs as job}
-          <li title={`${job.name}: ${job.status || 'unknown'}${job.note ? `. ${job.note}` : ''}.`}>
+          <li title={`${job.name}: ${job.status || 'unknown'}${job.note ? `. ${job.note}` : ''}${job.task_id ? ` · ${job.task_id}` : ''}.`}>
             <Icon name={jobIcon(job.status)} size="0.8rem" />
             <span>{job.name}</span>
             <em>{job.status || 'unknown'}</em>
           </li>
         {/each}
       </ul>
+      {#if peftJobs.length}
+        <div class="peft" title="Live PEFT receipt fields from elucifia-lora-train/receipt.json.">
+          <p class="lede">PEFT receipts</p>
+          {#each peftJobs as job}
+            <article class="peft-card">
+              <header>
+                <strong>{job.name}</strong>
+                <em>{job.status || 'idle'}</em>
+              </header>
+              {#if job.receipt}
+                <dl>
+                  <div><dt>loss</dt><dd>{fmtLoss(job.receipt.loss_first)} → {fmtLoss(job.receipt.loss_last)}{#if job.receipt.steps_ran != null} <span class="dim">({job.receipt.steps_ran} steps)</span>{/if}</dd></div>
+                  <div><dt>mode</dt><dd>{job.receipt.train_mode || '—'}</dd></div>
+                  <div><dt>GGUF fresh</dt><dd class:ok={job.receipt.gguf_fresh === true} class:bad={job.receipt.gguf_fresh === false}>{flag(job.receipt.gguf_fresh)}</dd></div>
+                  <div><dt>Q4</dt><dd class:ok={job.receipt.quantized === true} class:bad={job.receipt.quantized === false}>{flag(job.receipt.quantized)} <span class="dim">{fmtBytes(job.receipt.gguf_bytes)}</span></dd></div>
+                  <div><dt>ollama</dt><dd class:ok={job.receipt.ollama_created === true} class:bad={job.receipt.ollama_created === false}>{flag(job.receipt.ollama_created)}</dd></div>
+                </dl>
+                {#if job.receipt.blocked_reason}
+                  <p class="meta bad">{job.receipt.blocked_reason}</p>
+                {/if}
+              {:else}
+                <p class="meta">No receipt yet — run or drain a live PEFT job.</p>
+              {/if}
+              {#if job.task_id}
+                <p class="meta">task {job.task_id}</p>
+              {/if}
+              {#if job.note}
+                <p class="meta">{job.note}</p>
+              {/if}
+            </article>
+          {/each}
+        </div>
+      {/if}
       <div class="feed-head">
         <span class="lede" title="Latest lines from the peer event stream. [DESKTOP] and [GIN] are access-log prefixes.">Peer feed</span>
         <button type="button" class:pulse={pinging} disabled={pinging} title="Fetch peer facts and status now." onclick={onping}>
@@ -458,6 +544,18 @@
   .jobs { list-style: none; margin: 0.4rem 0 0; padding: 0; display: grid; gap: 0.28rem; }
   .jobs li { display: grid; grid-template-columns: auto 1fr auto; gap: 0.35rem; align-items: center; font-size: 0.75rem; }
   .jobs em { color: #a894ab; font-style: normal; }
+  .meta { margin: 0.35rem 0 0; color: #a894ab; font-size: 0.7rem; }
+  .meta.bad, .bad { color: #f3c2c8; }
+  .ok { color: #d7f5e4; }
+  .dim { color: #8a768c; }
+  .peft { margin-top: 0.55rem; display: grid; gap: 0.4rem; }
+  .peft-card { border: 1px solid color-mix(in srgb, var(--plum) 28%, transparent); border-radius: 0.45rem; padding: 0.45rem 0.5rem; background: color-mix(in srgb, #1a0f1c 72%, transparent); }
+  .peft-card header { display: flex; justify-content: space-between; gap: 0.4rem; font-size: 0.75rem; }
+  .peft-card header em { color: #a894ab; font-style: normal; }
+  .peft-card dl { margin: 0.35rem 0 0; display: grid; gap: 0.2rem; }
+  .peft-card dl div { display: grid; grid-template-columns: 5.2rem 1fr; gap: 0.35rem; font-size: 0.7rem; }
+  .peft-card dt { color: #a894ab; }
+  .peft-card dd { margin: 0; color: #f0e6f2; }
   .chart-fit { width: 100%; max-width: 100%; overflow-x: auto; margin: 0.2rem 0 0.45rem; }
   .chart-fit :global(.bar-chart li) { grid-template-columns: minmax(3.2rem, 4.4rem) 1fr auto; }
   .ping.pulse, button.pulse { animation: ping-press 0.7s ease; }

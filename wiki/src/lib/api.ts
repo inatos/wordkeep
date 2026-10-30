@@ -823,6 +823,48 @@ export type ElucifiaThread = {
   updated?: string;
 };
 
+export type ElucifiaTrainQueueEntry = {
+  id?: string;
+  job?: string;
+  status?: string;
+  handoff_slugs?: string[];
+  corpus_fnv?: string;
+  n_sft?: number;
+  n_dpo?: number;
+  n_triples?: number;
+  n_gold?: number;
+  task_id?: string;
+  note?: string;
+};
+
+export type ElucifiaTrainQueue = {
+  schema?: string;
+  pending?: number;
+  submitted?: number;
+  done?: number;
+  failed?: number;
+  jobs_live?: boolean;
+  copper_prefers_peer?: boolean;
+  open_id?: string;
+  last_task_id?: string;
+  last_error?: string;
+  entries_pending?: ElucifiaTrainQueueEntry[];
+  outbox?: string;
+  mirror?: string;
+};
+
+export type ElucifiaJobReceipt = {
+  loss_first?: number;
+  loss_last?: number;
+  steps_ran?: number;
+  gguf_fresh?: boolean;
+  quantized?: boolean;
+  ollama_created?: boolean;
+  gguf_bytes?: number;
+  train_mode?: string;
+  blocked_reason?: string;
+};
+
 export type ElucifiaStatus = {
   name?: string;
   model?: string;
@@ -835,6 +877,14 @@ export type ElucifiaStatus = {
   lora_pairs?: number;
   dpo_pairs?: number;
   memory?: { episodic?: number; semantic?: number; procedural?: number; dreams?: number };
+  train_queue?: ElucifiaTrainQueue;
+  rlsf?: {
+    triples?: number;
+    dpo?: number;
+    sft?: number;
+    gold?: number;
+    engram_entries?: number;
+  };
   error?: string;
 };
 
@@ -868,6 +918,7 @@ export type ElucifiaJob = {
   note?: string;
   task_id?: string;
   safe_mesh?: boolean;
+  receipt?: ElucifiaJobReceipt;
 };
 
 export function fetchElucifiaStatus() {

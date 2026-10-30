@@ -23,6 +23,7 @@
     type ElucifiaPeer,
     type ElucifiaStatus,
     type ElucifiaThread,
+    type ElucifiaTrainQueue,
     type ElucifiaTurn,
   } from './api';
   import type { SparkPoint } from './charts/utils';
@@ -31,7 +32,7 @@
   type View = 'chats' | 'canvas' | 'dreams' | 'journal' | 'personas' | 'logs' | 'config';
   type CanvasTab = 'graph' | 'gen2d' | 'gal2d' | 'gen3d' | 'gal3d';
   const MOODS: Mood[] = ['Attentive', 'Excited', 'Skeptical', 'Tender', 'Playful'];
-  const MODELS = ['gemma4:12b', 'gemma4:e4b', 'gemma4:26b', 'gemma3:12b', 'elucifia-gemma4:12b'];
+  const MODELS = ['elucifia-gemma4:12b', 'gemma4:12b', 'gemma4:e4b', 'gemma4:26b', 'gemma3:12b'];
   const JOBS = ['image-scout', 'image-refine', 'video-previx', 'hunyuan-img2mesh', 'lora-train-anima', 'elucifia-lora-train'];
   const VIEWS: { id: View; label: string; glyph: string; letter: string }[] = [
     { id: 'chats', label: 'Chats', glyph: '✉', letter: 'C' },
@@ -59,7 +60,7 @@
   const CONTEXT = ['@vault', '@lorekeep', '@continuity', '@peer', '@thread', '@page'];
 
   let mood = $state<Mood>('Attentive');
-  let model = $state('gemma4:12b');
+  let model = $state('elucifia-gemma4:12b');
   let peerUp = $state(false);
   let voice = $state('hexgrad/Kokoro-82M');
   let voiceLane = $state('');
@@ -76,6 +77,7 @@
   let threadId = $state('');
   let turns = $state<ElucifiaTurn[]>([]);
   let jobs = $state<ElucifiaJob[]>([]);
+  let trainQueue = $state<ElucifiaTrainQueue>({});
   let busy = $state('');
   let view = $state<View>('chats');
   let railOpen = $state(true);
@@ -225,6 +227,7 @@
     lane = status.chat_lane || lane;
     voiceLane = status.voice_lane || voiceLane;
     loraPairs = status.lora_pairs || 0;
+    if (status.train_queue) trainQueue = status.train_queue;
     const layers = status.memory;
     if (layers?.procedural != null) proceduralCount = layers.procedural;
   }
@@ -1204,6 +1207,7 @@
       {peer}
       {voice}
       {jobs}
+      {trainQueue}
       {peerLines}
       {peerUp}
       chatLane={lane}
