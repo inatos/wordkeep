@@ -43,6 +43,10 @@ const TRUNC_RATE_PCT: u64 = 15;
 const ERROR_RATE_PCT: u64 = 10;
 const ERROR_MIN_CALLS: u64 = 5;
 const NET_NEGATIVE_BASELINE_FLOOR: u64 = 500;
+/// Flag Ereshkigal idle when explore volume dwarfs decide/decree usage.
+const ERESHKIGAL_IDLE_KS_MIN: u64 = 40;
+const ERESHKIGAL_IDLE_RATIO_PCT: u64 = 3;
+const ERESHKIGAL_STALE_SECS: u64 = 2 * 24 * 60 * 60;
 
 /// Dashboard / health: low-yield only when rate and sample size clear these.
 #[allow(dead_code)] // used by dashboard + unit tests
@@ -1442,7 +1446,42 @@ fn render_insights(now: u64, tools: &BTreeMap<String, Tool>, registry: &[&'stati
         signals.push_str(&format!("never called: {}\n", never.join(", ")));
     }
 
-    let _ = now;
+    let ks_calls = tools
+        .get("knowledge_search")
+        .map(|t| t.calls)
+        .unwrap_or(0);
+    let sd_calls = tools
+        .get("semantic_decide")
+        .map(|t| t.calls)
+        .unwrap_or(0);
+    let decree_calls = tools.get("decree").map(|t| t.calls).unwrap_or(0);
+    let decide_calls = sd_calls + decree_calls;
+    let ks_last = tools
+        .get("knowledge_search")
+        .map(|t| t.last_ts)
+        .unwrap_or(0);
+    let decide_last = tools
+        .get("semantic_decide")
+        .map(|t| t.last_ts)
+        .unwrap_or(0)
+        .max(tools.get("decree").map(|t| t.last_ts).unwrap_or(0));
+    let ratio_idle = ks_calls >= ERESHKIGAL_IDLE_KS_MIN
+        && decide_calls * 100 / ks_calls < ERESHKIGAL_IDLE_RATIO_PCT;
+    let stale_idle = ks_calls >= ERESHKIGAL_IDLE_KS_MIN
+        && ks_last > 0
+        && now.saturating_sub(ks_last) < ERESHKIGAL_STALE_SECS
+        && (decide_last == 0 || ks_last.saturating_sub(decide_last) >= ERESHKIGAL_STALE_SECS);
+    if ratio_idle || stale_idle {
+        let pct = if ks_calls == 0 {
+            0
+        } else {
+            decide_calls * 100 / ks_calls
+        };
+        signals.push_str(&format!(
+            "ereshkigal idle: semantic_decide+decree {decide_calls} vs knowledge_search {ks_calls} ({pct}%); call decree/semantic_decide on forks and emit ereshkigal: receipt\n"
+        ));
+    }
+
     if signals.is_empty() {
         return String::new();
     }
@@ -1775,6 +1814,62 @@ mod tests {
         assert!(out.contains("page with continuation"), "{out}");
         assert!(!out.contains("raise token_budget"), "{out}");
         assert!(out.contains("slowest (avg ms): repo_map"), "{out}");
+    }
+
+    #[test]
+    fn render_insights_flags_ereshkigal_idle_ratio() {
+        let mut tools = BTreeMap::new();
+        tools.insert(
+            "knowledge_search".to_string(),
+            Tool {
+                calls: 163,
+                baseline_tokens: 10_000,
+                returned_tokens: 500,
+                last_ts: 1_000_000,
+                ..Default::default()
+            },
+        );
+        tools.insert(
+            "semantic_decide".to_string(),
+            Tool {
+                calls: 3,
+                baseline_tokens: 64,
+                returned_tokens: 100,
+                last_ts: 900_000,
+                ..Default::default()
+            },
+        );
+        let out = render_insights(1_000_000, &tools, &["knowledge_search", "semantic_decide"]);
+        assert!(out.contains("ereshkigal idle"), "{out}");
+        assert!(out.contains("semantic_decide+decree 3"), "{out}");
+        assert!(out.contains("knowledge_search 163"), "{out}");
+    }
+
+    #[test]
+    fn render_insights_skips_ereshkigal_idle_when_ratio_ok() {
+        let mut tools = BTreeMap::new();
+        tools.insert(
+            "knowledge_search".to_string(),
+            Tool {
+                calls: 100,
+                baseline_tokens: 10_000,
+                returned_tokens: 500,
+                last_ts: 1_000_000,
+                ..Default::default()
+            },
+        );
+        tools.insert(
+            "semantic_decide".to_string(),
+            Tool {
+                calls: 5,
+                baseline_tokens: 64,
+                returned_tokens: 100,
+                last_ts: 999_000,
+                ..Default::default()
+            },
+        );
+        let out = render_insights(1_000_000, &tools, &["knowledge_search", "semantic_decide"]);
+        assert!(!out.contains("ereshkigal idle"), "{out}");
     }
 
     #[test]
