@@ -313,6 +313,72 @@ pub fn default_semif_backend() -> String {
     "auto".into()
 }
 
+/// Myridos / remote `ereshkigal serve --http` base URL.
+/// `ERESHKIGAL_REMOTE_URL` wins, then `semif.remote_url`, else `http://10.55.0.2:8786`.
+pub fn semif_remote_url(root: &Path) -> String {
+    if let Ok(s) = std::env::var("ERESHKIGAL_REMOTE_URL") {
+        let t = s.trim();
+        if !t.is_empty() {
+            return t.trim_end_matches('/').to_string();
+        }
+    }
+    semif_str(root, "remote_url")
+        .map(|s| s.trim().trim_end_matches('/').to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "http://10.55.0.2:8786".into())
+}
+
+/// Optional DiffusionGemma / `djev-run` peer lane URL (`semif.peer_lanes.djev_url`
+/// or `ERESHKIGAL_DJEV_URL`). Empty means the lane is off.
+pub fn semif_peer_djev_url(root: &Path) -> Option<String> {
+    if let Ok(s) = std::env::var("ERESHKIGAL_DJEV_URL") {
+        let t = s.trim().trim_end_matches('/').to_string();
+        if !t.is_empty() {
+            return Some(t);
+        }
+    }
+    load_config(root)
+        .and_then(|cfg| {
+            cfg.get("semif")
+                .and_then(|m| m.get("peer_lanes"))
+                .and_then(|p| p.get("djev_url"))
+                .and_then(Value::as_str)
+                .map(|s| s.trim().trim_end_matches('/').to_string())
+        })
+        .filter(|s| !s.is_empty())
+}
+
+/// Optional mmproj GGUF for vision logits (`semif.mmproj` or `ERESHKIGAL_MMPROJ`).
+pub fn semif_mmproj_path(root: &Path) -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("ERESHKIGAL_MMPROJ") {
+        if !p.trim().is_empty() {
+            return Some(resolve_semif_path(root, p.trim()));
+        }
+    }
+    semif_str(root, "mmproj").map(|p| resolve_semif_path(root, &p))
+}
+
+/// When true, `decree` decide/run/test still spawn `ereshkigal serve --stdio`.
+/// Default false — Wordkeep's shared resolved scorer handles decide.
+pub fn semif_decree_subprocess(root: &Path) -> bool {
+    if let Ok(s) = std::env::var("WORDKEEP_DECREE_SUBPROCESS") {
+        let t = s.trim();
+        if matches!(t, "1" | "true" | "yes" | "on") {
+            return true;
+        }
+        if matches!(t, "0" | "false" | "no" | "off") {
+            return false;
+        }
+    }
+    load_config(root)
+        .and_then(|cfg| {
+            cfg.get("semif")
+                .and_then(|m| m.get("decree_subprocess"))
+                .and_then(Value::as_bool)
+        })
+        .unwrap_or(false)
+}
+
 /// SemIf scorer backend name. Unknown names fall back in `semif::resolve_scorer`.
 /// `WORDKEEP_SEMIF_BACKEND` / `ERESHKIGAL_BACKEND` override config (mcp.sh uses this to
 /// keep a second Cursor MCP off Vulkan GGUF entirely).
@@ -443,6 +509,14 @@ pub fn semif_adapter_scale(root: &Path) -> f32 {
 
 /// Post-hoc temperature for calibrated probabilities (`semif.temperature`, default 1.0).
 /// Argmax-invariant; set via grouped OOF fit.
+/// Per-type temperatures from `semif.calibration` JSON (`T_choice`/`T_noul`/`T_score`).
+pub fn semif_type_temperatures(root: &Path) -> ereshkigal_lang::TypeTemperatures {
+    load_config(root)
+        .and_then(|cfg| cfg.get("semif").and_then(|m| m.get("calibration")).cloned())
+        .map(|v| ereshkigal_lang::TypeTemperatures::from_json(&v))
+        .unwrap_or_default()
+}
+
 pub fn semif_temperature(root: &Path) -> f64 {
     if let Ok(s) = std::env::var("ERESHKIGAL_TEMPERATURE") {
         if let Ok(v) = s.trim().parse::<f64>() {
@@ -1084,6 +1158,11 @@ mod tests {
     #[test]
     fn semif_defaults_and_overrides() {
         let dir = tmp("semif");
+        // Parallel cargo tests may leak WORDKEEP_SEMIF_BACKEND / ERESHKIGAL_BACKEND.
+        std::env::remove_var("WORDKEEP_SEMIF_BACKEND");
+        std::env::remove_var("ERESHKIGAL_BACKEND");
+        std::env::remove_var("ERESHKIGAL_ADAPTER_SCALE");
+        std::env::remove_var("ERESHKIGAL_TEMPERATURE");
         assert!(semif_enabled(&dir));
         assert_eq!(semif_backend(&dir), default_semif_backend());
         assert_eq!(semif_knowledge_debias(&dir), "none");

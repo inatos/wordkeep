@@ -845,7 +845,11 @@ fn stats_reports_savings_after_a_call() {
     // One tool call to accumulate a saving in this server's hermetic cache.
     let _ = s.tool_text("repo_map", json!({ "paths": ["src"] }));
     let stats = s.tool_text("stats", json!({}));
-    assert!(stats.contains("estimated context avoided"), "{stats}");
+    // Stats table header evolved from "estimated context avoided" → returned/scanned/counterfactual.
+    assert!(
+        stats.contains("counterfactual") || stats.contains("estimated context avoided"),
+        "{stats}"
+    );
     assert!(stats.contains("repo_map"), "{stats}");
     assert!(stats.contains("TOTAL"), "{stats}");
 }

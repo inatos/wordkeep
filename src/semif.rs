@@ -68,6 +68,11 @@ pub struct DecisionResult {
     /// unless `abstain` is true (hard gate: clipped / missing / hash mismatch).
     pub abstain: bool,
     pub abstain_reason: Option<String>,
+    /// AutoThink System-2 deliberation was invoked for this row.
+    pub think_invoked: bool,
+    pub think_tokens: u32,
+    /// Argmax flipped between System-1 `p0` and fused `p1`.
+    pub p0_vs_p1_flipped: bool,
 }
 
 /// Inner scorer output (logits or already-normalized probabilities).
@@ -197,6 +202,96 @@ fn copper_scorer(root: &Path) -> RemoteCopperScorer {
     }
 }
 
+fn myridos_scorer(root: &Path) -> RemoteHttpScorer {
+    RemoteHttpScorer {
+        base_url: config::semif_remote_url(root),
+        root: root.to_path_buf(),
+        connect_timeout_ms: 250,
+        calibrated_proxy: false,
+        question_kind: "choice".into(),
+        scorer_name: "remote-myridos",
+    }
+}
+
+fn djev_scorer(root: &Path, url: &str) -> RemoteHttpScorer {
+    RemoteHttpScorer {
+        base_url: url.trim_end_matches('/').to_string(),
+        root: root.to_path_buf(),
+        connect_timeout_ms: 250,
+        // djev raw ECE is underconfident — always apply post-hoc T >= 1.0.
+        calibrated_proxy: true,
+        question_kind: "choice".into(),
+        scorer_name: "remote-djev",
+    }
+}
+
+/// Minimal HTTP/1.0 GET/POST over TcpStream (no reqwest dep on the MCP binary).
+fn http_exchange(
+    base_url: &str,
+    method: &str,
+    path: &str,
+    body: Option<&str>,
+    timeout_ms: u64,
+) -> Result<String, String> {
+    let url = base_url.trim().trim_end_matches('/');
+    let rest = url
+        .strip_prefix("http://")
+        .or_else(|| url.strip_prefix("https://"))
+        .ok_or_else(|| format!("remote url must be http(s): {url}"))?;
+    let (host_port, _) = rest.split_once('/').unwrap_or((rest, ""));
+    let (host, port): (&str, u16) = if let Some((h, p)) = host_port.rsplit_once(':') {
+        (
+            h,
+            p.parse()
+                .map_err(|_| format!("bad port in remote url: {host_port}"))?,
+        )
+    } else {
+        (host_port, 80)
+    };
+    let addr = format!("{host}:{port}");
+    let mut stream = std::net::TcpStream::connect_timeout(
+        &addr
+            .parse()
+            .map_err(|e| format!("resolve {addr}: {e}"))?,
+        std::time::Duration::from_millis(timeout_ms.max(1)),
+    )
+    .map_err(|e| format!("connect {addr}: {e}"))?;
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_millis(timeout_ms.max(1))))
+        .ok();
+    stream
+        .set_write_timeout(Some(std::time::Duration::from_millis(timeout_ms.max(1))))
+        .ok();
+    let body = body.unwrap_or("");
+    let req = if method == "GET" {
+        format!(
+            "GET {path} HTTP/1.0\r\nHost: {host_port}\r\nConnection: close\r\n\r\n"
+        )
+    } else {
+        format!(
+            "{method} {path} HTTP/1.0\r\nHost: {host_port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    };
+    use std::io::{Read, Write};
+    stream
+        .write_all(req.as_bytes())
+        .map_err(|e| format!("write: {e}"))?;
+    let mut resp = String::new();
+    stream
+        .read_to_string(&mut resp)
+        .map_err(|e| format!("read: {e}"))?;
+    let Some((_, payload)) = resp.split_once("\r\n\r\n") else {
+        return Err("http: no header/body split".into());
+    };
+    if let Some(status_line) = resp.lines().next() {
+        if !status_line.contains(" 200 ") && !status_line.ends_with(" 200") {
+            return Err(format!("http status: {status_line}"));
+        }
+    }
+    Ok(payload.to_string())
+}
+
 fn aeron_scorer(root: &Path) -> RemoteAeronScorer {
     RemoteAeronScorer {
         config: std::env::var("AERON_CONFIG").unwrap_or_else(|_| {
@@ -273,14 +368,17 @@ fn resolve_auto(root: &Path, for_decide: bool) -> ResolvedScorer {
               "via": "auto",
           }));
       }
+      // Prefer real Myridos HTTP SemIf when the Copper LAN peer is up; do not use
+      // the Copper FNV `semif-score` stub (see SemifScoreWorker).
       if copper_health::prefer_copper(root) {
-          eprintln!("[wordkeep] semif backend auto → remote-copper (peer healthy)");
+          eprintln!("[wordkeep] semif backend auto → remote-myridos (peer healthy)");
           semif_telemetry::record_event(serde_json::json!({
               "kind": "backend_resolve",
-              "backend": "remote-copper",
+              "backend": "remote-myridos",
               "via": "auto",
+              "url": config::semif_remote_url(root),
           }));
-          return ResolvedScorer::Ready(Box::new(copper_scorer(root)), false);
+          return ResolvedScorer::Ready(Box::new(myridos_scorer(root)), false);
       }
     if copper_health::prefer_aeron(root) {
         eprintln!("[wordkeep] semif backend auto → remote-aeron (Copper down/cooldown)");
@@ -340,7 +438,18 @@ fn resolve_scorer_ex(root: &Path, for_decide: bool) -> ResolvedScorer {
         "remote-aeron" | "aeron" => {
             ResolvedScorer::Ready(Box::new(aeron_scorer(root)), false)
         }
+        "remote-myridos" | "myridos" | "remote-http" | "http" => {
+            ResolvedScorer::Ready(Box::new(myridos_scorer(root)), false)
+        }
+        "remote-djev" | "djev" => match config::semif_peer_djev_url(root) {
+            Some(url) => ResolvedScorer::Ready(Box::new(djev_scorer(root, &url)), false),
+            None => {
+                eprintln!("[wordkeep] semif backend djev: peer_lanes.djev_url unset; heuristic");
+                ResolvedScorer::Ready(Box::new(HeuristicScorer), true)
+            }
+        },
         "remote-copper" | "copper" => {
+            // Explicit pin only — FNV stub; prefer remote-myridos / auto.
             ResolvedScorer::Ready(Box::new(copper_scorer(root)), false)
         }
         other => {
@@ -413,7 +522,154 @@ impl Scorer for RemoteAeronScorer {
     }
 }
 
-/// Lane L: SemIf via Copper `semif-score` worker (needs elevated copper serve).
+/// Real letter-logit SemIf via Myridos `ereshkigal serve --http` (`/health` + `/rpc` score).
+/// Also used as the calibrated `djev` peer-lane proxy (`calibrated_proxy = true`).
+pub struct RemoteHttpScorer {
+    pub base_url: String,
+    pub root: PathBuf,
+    pub connect_timeout_ms: u64,
+    /// When true, apply post-hoc per-type temperature (`T >= 1.0`) and stamp calibrated.
+    pub calibrated_proxy: bool,
+    pub question_kind: String,
+    pub scorer_name: &'static str,
+}
+
+impl RemoteHttpScorer {
+    fn try_remote_score(&self, req: &DecisionRequest) -> Result<Vec<(String, f64)>, String> {
+        let tag = self.scorer_name;
+        http_exchange(
+            &self.base_url,
+            "GET",
+            "/health",
+            None,
+            self.connect_timeout_ms,
+        )
+        .map_err(|e| format!("{tag}_health:{e}"))?;
+        let params = json!({
+            "id": req.id,
+            "state": req.state,
+            "question": req.question,
+            "type": self.question_kind,
+            "options": req.options.iter().map(|o| json!({
+                "id": o.id,
+                "description": o.description,
+            })).collect::<Vec<_>>(),
+        });
+        let body = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "score",
+            "params": params,
+        })
+        .to_string();
+        let raw = http_exchange(
+            &self.base_url,
+            "POST",
+            "/rpc",
+            Some(&body),
+            self.connect_timeout_ms.max(5_000),
+        )
+        .map_err(|e| format!("{tag}_rpc:{e}"))?;
+        let v: Value = serde_json::from_str(&raw).map_err(|e| format!("{tag} json: {e}"))?;
+        let result = v.get("result").cloned().unwrap_or(v);
+        if let Some(err) = result.get("error") {
+            return Err(format!("{tag}_score:{err}"));
+        }
+        let scores_v = result
+            .get("scores")
+            .or_else(|| result.get("options"))
+            .cloned()
+            .unwrap_or(result);
+        let arr = scores_v
+            .as_array()
+            .ok_or_else(|| format!("{tag} score: expected scores array"))?;
+        let mut scores = Vec::new();
+        for item in arr {
+            if let Some(a) = item.as_array() {
+                let id = a
+                    .first()
+                    .and_then(|x| x.as_str())
+                    .ok_or("bad score id")?
+                    .to_string();
+                let s = a
+                    .get(1)
+                    .and_then(|x| x.as_f64())
+                    .ok_or("bad score val")?;
+                scores.push((id, s));
+            } else {
+                let id = item
+                    .get("id")
+                    .and_then(|x| x.as_str())
+                    .ok_or("bad score id")?
+                    .to_string();
+                let s = item
+                    .get("raw_score")
+                    .or_else(|| item.get("logit"))
+                    .or_else(|| item.get("score"))
+                    .and_then(|x| x.as_f64())
+                    .ok_or("bad score val")?;
+                scores.push((id, s));
+            }
+        }
+        if scores.is_empty() {
+            return Err(format!("{tag}_empty_scores"));
+        }
+        Ok(self.maybe_calibrate(scores))
+    }
+
+    fn maybe_calibrate(&self, scores: Vec<(String, f64)>) -> Vec<(String, f64)> {
+        if !self.calibrated_proxy {
+            return scores;
+        }
+        let temps = config::semif_type_temperatures(&self.root);
+        let t = temps.for_kind(&self.question_kind).max(1.0);
+        if (t - 1.0).abs() < 1e-12 {
+            return scores;
+        }
+        scores
+            .into_iter()
+            .map(|(id, logit)| (id, logit / t))
+            .collect()
+    }
+}
+
+impl Scorer for RemoteHttpScorer {
+    fn name(&self) -> &'static str {
+        self.scorer_name
+    }
+    fn revision(&self) -> &'static str {
+        if self.calibrated_proxy {
+            "djev-calibrated-v1"
+        } else {
+            "ereshkigal-http-v1"
+        }
+    }
+    fn score_one(&self, req: &DecisionRequest) -> Result<Vec<(String, f64)>, String> {
+        match self.try_remote_score(req) {
+            Ok(s) => Ok(s),
+            Err(e) => cascade_after_copper_fail(&self.root, req, &e),
+        }
+    }
+    fn score_detailed(&self, req: &DecisionRequest) -> Result<ScoreBundle, String> {
+        match self.try_remote_score(req) {
+            Ok(raw) => {
+                let mut b = ScoreBundle::from_raw(raw);
+                if self.calibrated_proxy {
+                    b.cascade_source = Some("djev-calibrated".into());
+                }
+                Ok(b)
+            }
+            Err(e) => {
+                let raw = cascade_after_copper_fail(&self.root, req, &e)?;
+                let mut b = ScoreBundle::from_raw(raw);
+                b.cascade_source = Some(format!("{name}→heuristic:{e}", name = self.scorer_name));
+                Ok(b)
+            }
+        }
+    }
+}
+
+/// Lane L: SemIf via Copper `semif-score` worker (FNV stub — explicit pin only).
 pub struct RemoteCopperScorer {
     pub config: String,
     pub root: PathBuf,
@@ -768,7 +1024,7 @@ fn decide_batch_wavefront(
 }
 
 /// Score one decision; returns a fully filled [`DecisionResult`].
-#[cfg(test)]
+/// Used by decree shared-scorer fallback and unit tests (must not be `cfg(test)`-only).
 pub fn decide_one(scorer: &dyn Scorer, req: &DecisionRequest, force_fallback: bool) -> DecisionResult {
     decide_one_at(None, scorer, req, force_fallback)
 }
@@ -779,6 +1035,7 @@ fn decide_one_at(
     req: &DecisionRequest,
     force_fallback: bool,
 ) -> DecisionResult {
+    let wall0 = Instant::now();
     let prompt = render_prompt(req);
     let heuristic_hash = sha256_hex(&prompt);
     // Hard abstain gates for vision evidence (clipped / missing / hash) — no silent argmax.
@@ -791,13 +1048,16 @@ fn decide_one_at(
                 prompt_sha256: heuristic_hash,
                 scorer: scorer.name().into(),
                 scorer_revision: scorer.revision().into(),
-                timing_us: 0,
+                timing_us: wall0.elapsed().as_micros() as u64,
                 calibrated: false,
                 fallback: true,
                 cascade_source: Some("visual-abstain:clipped".into()),
                 cascade_set_size: None,
                 abstain: true,
                 abstain_reason: Some("clipped".into()),
+                think_invoked: false,
+                think_tokens: 0,
+                p0_vs_p1_flipped: false,
             };
         }
         if let Err(e) = ev.verify_hashes() {
@@ -813,40 +1073,72 @@ fn decide_one_at(
                 prompt_sha256: heuristic_hash,
                 scorer: scorer.name().into(),
                 scorer_revision: scorer.revision().into(),
-                timing_us: 0,
+                timing_us: wall0.elapsed().as_micros() as u64,
                 calibrated: false,
                 fallback: true,
                 cascade_source: Some(format!("visual-abstain:{reason}")),
                 cascade_set_size: None,
                 abstain: true,
                 abstain_reason: Some(reason.into()),
+                think_invoked: false,
+                think_tokens: 0,
+                p0_vs_p1_flipped: false,
             };
         }
     }
-    let (bundle, fallback) = match root {
+    let (bundle, fallback, winning_scorer) = match root {
         Some(root) => match score_with_policy(root, scorer, req) {
-            Ok(b) => (b, force_fallback),
-            Err(e) => {
-                eprintln!("[wordkeep] semif scorer error: {e}");
-                return DecisionResult {
-                    id: req.id.clone(),
-                    options: Vec::new(),
-                    chosen: String::new(),
-                    prompt_sha256: heuristic_hash,
-                    scorer: scorer.name().into(),
-                    scorer_revision: scorer.revision().into(),
-                    timing_us: 0,
-                    calibrated: false,
-                    fallback: true,
-                    cascade_source: Some("error".into()),
-                    cascade_set_size: None,
-                    abstain: false,
-                    abstain_reason: None,
+            Ok(b) => {
+                let cascaded = b
+                    .cascade_source
+                    .as_deref()
+                    .map(|s| s.contains('→') || s.contains("heuristic"))
+                    .unwrap_or(false);
+                let name = if cascaded
+                    && b.cascade_source
+                        .as_deref()
+                        .map(|s| s.contains("heuristic"))
+                        .unwrap_or(false)
+                {
+                    "heuristic"
+                } else {
+                    scorer.name()
                 };
+                (b, force_fallback || cascaded, name)
+            }
+            Err(e) => {
+                eprintln!("[wordkeep] semif scorer error → heuristic: {e}");
+                match HeuristicScorer.score_detailed(req) {
+                    Ok(mut b) => {
+                        b.cascade_source =
+                            Some(format!("error→heuristic:{}", e.chars().take(120).collect::<String>()));
+                        (b, true, "heuristic")
+                    }
+                    Err(e2) => {
+                        return DecisionResult {
+                            id: req.id.clone(),
+                            options: Vec::new(),
+                            chosen: String::new(),
+                            prompt_sha256: heuristic_hash,
+                            scorer: scorer.name().into(),
+                            scorer_revision: scorer.revision().into(),
+                            timing_us: wall0.elapsed().as_micros() as u64,
+                            calibrated: false,
+                            fallback: true,
+                            cascade_source: Some("error".into()),
+                            cascade_set_size: None,
+                            abstain: true,
+                            abstain_reason: Some(format!("{e}; heuristic:{e2}")),
+                            think_invoked: false,
+                            think_tokens: 0,
+                            p0_vs_p1_flipped: false,
+                        };
+                    }
+                }
             }
         },
         None => match scorer.score_detailed(req) {
-            Ok(b) => (b, force_fallback),
+            Ok(b) => (b, force_fallback, scorer.name()),
             Err(e) => {
                 eprintln!("[wordkeep] semif scorer error, uniform fallback: {e}");
                 let n = req.options.len().max(1) as f64;
@@ -860,15 +1152,24 @@ fn decide_one_at(
                         already_normalized: true,
                         averaged_probs: None,
                         prompt_sha256: None,
-                        cascade_source: None,
+                        cascade_source: Some(format!("error→uniform:{}", e.chars().take(80).collect::<String>())),
                         cascade_set_size: None,
                     },
                     true,
+                    "heuristic",
                 )
             }
         },
     };
-    decide_from_bundle(root, scorer, req, bundle, fallback)
+    decide_from_bundle_timed(
+        root,
+        winning_scorer,
+        scorer.revision(),
+        req,
+        bundle,
+        fallback,
+        wall0,
+    )
 }
 
 fn decide_from_bundle(
@@ -878,14 +1179,47 @@ fn decide_from_bundle(
     bundle: ScoreBundle,
     fallback: bool,
 ) -> DecisionResult {
-    let t0 = Instant::now();
+    decide_from_bundle_timed(
+        root,
+        scorer.name(),
+        scorer.revision(),
+        req,
+        bundle,
+        fallback,
+        Instant::now(),
+    )
+}
+
+fn decide_from_bundle_timed(
+    root: Option<&Path>,
+    scorer_name: &str,
+    scorer_revision: &str,
+    req: &DecisionRequest,
+    bundle: ScoreBundle,
+    fallback: bool,
+    wall0: Instant,
+) -> DecisionResult {
     let heuristic_hash = sha256_hex(&render_prompt(req));
     let temperature = root.map(config::semif_temperature).unwrap_or(1.0);
-    let (probs, calibrated) = apply_decision_temperature(&bundle, temperature);
+    let (probs, mut calibrated) = apply_decision_temperature(&bundle, temperature);
+    if bundle
+        .cascade_source
+        .as_deref()
+        .map(|s| s.contains("djev-calibrated"))
+        .unwrap_or(false)
+        || scorer_name == "remote-djev"
+    {
+        calibrated = true;
+    }
     let soft_abstain = bundle
         .cascade_source
         .as_deref()
         .map(|s| s.starts_with("visual-abstain:") || s.contains("→exact") || s.contains("low_visual"))
+        .unwrap_or(false);
+    let cascade_fallback = bundle
+        .cascade_source
+        .as_deref()
+        .map(|s| s.contains("→heuristic") || s.starts_with("error"))
         .unwrap_or(false);
     let chosen = probs
         .iter()
@@ -906,7 +1240,13 @@ fn decide_from_bundle(
         .prompt_sha256
         .clone()
         .unwrap_or(heuristic_hash);
-    let timing_us = t0.elapsed().as_micros() as u64;
+    let timing_us = wall0.elapsed().as_micros() as u64;
+    let fallback = fallback || soft_abstain || cascade_fallback;
+    let abstain = chosen.is_empty() && !options.is_empty();
+    // AutoThink fields are filled by score_autothink callers (Phase 3); default off here.
+    let think_invoked = false;
+    let think_tokens = 0u32;
+    let p0_vs_p1_flipped = false;
     if let Some(root) = root {
         #[cfg(feature = "ereshkigal")]
         let warm = crate::semif_gguf::is_warm();
@@ -917,14 +1257,23 @@ fn decide_from_bundle(
             "chosen": chosen,
             "timing_us": timing_us,
             "warm": warm,
-            "fallback": fallback || soft_abstain,
+            "fallback": fallback,
             "calibrated": calibrated,
             "temperature": temperature,
-            "scorer": scorer.name(),
+            "scorer": scorer_name,
             "cascade_source": bundle.cascade_source,
             "cascade_set_size": bundle.cascade_set_size,
             "kind": "decide",
             "has_visual_evidence": req.visual_evidence.is_some(),
+            "abstain": abstain,
+            "think_invoked": think_invoked,
+            "think_tokens": think_tokens,
+            "p0_vs_p1_flipped": p0_vs_p1_flipped,
+            "prompt_sha256": prompt_sha256,
+            "probabilities": options.iter().map(|o| json!({
+                "id": o.id,
+                "probability": o.probability,
+            })).collect::<Vec<_>>(),
         }));
         let _ = root;
     }
@@ -933,15 +1282,22 @@ fn decide_from_bundle(
         options,
         chosen,
         prompt_sha256,
-        scorer: scorer.name().into(),
-        scorer_revision: scorer.revision().into(),
+        scorer: scorer_name.into(),
+        scorer_revision: scorer_revision.into(),
         timing_us,
         calibrated,
-        fallback: fallback || soft_abstain,
+        fallback,
         cascade_source: bundle.cascade_source,
         cascade_set_size: bundle.cascade_set_size,
-        abstain: false,
-        abstain_reason: None,
+        abstain,
+        abstain_reason: if abstain {
+            Some("empty_chosen".into())
+        } else {
+            None
+        },
+        think_invoked,
+        think_tokens,
+        p0_vs_p1_flipped,
     }
 }
 
@@ -1004,6 +1360,19 @@ pub fn decide(root: &Path, args: &Value) -> Result<String, String> {
             }
             reqs.push(req);
         }
+        let packing = args
+            .get("packing")
+            .and_then(Value::as_str)
+            .unwrap_or("auto");
+        // Wordkeep draft wavefront uses shared-KV / serial score_batch; true
+        // joint-options-v1 single-batch multi-ANSWER: decoding lives in ereshkigal
+        // serve `/v1/systemone` (packing=joint). Record the requested packing for
+        // telemetry honesty without silently claiming joint when we didn't run it.
+        let packing_used = match packing {
+            "joint" => "shared_kv", // MCP wavefront cannot yet emit joint ANSWER: logits
+            "shared_kv" => "shared_kv",
+            _ => "auto",
+        };
         let t0 = Instant::now();
         // Wavefront: draft-score all → compact uncertain → CPU → verify → scatter.
         let results = decide_batch_wavefront(root, scorer.as_ref(), &reqs, &state, unknown);
@@ -1013,6 +1382,8 @@ pub fn decide(root: &Path, args: &Value) -> Result<String, String> {
             "state_chars": state.len(),
             "count": results.len(),
             "timing_us": timing_us,
+            "packing": packing,
+            "packing_used": packing_used,
             "results": results.iter().map(result_to_json).collect::<Vec<_>>(),
         });
         let text = serde_json::to_string_pretty(&out).map_err(|e| e.to_string())?;
@@ -1202,7 +1573,18 @@ fn parse_request_row(args: &Value, state_override: Option<&str>) -> Result<Decis
     if question.is_empty() {
         return Err("question is required".into());
     }
-    let options = parse_options(args.get("options"))?;
+    let mut options = parse_options(args.get("options"))?;
+    if args
+        .get("include_none")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        && !options.iter().any(|o| o.id == "none")
+    {
+        options.push(OptionSpec {
+            id: "none".into(),
+            description: "None of the above / abstain".into(),
+        });
+    }
     let visual_evidence = VisualEvidence::from_args(args)?;
     Ok(DecisionRequest {
         id,
@@ -1217,6 +1599,18 @@ fn parse_options(v: Option<&Value>) -> Result<Vec<OptionSpec>, String> {
     let arr = v.and_then(Value::as_array).ok_or("options must be an array")?;
     let mut out = Vec::with_capacity(arr.len());
     for (i, o) in arr.iter().enumerate() {
+        // Shorthand: "keep" or ["keep","revert"] element as string.
+        if let Some(s) = o.as_str() {
+            let id = s.trim().to_string();
+            if id.is_empty() {
+                return Err(format!("options[{i}] string shorthand is empty"));
+            }
+            out.push(OptionSpec {
+                description: id.clone(),
+                id,
+            });
+            continue;
+        }
         let id = o
             .get("id")
             .and_then(Value::as_str)
@@ -1225,16 +1619,22 @@ fn parse_options(v: Option<&Value>) -> Result<Vec<OptionSpec>, String> {
             .to_string();
         let description = o
             .get("description")
+            .or_else(|| o.get("label"))
+            .or_else(|| o.get("desc"))
             .and_then(Value::as_str)
             .unwrap_or("")
             .trim()
             .to_string();
+        // Optional typed options (noul/choice/score) — description may equal id.
+        let _kind = o.get("type").and_then(Value::as_str);
         if id.is_empty() {
             return Err(format!("options[{i}].id is required"));
         }
-        if description.is_empty() {
-            return Err(format!("options[{i}].description is required"));
-        }
+        let description = if description.is_empty() {
+            id.clone()
+        } else {
+            description
+        };
         out.push(OptionSpec { id, description });
     }
     Ok(out)
@@ -1341,6 +1741,9 @@ fn result_to_json(r: &DecisionResult) -> Value {
         "cascade_set_size": r.cascade_set_size,
         "abstain": r.abstain,
         "abstain_reason": r.abstain_reason,
+        "think_invoked": r.think_invoked,
+        "think_tokens": r.think_tokens,
+        "p0_vs_p1_flipped": r.p0_vs_p1_flipped,
         "visual_logits_available": semif_visual::visual_logits_available(),
     })
 }
@@ -1598,6 +2001,99 @@ mod tests {
             .expect("heuristic cascade");
         assert!(!scores.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Pre-change / honesty contract: scorer Err must never look like a successful
+    /// empty choice (chosen="", abstain=false). Fix lands in Phase 1a.
+    #[test]
+    fn scorer_error_must_not_return_empty_chosen_without_abstain() {
+        struct Boom;
+        impl Scorer for Boom {
+            fn name(&self) -> &'static str {
+                "boom"
+            }
+            fn revision(&self) -> &'static str {
+                "test"
+            }
+            fn score_one(&self, _req: &DecisionRequest) -> Result<Vec<(String, f64)>, String> {
+                Err("forced NoKvCacheSlot".into())
+            }
+        }
+        let dir = std::env::temp_dir().join(format!("wk_semif_err_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".wordkeep")).unwrap();
+        std::fs::write(
+            dir.join(".wordkeep/config.json"),
+            r#"{"semif":{"enabled":true,"backend":"heuristic"}}"#,
+        )
+        .unwrap();
+        let r = decide_one_at(Some(&dir), &Boom, &support_req(), false);
+        assert!(
+            r.abstain || !r.chosen.is_empty(),
+            "dishonest empty chosen: abstain={} chosen={:?} cascade={:?}",
+            r.abstain,
+            r.chosen,
+            r.cascade_source
+        );
+        assert!(r.fallback, "scorer error must mark fallback");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Copper blip path must yield non-empty option ids (heuristic/Aeron/GGUF),
+    /// never an empty score vector that would collapse to chosen="".
+    #[test]
+    fn copper_failure_honesty_yields_non_empty_scores() {
+        let dir = std::env::temp_dir().join(format!("wk_semif_cu_hon_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".wordkeep")).unwrap();
+        std::fs::write(
+            dir.join(".wordkeep/config.json"),
+            r#"{"semif":{"enabled":true,"backend":"remote-copper"}}"#,
+        )
+        .unwrap();
+        let scores = cascade_after_copper_fail(&dir, &support_req(), "honesty_pin")
+            .expect("cascade must return scores");
+        assert!(!scores.is_empty());
+        for (id, s) in &scores {
+            assert!(!id.is_empty(), "empty option id in cascade scores");
+            assert!(s.is_finite(), "non-finite score for {id}");
+        }
+        let bundle = ScoreBundle::from_raw(scores);
+        let r = decide_from_bundle(Some(&dir), &HeuristicScorer, &support_req(), bundle, true);
+        assert!(!r.chosen.is_empty(), "fallback decide must pick an id");
+        assert!(r.fallback, "cascade path must stamp fallback=true");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// direct-options-v1 / MCP contract: classic {id,description} still parses;
+    /// shorthand strings are accepted once Phase 1c lands (both must work).
+    #[test]
+    fn parse_options_direct_v1_and_shorthand_parity() {
+        let classic = parse_options(Some(&json!([
+            {"id": "keep", "description": "Keep the change"},
+            {"id": "revert", "description": "Revert the change"}
+        ])))
+        .expect("classic options");
+        assert_eq!(classic.len(), 2);
+        assert_eq!(classic[0].id, "keep");
+
+        let shorthand = parse_options(Some(&json!(["keep", "revert"])));
+        assert!(
+            shorthand.is_ok(),
+            "string shorthand must parse (Phase 1c): {shorthand:?}"
+        );
+        let short = shorthand.unwrap();
+        assert_eq!(short.len(), 2);
+        assert_eq!(short[0].id, "keep");
+
+        let aliases = parse_options(Some(&json!([
+            {"id": "a", "label": "Alpha"},
+            {"id": "b", "desc": "Bravo"}
+        ])));
+        assert!(
+            aliases.is_ok(),
+            "label/desc aliases must parse (Phase 1c): {aliases:?}"
+        );
     }
 
     #[test]
@@ -1994,6 +2490,135 @@ mod tests {
                 }
             }
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Non-decorative: a healthy local HTTP SemIf peer must fill scores via RemoteHttpScorer.
+    #[test]
+    fn remote_http_scorer_healthy_peer_returns_scores() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::thread;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().unwrap();
+        thread::spawn(move || {
+            for stream in listener.incoming().take(2) {
+                let Ok(mut s) = stream else { continue };
+                let mut buf = [0u8; 4096];
+                let _ = s.read(&mut buf);
+                let req = String::from_utf8_lossy(&buf);
+                let body = if req.contains("GET /health") {
+                    r#"{"ok":true}"#
+                } else {
+                    r#"{"jsonrpc":"2.0","id":1,"result":{"scores":[["yes",2.0],["no",0.1]]}}"#
+                };
+                let resp = format!(
+                    "HTTP/1.0 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = s.write_all(resp.as_bytes());
+            }
+        });
+        let dir = std::env::temp_dir().join(format!("wk_http_ok_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".wordkeep")).unwrap();
+        let scorer = RemoteHttpScorer {
+            base_url: format!("http://{addr}"),
+            root: dir.clone(),
+            connect_timeout_ms: 500,
+            calibrated_proxy: false,
+            question_kind: "choice".into(),
+            scorer_name: "remote-myridos",
+        };
+        let scores = scorer.score_one(&support_req()).expect("healthy peer");
+        assert_eq!(scores.len(), 2);
+        assert_eq!(scores[0].0, "yes");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Non-decorative: HTTP 500 / dead peer must failover without empty chosen.
+    #[test]
+    fn remote_http_scorer_failover_on_http_error() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::thread;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().unwrap();
+        thread::spawn(move || {
+            if let Ok((mut s, _)) = listener.accept() {
+                let mut buf = [0u8; 1024];
+                let _ = s.read(&mut buf);
+                let resp = "HTTP/1.0 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                let _ = s.write_all(resp.as_bytes());
+            }
+        });
+        let dir = std::env::temp_dir().join(format!("wk_http_fail_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".wordkeep")).unwrap();
+        std::fs::write(
+            dir.join(".wordkeep/config.json"),
+            r#"{"semif":{"enabled":true,"backend":"heuristic"}}"#,
+        )
+        .unwrap();
+        let scorer = RemoteHttpScorer {
+            base_url: format!("http://{addr}"),
+            root: dir.clone(),
+            connect_timeout_ms: 300,
+            calibrated_proxy: false,
+            question_kind: "choice".into(),
+            scorer_name: "remote-myridos",
+        };
+        let r = decide_one_at(Some(&dir), &scorer, &support_req(), false);
+        assert!(
+            r.abstain || !r.chosen.is_empty(),
+            "failover must not empty-chosen: {:?}",
+            r
+        );
+        assert!(r.fallback || r.scorer == "heuristic" || r.cascade_source.is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn djev_calibrated_proxy_marks_calibrated() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::thread;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().unwrap();
+        thread::spawn(move || {
+            for stream in listener.incoming().take(2) {
+                let Ok(mut s) = stream else { continue };
+                let mut buf = [0u8; 4096];
+                let _ = s.read(&mut buf);
+                let req = String::from_utf8_lossy(&buf);
+                let body = if req.contains("GET /health") {
+                    r#"{"ok":true}"#
+                } else {
+                    r#"{"jsonrpc":"2.0","id":1,"result":{"scores":[["yes",1.0],["no",1.0]]}}"#
+                };
+                let resp = format!(
+                    "HTTP/1.0 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = s.write_all(resp.as_bytes());
+            }
+        });
+        let dir = std::env::temp_dir().join(format!("wk_djev_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".wordkeep")).unwrap();
+        std::fs::write(
+            dir.join(".wordkeep/config.json"),
+            r#"{"semif":{"calibration":{"T_choice":1.5}}}"#,
+        )
+        .unwrap();
+        let scorer = djev_scorer(&dir, &format!("http://{addr}"));
+        let r = decide_one_at(Some(&dir), &scorer, &support_req(), false);
+        assert!(!r.chosen.is_empty());
+        assert!(r.calibrated, "djev proxy must stamp calibrated");
+        assert_eq!(r.scorer, "remote-djev");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

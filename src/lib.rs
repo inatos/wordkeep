@@ -54,6 +54,16 @@ mod shrift;
 mod stats;
 mod tacet;
 mod task_lan;
+
+/// Example / smoke helper: `task_submit` against a real workspace root.
+pub fn task_lan_submit_for_test(
+    root: &std::path::Path,
+    job: &str,
+    wait: bool,
+) -> Result<String, String> {
+    let args = serde_json::json!({ "job": job, "wait": wait });
+    task_lan::submit(root, &args)
+}
 mod symbol_context;
 mod symbol_def;
 mod symbol_diff;

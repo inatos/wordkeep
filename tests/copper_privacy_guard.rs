@@ -38,6 +38,8 @@ fn no_new_copper_hits_outside_grandfather() {
             "--glob",
             "!**/target/**",
             "--glob",
+            "!**/target-*/**",
+            "--glob",
             "!**/node_modules/**",
             "--glob",
             "!**/dist/**",
@@ -86,7 +88,11 @@ fn walk_copper_hits(root: &Path) -> Vec<String> {
         for entry in entries.flatten() {
             let path = entry.path();
             let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
-            if name == "target" || name == "node_modules" || name == "dist" {
+            if name == "target"
+                || name.starts_with("target-")
+                || name == "node_modules"
+                || name == "dist"
+            {
                 continue;
             }
             if path.is_dir() {

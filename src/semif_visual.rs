@@ -273,10 +273,56 @@ pub fn score_hybrid(
     text_scorer: &dyn Scorer,
     req: &DecisionRequest,
 ) -> Result<(ScoreBundle, bool, Option<String>), String> {
-    if req.visual_evidence.is_none() {
+    let Some(ev) = &req.visual_evidence else {
         let b = text_scorer.score_detailed(req)?;
         return Ok((b, false, None));
+    };
+    // Enforce protocol_version:1 / clipped / hash fences before any visual model call.
+    if ev.protocol_version != VisualEvidence::PROTOCOL_V1 {
+        let mut exact = text_scorer.score_detailed(req)?;
+        exact.cascade_source = Some("visual-abstain:protocol".into());
+        return Ok((exact, true, Some("protocol".into())));
     }
+    if ev.clipped {
+        let mut exact = text_scorer.score_detailed(req)?;
+        exact.cascade_source = Some("visual-abstain:clipped".into());
+        return Ok((exact, true, Some("clipped".into())));
+    }
+    if let Err(e) = ev.verify_hashes() {
+        let reason = if e.contains("hash mismatch") {
+            "hash_mismatch"
+        } else {
+            "missing_source"
+        };
+        let mut exact = text_scorer.score_detailed(req)?;
+        exact.cascade_source = Some(format!("visual-abstain:{reason}"));
+        return Ok((exact, true, Some(reason.into())));
+    }
+
+    // When visual_logits + ereshkigal are compiled and semif.mmproj is configured,
+    // attempt true mtmd/mmproj image-token logits first; fall back to hybrid draft on Err.
+    #[cfg(all(feature = "visual_logits", feature = "ereshkigal"))]
+    if crate::config::semif_mmproj_path(root).is_some() {
+        let engine = EreshkigalVisualEngine::new(root);
+        if let Ok(bundle) = engine.score_image_options_with_state(
+            &ev.png_paths,
+            &req.state,
+            &req.question,
+            &req.options,
+        ) {
+            let mut probs = crate::semif::softmax_labeled(&bundle.raw);
+            probs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            let top = probs.first().map(|(_, p)| *p).unwrap_or(0.0);
+            let second = probs.get(1).map(|(_, p)| *p).unwrap_or(0.0);
+            if top - second >= 0.15 && top >= 0.35 {
+                return Ok((bundle, false, None));
+            }
+            let mut exact = text_scorer.score_detailed(req)?;
+            exact.cascade_source = Some("visual-mtmd→exact".into());
+            return Ok((exact, true, Some("low_visual_margin".into())));
+        }
+    }
+
     let visual = VisualDraftScorer::new(root);
     match visual.draft_or_abstain(req) {
         Ok(draft) => {
@@ -303,7 +349,7 @@ pub fn score_hybrid(
     }
 }
 
-/// Gated scaffold for true image-token logits (no weights in v1).
+/// Gated interface for true image-token logits via mtmd/mmproj.
 #[cfg(feature = "visual_logits")]
 pub trait VisualLogitEngine: Send + Sync {
     fn score_image_options(
@@ -316,12 +362,163 @@ pub trait VisualLogitEngine: Send + Sync {
 
 #[cfg(feature = "visual_logits")]
 pub fn visual_logits_available() -> bool {
+    // True image-token path when feature is on; mmproj may still abstain at runtime.
     true
 }
 
 #[cfg(not(feature = "visual_logits"))]
 pub fn visual_logits_available() -> bool {
     false
+}
+
+#[cfg(all(feature = "visual_logits", feature = "ereshkigal"))]
+struct CachedVisualRuntime {
+    gguf: PathBuf,
+    mmproj: PathBuf,
+    engine: ereshkigal_core::EngineOwned,
+    vctx: ereshkigal_core::vision::VisionContext,
+}
+
+#[cfg(all(feature = "visual_logits", feature = "ereshkigal"))]
+static VISUAL_RUNTIME: std::sync::Mutex<Option<CachedVisualRuntime>> = std::sync::Mutex::new(None);
+
+/// Bridge to `ereshkigal-core` mtmd/mmproj visual logits when `visual_logits` is enabled.
+#[cfg(all(feature = "visual_logits", feature = "ereshkigal"))]
+#[derive(Clone, Debug)]
+pub struct EreshkigalVisualEngine {
+    pub root: PathBuf,
+}
+
+#[cfg(all(feature = "visual_logits", feature = "ereshkigal"))]
+impl Default for EreshkigalVisualEngine {
+    fn default() -> Self {
+        Self {
+            root: PathBuf::from("."),
+        }
+    }
+}
+
+#[cfg(all(feature = "visual_logits", feature = "ereshkigal"))]
+impl EreshkigalVisualEngine {
+    pub fn new(root: &Path) -> Self {
+        Self {
+            root: root.to_path_buf(),
+        }
+    }
+
+    pub fn score_image_options_with_state(
+        &self,
+        png_paths: &[PathBuf],
+        state: &str,
+        question: &str,
+        options: &[OptionSpec],
+    ) -> Result<ScoreBundle, String> {
+        let Some(mmproj) = crate::config::semif_mmproj_path(&self.root) else {
+            return Err(
+                "mmproj not configured (semif.mmproj / ERESHKIGAL_MMPROJ); abstain to text SoT"
+                    .into(),
+            );
+        };
+        let eff_state = if state.trim().is_empty() {
+            "[visual evidence]"
+        } else {
+            state
+        };
+        let row = ereshkigal_core::DecisionRow {
+            id: "visual".into(),
+            state: serde_json::Value::String(eff_state.to_string()),
+            question: question.to_string(),
+            options: options
+                .iter()
+                .map(|o| ereshkigal_core::OptionSpec {
+                    id: o.id.clone(),
+                    description: o.description.clone(),
+                })
+                .collect(),
+        };
+        let mut vcfg = ereshkigal_core::vision::VisionConfig::from_mmproj(mmproj.clone());
+        let n_gpu_layers = crate::config::semif_n_gpu_layers(&self.root);
+        let threads = crate::config::semif_threads(&self.root).max(1);
+        vcfg.use_gpu = n_gpu_layers > 0;
+        vcfg.n_threads = threads;
+        let path_refs: Vec<&Path> = png_paths.iter().map(PathBuf::as_path).collect();
+
+        if !mmproj.is_file() {
+            // Delegate through ereshkigal-core vision guard so abstain semantics stay unified.
+            return ereshkigal_core::vision::score_visual_logits(None, &vcfg, &path_refs, &row)
+                .map(|_| unreachable!())
+                .map_err(|e| e.to_string());
+        }
+        let Some(gguf) = crate::config::semif_gguf_path(&self.root).filter(|p| p.is_file()) else {
+            return ereshkigal_core::vision::score_visual_logits(None, &vcfg, &path_refs, &row)
+                .map(|_| unreachable!())
+                .map_err(|e| e.to_string());
+        };
+
+        let mut slot = VISUAL_RUNTIME.lock().map_err(|e| e.to_string())?;
+        let need_load = match slot.as_ref() {
+            Some(c) => c.gguf != gguf || c.mmproj != mmproj,
+            None => true,
+        };
+        if need_load {
+            let ecfg = ereshkigal_core::EngineConfig {
+                gguf: gguf.clone(),
+                tokenizer_source: crate::config::semif_tokenizer_source(&self.root),
+                tokenizer_revision: crate::config::semif_tokenizer_revision(&self.root),
+                max_prompt_tokens: crate::config::semif_max_prompt_tokens(&self.root).max(512),
+                threads,
+                n_gpu_layers,
+                n_seq_max: 1,
+                embeddings: false,
+                adapter: None,
+                adapter_scale: 1.0,
+            };
+            let (engine, _tok) =
+                ereshkigal_core::EngineOwned::load(ecfg).map_err(|e| e.to_string())?;
+            let vctx = ereshkigal_core::vision::VisionContext::load(&vcfg, &engine)
+                .map_err(|e| e.to_string())?;
+            *slot = Some(CachedVisualRuntime {
+                gguf,
+                mmproj,
+                engine,
+                vctx,
+            });
+        }
+        let cached = slot.as_mut().expect("visual runtime populated");
+        let logits = ereshkigal_core::vision::score_visual_logits_with_ctx(
+            &mut cached.engine,
+            &cached.vctx,
+            &path_refs,
+            &row,
+        )
+        .map_err(|e| e.to_string())?;
+        let raw: Vec<(String, f64)> = options
+            .iter()
+            .zip(logits.into_iter())
+            .map(|(o, l)| (o.id.clone(), l as f64))
+            .collect();
+        Ok(ScoreBundle {
+            raw,
+            already_normalized: false,
+            averaged_probs: None,
+            prompt_sha256: None,
+            cascade_source: Some("visual-mtmd".into()),
+            cascade_set_size: None,
+        })
+    }
+}
+
+#[cfg(all(feature = "visual_logits", feature = "ereshkigal"))]
+impl VisualLogitEngine for EreshkigalVisualEngine {
+    fn score_image_options(
+        &self,
+        png_paths: &[PathBuf],
+        question: &str,
+        options: &[OptionSpec],
+    ) -> Result<ScoreBundle, String> {
+        // SemIf prompt validation requires nonempty state; visual-only calls use a probe stub.
+        self.score_image_options_with_state(png_paths, "visual evidence", question, options)
+    }
 }
 
 /// Telemetry tip for agents / decrees.
@@ -445,5 +642,36 @@ mod tests {
         let v = json!({"png_paths": ["/tmp/x.png"]});
         let err = VisualEvidence::from_args(&json!({"visual_evidence": v})).unwrap_err();
         assert!(err.contains("protocol_version"), "{err}");
+    }
+
+    #[cfg(all(feature = "visual_logits", feature = "ereshkigal"))]
+    #[test]
+    fn visual_engine_abstains_when_mmproj_unconfigured_or_missing() {
+        let dir = tmp();
+        let engine = EreshkigalVisualEngine::new(&dir);
+        let opts = vec![
+            OptionSpec {
+                id: "yes".into(),
+                description: "Yes".into(),
+            },
+            OptionSpec {
+                id: "no".into(),
+                description: "No".into(),
+            },
+        ];
+        // Unconfigured root abstains cleanly.
+        let err = engine.score_image_options(&[], "Q?", &opts).unwrap_err();
+        assert!(err.contains("abstain"), "{err}");
+
+        // Configured with missing mmproj file abstains cleanly through ereshkigal-core::vision.
+        let wk = dir.join(".wordkeep");
+        fs::create_dir_all(&wk).unwrap();
+        fs::write(
+            wk.join("config.json"),
+            r#"{"semif":{"mmproj":"/nonexistent/mmproj.gguf"}}"#,
+        )
+        .unwrap();
+        let err2 = engine.score_image_options(&[], "Q?", &opts).unwrap_err();
+        assert!(err2.contains("mmproj not found"), "{err2}");
     }
 }

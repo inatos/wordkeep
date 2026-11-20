@@ -38,8 +38,8 @@ dashboard = ["dep:ratatui"]
 # stays heuristic-only; Betwixt launchers pass ereshkigal-vulkan (GPU offload).
 ereshkigal = ["dep:ereshkigal-core"]
 ereshkigal-vulkan = ["ereshkigal", "ereshkigal-core/vulkan"]
-# Scaffold for true image-token logits (no multimodal weights in v1).
-visual_logits = []
+# True image-token logits via llama.cpp mtmd / mmproj (enables ereshkigal-core/vision).
+visual_logits = ["ereshkigal", "ereshkigal-core/vision"]
 
 [dependencies]
 serde_json = "1"

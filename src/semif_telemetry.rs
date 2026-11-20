@@ -58,6 +58,8 @@ pub fn write_status(root: &Path, extra: Value) {
           "adapter": crate::config::semif_adapter_path(root).map(|p| p.display().to_string()),
           "decrees": crate::config::semif_decrees_path(root).map(|p| p.display().to_string()),
           "serve_bin": crate::config::semif_serve_bin(root).map(|p| p.display().to_string()),
+          "remote_url": crate::config::semif_remote_url(root),
+          "decree_subprocess": crate::config::semif_decree_subprocess(root),
       });
       #[cfg(any(test, feature = "ereshkigal"))]
       if let Some(obj) = core.as_object_mut() {

@@ -13,3 +13,11 @@ tools/wordkeep/src/task_lan.rs
 tools/wordkeep/tests/eval_optical.rs
 tools/wordkeep/tests/fixtures/copper_grandfather.txt
 tools/wordkeep/tests/copper_privacy_guard.rs
+tools/wordkeep/tests/mcp_stdio.rs
+tools/wordkeep/crates/wordkeep-wiki/src/semif.rs
+tools/wordkeep/crates/wordkeep-wiki/src/elucifia.rs
+tools/wordkeep/crates/wordkeep-wiki/src/providers.rs
+tools/wordkeep/wiki/src/lib/ElucifiaBoard.svelte
+tools/wordkeep/wiki/src/lib/api.ts
+tools/wordkeep/wiki/src/lib/elucifia/ElucifiaInspector.svelte
+tools/wordkeep/wiki/src/lib/toolHelp.ts
