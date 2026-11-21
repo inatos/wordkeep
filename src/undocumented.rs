@@ -45,12 +45,12 @@ pub fn build(root: &Path, args: &Value) -> Result<String, String> {
     let mut items: Vec<Item> = Vec::new();
     for p in &paths {
         let base = root.join(p);
-        for entry in walk::files(&base, &prune) {
-            let path = entry.path();
+        for path_owned in walk::files(&base, &prune) {
+            let path = path_owned.as_path();
             let Some(lang) = Lang::from_path(path) else {
                 continue;
             };
-            let Ok(meta) = entry.metadata() else { continue };
+            let Ok(meta) = path.metadata() else { continue };
             let mt = cache::mtime_ns(&meta);
             let rel = path
                 .strip_prefix(root)

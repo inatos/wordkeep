@@ -1,5 +1,5 @@
 use crate::config::WikiConfig;
-use crate::meili::MeiliClient;
+use crate::search_backend::SearchBackend;
 use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -19,23 +19,23 @@ pub(crate) struct DocFile {
 }
 
 #[derive(Clone, Debug, Serialize)]
-struct ChunkDocument {
-    id: String,
-    path: String,
-    heading: String,
-    heading_path: Vec<String>,
-    heading_level: u8,
-    anchor: String,
-    body: String,
-    content: String,
-    kind: String,
-    root: String,
-    tags: Vec<String>,
-    start_line: usize,
-    end_line: usize,
-    mtime_ns: u64,
-    content_hash: String,
-    updated_at: u64,
+pub(crate) struct ChunkDocument {
+    pub id: String,
+    pub path: String,
+    pub heading: String,
+    pub heading_path: Vec<String>,
+    pub heading_level: u8,
+    pub anchor: String,
+    pub body: String,
+    pub content: String,
+    pub kind: String,
+    pub root: String,
+    pub tags: Vec<String>,
+    pub start_line: usize,
+    pub end_line: usize,
+    pub mtime_ns: u64,
+    pub content_hash: String,
+    pub updated_at: u64,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -63,10 +63,10 @@ enum SyncResult {
 pub(crate) async fn index_workspace(
     root: &Path,
     config: &WikiConfig,
-    meili: &MeiliClient,
+    search: &SearchBackend,
     full: bool,
 ) -> Result<IndexSummary, String> {
-    meili.ensure_index().await?;
+    search.ensure_index(root, config).await?;
     let documents = collect_docs(root, config)?;
     let mut manifest = load_manifest(root)?;
     let mut summary = IndexSummary {
@@ -75,7 +75,7 @@ pub(crate) async fn index_workspace(
     };
 
     for document in documents.values() {
-        match sync_file(root, document, config, meili, &mut manifest, full).await? {
+        match sync_file(root, document, config, search, &mut manifest, full).await? {
             SyncResult::Skipped => summary.skipped_files += 1,
             SyncResult::Updated(chunks) => {
                 summary.updated_files += 1;
@@ -91,7 +91,7 @@ pub(crate) async fn index_workspace(
         .collect();
     for orphan in orphans {
         if let Some(entry) = manifest.remove(&orphan) {
-            meili.delete_documents(&entry.chunk_ids).await?;
+            search.delete_file_chunks(&orphan, &entry.chunk_ids).await?;
             summary.deleted_files += 1;
         }
     }
@@ -104,13 +104,14 @@ async fn sync_file(
     root: &Path,
     document: &DocFile,
     _config: &WikiConfig,
-    meili: &MeiliClient,
+    search: &SearchBackend,
     manifest: &mut Manifest,
     force: bool,
 ) -> Result<SyncResult, String> {
     let metadata = std::fs::metadata(&document.absolute)
         .map_err(|error| format!("stat {}: {error}", document.absolute.display()))?;
     let mtime_ns = metadata_mtime_ns(&metadata);
+    let size_bytes = metadata.len();
     if !force
         && manifest
             .get(&document.relative)
@@ -154,10 +155,20 @@ async fn sync_file(
         });
     }
 
-    if let Some(old) = manifest.get(&document.relative) {
-        meili.delete_documents(&old.chunk_ids).await?;
-    }
-    meili.upsert_documents(&chunks).await?;
+    let old_chunk_ids = manifest
+        .get(&document.relative)
+        .map(|old| old.chunk_ids.as_slice())
+        .unwrap_or(&[]);
+    search
+        .upsert_file_chunks(
+            &document.relative,
+            mtime_ns,
+            size_bytes,
+            &parsed.tags,
+            old_chunk_ids,
+            &chunks,
+        )
+        .await?;
 
     let chunk_ids = chunks.iter().map(|chunk| chunk.id.clone()).collect();
     manifest.insert(
@@ -302,9 +313,9 @@ pub fn id_slug(value: &str) -> String {
 pub(crate) async fn watch_workspace(
     root: PathBuf,
     config: WikiConfig,
-    meili: MeiliClient,
+    search: SearchBackend,
 ) -> Result<(), String> {
-    let summary = index_workspace(&root, &config, &meili, false).await?;
+    let summary = index_workspace(&root, &config, &search, false).await?;
     if summary.updated_files > 0 || summary.deleted_files > 0 {
         eprintln!(
             "wordkeep-wiki: initial index: {} updated, {} skipped, {} deleted",
@@ -354,7 +365,7 @@ pub(crate) async fn watch_workspace(
         while let Ok(event) = receiver.try_recv() {
             collect_event_paths(event, &mut paths);
         }
-        if let Err(error) = sync_changed_paths(&root, &config, &meili, paths).await {
+        if let Err(error) = sync_changed_paths(&root, &config, &search, paths).await {
             eprintln!("wordkeep-wiki: incremental update failed: {error}");
         }
     }
@@ -401,7 +412,7 @@ fn watch_targets(root: &Path, config: &WikiConfig) -> BTreeMap<PathBuf, bool> {
 async fn sync_changed_paths(
     root: &Path,
     config: &WikiConfig,
-    meili: &MeiliClient,
+    search: &SearchBackend,
     paths: BTreeSet<PathBuf>,
 ) -> Result<(), String> {
     let mut manifest = load_manifest(root)?;
@@ -440,10 +451,10 @@ async fn sync_changed_paths(
                 relative,
                 root_label,
             };
-            let _ = sync_file(root, &document, config, meili, &mut manifest, false).await?;
+            let _ = sync_file(root, &document, config, search, &mut manifest, false).await?;
         } else if !absolute.exists() {
             if is_markdown_path(&absolute) {
-                delete_manifest_path(&relative, meili, &mut manifest).await?;
+                delete_manifest_path(&relative, search, &mut manifest).await?;
             } else {
                 let prefix = format!("{}/", relative.trim_end_matches('/'));
                 let removed: Vec<String> = manifest
@@ -452,14 +463,14 @@ async fn sync_changed_paths(
                     .cloned()
                     .collect();
                 for path in removed {
-                    delete_manifest_path(&path, meili, &mut manifest).await?;
+                    delete_manifest_path(&path, search, &mut manifest).await?;
                 }
             }
         }
     }
 
     if rescan {
-        let _ = index_workspace(root, config, meili, false).await?;
+        let _ = index_workspace(root, config, search, false).await?;
     } else {
         save_manifest(root, &manifest)?;
     }
@@ -468,11 +479,11 @@ async fn sync_changed_paths(
 
 async fn delete_manifest_path(
     relative: &str,
-    meili: &MeiliClient,
+    search: &SearchBackend,
     manifest: &mut Manifest,
 ) -> Result<(), String> {
     if let Some(entry) = manifest.remove(relative) {
-        meili.delete_documents(&entry.chunk_ids).await?;
+        search.delete_file_chunks(relative, &entry.chunk_ids).await?;
     }
     Ok(())
 }
@@ -510,6 +521,15 @@ pub(crate) fn manifest_path(root: &Path) -> PathBuf {
         .join("wiki_manifest.json")
 }
 
+/// Path to the shared workspace SQLite FTS5 database (`index.sqlite3`).
+pub(crate) fn sqlite_db_path(root: &Path) -> PathBuf {
+    global_cache_dir()
+        .join("wordkeep")
+        .join("workspaces")
+        .join(workspace_id(root))
+        .join("index.sqlite3")
+}
+
 pub(crate) fn global_cache_dir() -> PathBuf {
     wordkeep_knowledge::global_cache_dir()
 }
@@ -525,7 +545,7 @@ fn workspace_id(root: &Path) -> String {
     format!("{:016x}", hasher.finish())
 }
 
-fn metadata_mtime_ns(metadata: &std::fs::Metadata) -> u64 {
+pub(crate) fn metadata_mtime_ns(metadata: &std::fs::Metadata) -> u64 {
     metadata
         .modified()
         .ok()
@@ -541,7 +561,7 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
+pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     let mut output = String::with_capacity(digest.len() * 2);
     for byte in digest {

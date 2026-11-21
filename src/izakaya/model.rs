@@ -40,11 +40,11 @@ impl AgentState {
     }
 
     pub fn parse(raw: &str) -> Result<Self, String> {
-        match raw.trim() {
+        match raw.trim().to_ascii_lowercase().as_str() {
             "checked_in" => Ok(AgentState::CheckedIn),
             "live_code" => Ok(AgentState::LiveCode),
             "suspended" => Ok(AgentState::Suspended),
-            "checked_out" => Ok(AgentState::CheckedOut),
+            "checked_out" | "done" | "completed" => Ok(AgentState::CheckedOut),
             other => Err(format!(
                 "unknown agent state {other:?}; expected checked_in|live_code|suspended|checked_out"
             )),
@@ -354,8 +354,8 @@ pub fn reject_unsafe_payload(v: &Value) -> Result<(), String> {
 }
 
 pub fn checkout_reason(raw: &str) -> Result<&'static str, String> {
-    match raw.trim() {
-        "completed" => Ok("completed"),
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "completed" | "done" => Ok("completed"),
         "handed_off" => Ok("handed_off"),
         "abandoned" => Ok("abandoned"),
         other => Err(format!(

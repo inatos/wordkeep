@@ -46,7 +46,12 @@ pub fn batch_context(root: &Path, args: &Value) -> Result<String, String> {
         let remaining = budget.saturating_sub(used);
         let section_budget = remaining.min(per_sym_cap).max(80);
 
-        let mut section = format!("\n## {sym}\n");
+        let hub = adj.hub_info(sym);
+        let mut section = if let Some(badge) = hub.badge() {
+            format!("\n## {sym}  {badge}\n")
+        } else {
+            format!("\n## {sym}\n")
+        };
         let (info, scanned) = symbol_def::locate(root, sym, &paths, want_context);
         baseline += scanned / 4;
 
@@ -79,7 +84,11 @@ pub fn batch_context(root: &Path, args: &Value) -> Result<String, String> {
         }
 
         if want_refs {
-            let callers = adj.callers_of(sym);
+            let callers = adj.ranked_callers_of(sym);
+            let prod_count = callers.iter().filter(|c| !c.is_test).count();
+            let test_count = callers.len().saturating_sub(prod_count);
+            let count_label =
+                call_graph::format_caller_count(callers.len(), prod_count, test_count);
             let callees: Vec<String> = adj
                 .callees
                 .get(call_graph::seg(sym))
@@ -96,12 +105,13 @@ pub fn batch_context(root: &Path, args: &Value) -> Result<String, String> {
                 }
                 section.push('\n');
             }
-            section.push_str(&format!("  called by ({}):\n", callers.len()));
+            section.push_str(&format!("  called by ({count_label}):\n"));
             if callers.is_empty() {
                 section.push_str("    (none)\n");
             } else {
-                for (name, rel, line) in callers.iter().take(8) {
-                    section.push_str(&format!("    {name}   {rel}:{line}\n"));
+                for c in callers.iter().take(8) {
+                    let tag = call_graph::format_caller_tag(c);
+                    section.push_str(&format!("    {}   {}:{}  {tag}\n", c.name, c.rel, c.line));
                 }
                 if callers.len() > 8 {
                     section.push_str(&format!("    … (+{} more)\n", callers.len() - 8));
@@ -124,7 +134,17 @@ pub fn batch_context(root: &Path, args: &Value) -> Result<String, String> {
         ));
     }
 
-    stats::record("batch_context", baseline, (out.len() / 4) as u64);
+    stats::record_ext(
+        "batch_context",
+        stats::RecordMeta {
+            baseline,
+            returned: (out.len() / 4) as u64,
+            bytes_read: adj.bytes_read,
+            cache_hits: adj.cache_hits,
+            cache_misses: adj.cache_misses,
+            reason: None,
+        },
+    );
     Ok(out)
 }
 
@@ -565,5 +585,59 @@ render_pass                         0.250  12.50%        1       25.0  c.cpp:3
             include_flags(&json!({"include": ["context"]})),
             (true, false)
         );
+    }
+
+    #[test]
+    fn batch_context_ranks_prod_ahead_of_tests_with_true_totals_and_hub_badge() {
+        let _g = crate::cache::test_env_lock();
+        let xdg = std::env::temp_dir().join(format!("wk_triage_xdg_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&xdg);
+        std::fs::create_dir_all(&xdg).unwrap();
+        let prev_xdg = std::env::var_os("XDG_CACHE_HOME");
+        std::env::set_var("XDG_CACHE_HOME", &xdg);
+        let dir = std::env::temp_dir().join(format!("wk_triage_rank_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        write(
+            &dir,
+            "src/hub.cpp",
+            "void shared_hub() {}\n\
+             void p1() { shared_hub(); }\n\
+             void p2() { shared_hub(); }\n\
+             void p3() { shared_hub(); }\n\
+             void p4() { shared_hub(); }\n\
+             void p5() { shared_hub(); }\n\
+             void p6() { shared_hub(); }\n",
+        );
+        write(
+            &dir,
+            "tests/test_hub.cpp",
+            "void a_fixture_1() { shared_hub(); }\n\
+             void a_fixture_2() { shared_hub(); }\n\
+             void a_fixture_3() { shared_hub(); }\n\
+             void a_fixture_4() { shared_hub(); }\n",
+        );
+        let out = batch_context(
+            &dir,
+            &json!({
+                "symbols": ["shared_hub"],
+                "paths": ["src", "tests"],
+                "token_budget": 3000,
+                "include": ["refs"]
+            }),
+        )
+        .unwrap();
+
+        assert!(out.contains("## shared_hub  [hub fan-in=10 k-core=1]"), "{out}");
+        assert!(out.contains("called by (10 total: 6 prod, 4 test):"), "{out}");
+        // All 6 prod callers appear before the 2 shown test callers (cap 8 -> +2 more).
+        let pos_p6 = out.find("p6").expect("p6 shown");
+        let pos_t1 = out.find("a_fixture_1").expect("a_fixture_1 shown");
+        assert!(pos_p6 < pos_t1, "prod must precede test:\n{out}");
+        assert!(out.contains("(+2 more)"), "{out}");
+        if let Some(prev) = prev_xdg {
+            std::env::set_var("XDG_CACHE_HOME", prev);
+        }
+        let _ = std::fs::remove_dir_all(&xdg);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

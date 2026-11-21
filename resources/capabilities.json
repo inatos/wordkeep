@@ -1,80 +1,105 @@
 {
   "version": 1,
-  "tool_count": 67,
-  "notes": "Effect/coeffect manifest (FIG-2026-005). Wired: knowledge-chunks-cache, mas-session, workspace-cache. config/defects/runs/effect-journal are disk-fresh reads. Izakaya writes only its coordination journal (FIG-2026-006); advise stays read-only. Shrift writes idea Markdown + ledger + local bookmarks. Decision/outcome/replay MCP tools were removed (no agent producer path; offline lab remains via CLI policy evaluate). Triage composites (batch_context, perf_triage, test_impact) and index_health are read-only. `/tacet` latch (tacet.json) hard-blocks tools with effects except the tacet tool itself.",
+  "tool_count": 68,
+  "notes": "Effect/coeffect manifest (FIG-2026-005). Wired: knowledge-chunks-cache, mas-session, workspace-cache. config/defects/runs/effect-journal are disk-fresh reads. Izakaya writes only its coordination journal (FIG-2026-006); advise stays read-only. Shrift writes idea Markdown + ledger + local bookmarks. Decision/outcome/replay MCP tools were removed (no agent producer path; offline lab remains via CLI policy evaluate). Triage composites (batch_context, perf_triage, test_impact), tool_discover, and index_health are read-only. `/tacet` latch (tacet.json) hard-blocks tools with effects except the tacet tool itself.",
+  "open_world_tools": [
+    "task_submit",
+    "task_status",
+    "task_fetch",
+    "task_cancel",
+    "copper_status"
+  ],
   "tools": {
     "tacet": {
       "effects": ["write-tacet-latch"],
-      "coeffects": ["config"]
+      "coeffects": ["config"],
+      "annotations": { "destructiveHint": false, "idempotentHint": true, "openWorldHint": false }
     },
     "knowledge_upsert": {
       "effects": ["write-notes"],
       "coeffects": ["config", "knowledge-chunks-cache", "mas-session"],
-      "revertible": "opt-in via effect_session"
+      "revertible": "opt-in via effect_session",
+      "annotations": { "destructiveHint": false, "idempotentHint": true, "openWorldHint": false }
     },
     "defect_upsert": {
       "effects": ["write-defects"],
-      "coeffects": ["config"]
+      "coeffects": ["config"],
+      "annotations": { "destructiveHint": false, "idempotentHint": true, "openWorldHint": false }
     },
     "shrift_upsert": {
       "effects": ["write-shrift"],
-      "coeffects": ["config", "knowledge-chunks-cache"]
+      "coeffects": ["config", "knowledge-chunks-cache"],
+      "annotations": { "destructiveHint": false, "idempotentHint": true, "openWorldHint": false }
     },
     "shrift_touch": {
       "effects": ["write-shrift"],
-      "coeffects": ["config"]
+      "coeffects": ["config"],
+      "annotations": { "destructiveHint": false, "idempotentHint": true, "openWorldHint": false }
     },
     "shrift_status": {
       "effects": ["write-shrift"],
-      "coeffects": ["config", "knowledge-chunks-cache"]
+      "coeffects": ["config", "knowledge-chunks-cache"],
+      "annotations": { "destructiveHint": false, "idempotentHint": true, "openWorldHint": false }
     },
     "shrift_bookmark": {
       "effects": ["write-shrift-bookmarks"],
-      "coeffects": ["config"]
+      "coeffects": ["config"],
+      "annotations": { "destructiveHint": false, "idempotentHint": false, "openWorldHint": false }
     },
     "mas_post": {
       "effects": ["write-mas-session"],
-      "coeffects": ["config", "workspace-cache"]
+      "coeffects": ["config", "workspace-cache"],
+      "annotations": { "destructiveHint": false, "idempotentHint": false, "openWorldHint": false }
     },
     "mas_finalize": {
       "effects": ["write-mas-session", "write-notes", "write-handoff-marker"],
-      "coeffects": ["config", "effect-journal"]
+      "coeffects": ["config", "effect-journal"],
+      "annotations": { "destructiveHint": false, "idempotentHint": true, "openWorldHint": false }
     },
     "session_handoff": {
       "effects": ["write-handoff-marker"],
-      "coeffects": ["config", "mas-session", "defects", "runs"]
+      "coeffects": ["config", "mas-session", "defects", "runs"],
+      "annotations": { "destructiveHint": false, "idempotentHint": true, "openWorldHint": false }
     },
     "run_record": {
       "effects": ["append-runs"],
-      "coeffects": ["config"]
+      "coeffects": ["config"],
+      "annotations": { "destructiveHint": false, "idempotentHint": true, "openWorldHint": false }
     },
     "stats": {
       "effects": ["append-stats", "reset-stats"],
-      "coeffects": ["config"]
+      "coeffects": ["config"],
+      "annotations": { "destructiveHint": true, "idempotentHint": true, "openWorldHint": false }
     },
     "profile_upsert": {
       "effects": ["write-config"],
-      "coeffects": ["config"]
+      "coeffects": ["config"],
+      "annotations": { "destructiveHint": false, "idempotentHint": true, "openWorldHint": false }
     },
     "izakaya_check_in": {
       "effects": ["write-izakaya-journal"],
-      "coeffects": []
+      "coeffects": [],
+      "annotations": { "destructiveHint": false, "idempotentHint": true, "openWorldHint": false }
     },
     "izakaya_update": {
       "effects": ["write-izakaya-journal"],
-      "coeffects": []
+      "coeffects": [],
+      "annotations": { "destructiveHint": false, "idempotentHint": true, "openWorldHint": false }
     },
     "izakaya_check_out": {
       "effects": ["write-izakaya-journal"],
-      "coeffects": []
+      "coeffects": [],
+      "annotations": { "destructiveHint": false, "idempotentHint": true, "openWorldHint": false }
     },
     "task_submit": {
       "effects": ["write-izakaya-journal", "spawn-palaestra-remote"],
-      "coeffects": ["config"]
+      "coeffects": ["config"],
+      "annotations": { "destructiveHint": false, "idempotentHint": false, "openWorldHint": true }
     },
     "task_cancel": {
       "effects": ["write-izakaya-journal", "kill-palaestra-remote"],
-      "coeffects": ["config"]
+      "coeffects": ["config"],
+      "annotations": { "destructiveHint": true, "idempotentHint": true, "openWorldHint": true }
     }
   },
   "read_only_default": "All tools not listed above are read-only over workspace paths (no durable writes)."

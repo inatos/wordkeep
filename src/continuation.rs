@@ -17,6 +17,7 @@ pub const KIND_HIT_SKIP: &str = "hit_skip";
 pub const KIND_ITEM_SKIP: &str = "item_skip";
 pub const KIND_CALLER_SKIP: &str = "caller_skip";
 pub const KIND_MODULE_SKIP: &str = "module_skip";
+pub const KIND_SCOPE_SKIP: &str = "scope_skip";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Token {

@@ -1,48 +1,367 @@
-//! knowledge_search / knowledge_answer - BM25 lexical retrieval over project markdown.
+//! knowledge_search / knowledge_answer - 3-way Reciprocal Rank Fusion (RRF)
+//! retrieval over project markdown.
 //!
-//! Indexes `.md` / `.mdc` files (chunked by heading), then ranks chunks for a query
-//! with Okapi BM25. Zero dependencies, fully deterministic, no model download - a
-//! strong offline baseline. With `--features embeddings`, the BM25 head is reranked
-//! by a small local embedding model (see embed.rs); BM25 stays the fallback.
-//! Pass `semif:true` to optionally rerank the BM25 head with the SemIf scorer
-//! ([`crate::semif`]; heuristic or Ereshkigal GGUF). `knowledge_answer` builds an extractive synthesis +
-//! citations from the same pipeline.
+//! Indexes `.md` / `.mdc` files (chunked by heading) into the per-workspace
+//! SQLite store (`doc_chunks` + `doc_chunks_fts`), then fuses up to three
+//! independent ranked lists via Reciprocal Rank Fusion (`K = 60`):
+//!   1. SQLite FTS5 BM25 (`doc_chunks_fts`, scoped to active roots)
+//!   2. In-memory Okapi BM25 + exact heading/phrase affinity (also covers
+//!      dynamically injected unresolved defects from `.wordkeep/defects.json`)
+//!   3. Dense vector cosine similarity over all chunks in scope, cached by
+//!      `(content_sha256, model_tag)` in the SQLite `embeddings` table
+//!      (pure-Rust `model2vec-rs` `potion-retrieval-32M` under `--features
+//!      semantic-m2v`, or legacy `fastembed` under `--features embeddings`).
+//!
+//! Defect boosting (`eyeball_fail` / `open` / `gated`) is applied post-RRF,
+//! followed by optional Ereshkigal SemIf head reranking (`semif:true`).
+//! `knowledge_answer` builds an extractive synthesis + citations from the same
+//! pipeline.
 
-use serde_json::{json, Value};
-use std::collections::HashMap;
-use std::path::Path;
-use std::sync::{Mutex, OnceLock};
+use serde_json::Value;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
 use wordkeep_knowledge::chunk_bodies;
 
-use crate::cache::{self, DiskMap};
+use crate::cache;
 use crate::continuation::{self, KIND_HIT_SKIP};
+use crate::embed::{self, EmbedDomain, Embedder, RRF_K};
+use crate::store::{self, Store, STAGE_DOC_CHUNKS};
 use crate::{coeffects, config, defects, effect_journal, mas, progress, semif, stats, walk};
-
-#[cfg(feature = "embeddings")]
-mod embed;
 
 const DOC_EXT: [&str; 3] = ["md", "mdc", "markdown"];
 /// Paths (relative to repo root) agents may write via `knowledge_upsert`.
 const UPSERT_ROOTS: [&str; 3] = [".cursor/rules", "docs", ".wordkeep/notes"];
 const K1: f64 = 1.5;
 const B: f64 = 0.75;
+/// RRF leg weights: SQLite FTS5 BM25 + in-memory Okapi BM25 + dense vectors.
+const W_FTS5: f64 = 1.0;
+const W_BM25: f64 = 1.0;
+const W_DENSE: f64 = 1.2;
+/// Minimum cosine similarity for a chunk to enter the dense RRF list.
+const MIN_DOC_DENSE_COSINE: f64 = 0.20;
+/// Maximum dense candidates contributed into RRF per query.
+const DENSE_RRF_TOP: usize = 64;
 
-/// Chunk cache keyed by absolute path; the stored mtime invalidates the entry
-/// when the document changes. Backed by a JSON file under the shared cache dir,
-/// so a cold spawn over a large docs tree reuses the previous run's chunking.
-static CHUNK_CACHE: OnceLock<Mutex<DiskMap>> = OnceLock::new();
+/// Process-local warm doc corpus: pre-tokenized chunks + BM25 stats keyed by
+/// workspace + roots + SQLite doc-stage fingerprint. Avoids N+1 SQLite loads and
+/// full-corpus `term_freqs` reallocation on warm `knowledge_search` calls.
+struct WarmDocCorpus {
+    root: PathBuf,
+    roots_key: String,
+    fingerprint: String,
+    chunks: Arc<Vec<Chunk>>,
+    df: Arc<HashMap<String, u32>>,
+    postings: Arc<HashMap<String, Vec<usize>>>,
+    avgdl: f64,
+    indexed_bytes: u64,
+}
 
-const CHUNK_KEY_SUFFIX: &str = "markdown-v2";
-
-/// Drop cached chunking for a markdown file (spatial coeffect on agent writes).
-pub fn invalidate_markdown_chunks(path: &Path) {
-    let key = format!("{}::{}", path.to_string_lossy(), CHUNK_KEY_SUFFIX);
-    let cell = CHUNK_CACHE.get_or_init(|| Mutex::new(DiskMap::load("knowledge-chunks.json")));
-    if let Ok(mut store) = cell.lock() {
-        if store.remove(&key) {
-            store.save();
+fn build_bm25_stats(
+    chunks: &[Chunk],
+) -> (HashMap<String, u32>, HashMap<String, Vec<usize>>, f64) {
+    let n = chunks.len() as f64;
+    let avgdl = if n > 0.0 {
+        (chunks.iter().map(|c| c.len as f64).sum::<f64>() / n).max(1.0)
+    } else {
+        1.0
+    };
+    let mut df: HashMap<String, u32> = HashMap::new();
+    let mut postings: HashMap<String, Vec<usize>> = HashMap::new();
+    for (i, c) in chunks.iter().enumerate() {
+        for term in c.tf.keys() {
+            *df.entry(term.clone()).or_insert(0) += 1;
+            postings.entry(term.clone()).or_default().push(i);
         }
     }
+    (df, postings, avgdl)
+}
+
+fn warm_corpus_cache() -> &'static Mutex<Option<WarmDocCorpus>> {
+    static CACHE: OnceLock<Mutex<Option<WarmDocCorpus>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(None))
+}
+
+/// Merged docs+defects corpus so warm searches never re-clone ~2500 chunks.
+struct MergedCorpus {
+    root: PathBuf,
+    roots_key: String,
+    doc_fingerprint: String,
+    defects_mtime_ns: u64,
+    chunks: Arc<Vec<Chunk>>,
+    defect_boosts: HashMap<usize, f64>,
+    df: Arc<HashMap<String, u32>>,
+    postings: Arc<HashMap<String, Vec<usize>>>,
+    avgdl: f64,
+}
+
+fn merged_corpus_cache() -> &'static Mutex<Option<MergedCorpus>> {
+    static CACHE: OnceLock<Mutex<Option<MergedCorpus>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(None))
+}
+
+fn roots_cache_key(roots: &[String]) -> String {
+    let mut parts: Vec<String> = roots
+        .iter()
+        .map(|r| r.replace('\\', "/").trim_matches('/').to_string())
+        .collect();
+    parts.sort();
+    parts.join("\n")
+}
+
+pub(crate) fn invalidate_warm_corpus_cache() {
+    if let Ok(mut guard) = warm_corpus_cache().lock() {
+        *guard = None;
+    }
+    if let Ok(mut guard) = merged_corpus_cache().lock() {
+        *guard = None;
+    }
+    embed::invalidate_embed_ram_cache();
+}
+
+fn merge_docs_with_defects(
+    root: &Path,
+    roots: &[String],
+    warm: &WarmIndex,
+    include_defects: bool,
+    defects_mt: u64,
+) -> (
+    Arc<Vec<Chunk>>,
+    HashMap<usize, f64>,
+    Option<Arc<HashMap<String, u32>>>,
+    Option<Arc<HashMap<String, Vec<usize>>>>,
+    Option<f64>,
+) {
+    let doc_fp = warm.fingerprint.clone();
+    let roots_key = roots_cache_key(roots);
+    let canon = root
+        .canonicalize()
+        .unwrap_or_else(|_| root.to_path_buf());
+    let want_defects = include_defects;
+
+    if !doc_fp.is_empty() {
+        if let Ok(guard) = merged_corpus_cache().lock() {
+            if let Some(cached) = guard.as_ref() {
+                let defects_ok = if want_defects {
+                    cached.defects_mtime_ns == defects_mt
+                } else {
+                    cached.defect_boosts.is_empty()
+                };
+                if cached.root == canon
+                    && cached.roots_key == roots_key
+                    && cached.doc_fingerprint == doc_fp
+                    && defects_ok
+                {
+                    return (
+                        Arc::clone(&cached.chunks),
+                        cached.defect_boosts.clone(),
+                        Some(Arc::clone(&cached.df)),
+                        Some(Arc::clone(&cached.postings)),
+                        Some(cached.avgdl),
+                    );
+                }
+            }
+        }
+    }
+
+    // Docs-only fast path: reuse warm Arc without cloning.
+    if !want_defects {
+        return (
+            Arc::clone(&warm.chunks),
+            HashMap::new(),
+            warm.df.clone(),
+            warm.postings.clone(),
+            warm.avgdl,
+        );
+    }
+
+    let mut defect_boosts: HashMap<usize, f64> = HashMap::new();
+    let mut defect_chunks: Vec<Chunk> = Vec::new();
+    for d in defects::unresolved(root) {
+        let boost = defects::boost_for_status(&d.status);
+        if boost <= 0.0 {
+            continue;
+        }
+        let (path, heading, body) = defects::defect_chunk_text(&d);
+        let mut tf = HashMap::new();
+        for t in tokenize(&format!("{heading} {body}")) {
+            *tf.entry(t).or_insert(0u32) += 1;
+        }
+        let len = tf.values().sum();
+        let sha256 = store::sha256_hex(&format!("{heading}\n{body}"));
+        defect_boosts.insert(warm.chunks.len() + defect_chunks.len(), boost);
+        defect_chunks.push(Chunk {
+            path,
+            heading,
+            body,
+            sha256,
+            tf,
+            len,
+        });
+    }
+
+    if defect_chunks.is_empty() {
+        let chunks = Arc::clone(&warm.chunks);
+        if !doc_fp.is_empty() {
+            if let (Some(df), Some(postings), Some(avgdl)) =
+                (warm.df.clone(), warm.postings.clone(), warm.avgdl)
+            {
+                if let Ok(mut guard) = merged_corpus_cache().lock() {
+                    *guard = Some(MergedCorpus {
+                        root: canon,
+                        roots_key,
+                        doc_fingerprint: doc_fp,
+                        defects_mtime_ns: defects_mt,
+                        chunks: Arc::clone(&chunks),
+                        defect_boosts: HashMap::new(),
+                        df: Arc::clone(&df),
+                        postings: Arc::clone(&postings),
+                        avgdl,
+                    });
+                }
+                return (
+                    chunks,
+                    HashMap::new(),
+                    Some(df),
+                    Some(postings),
+                    Some(avgdl),
+                );
+            }
+        }
+        return (
+            chunks,
+            HashMap::new(),
+            warm.df.clone(),
+            warm.postings.clone(),
+            warm.avgdl,
+        );
+    }
+
+    let mut merged = Vec::with_capacity(warm.chunks.len() + defect_chunks.len());
+    merged.extend(warm.chunks.iter().cloned());
+    merged.extend(defect_chunks);
+    let (df, postings, avgdl) = build_bm25_stats(&merged);
+    let df = Arc::new(df);
+    let postings = Arc::new(postings);
+    let chunks = Arc::new(merged);
+    if !doc_fp.is_empty() {
+        if let Ok(mut guard) = merged_corpus_cache().lock() {
+            *guard = Some(MergedCorpus {
+                root: canon,
+                roots_key,
+                doc_fingerprint: doc_fp,
+                defects_mtime_ns: defects_mt,
+                chunks: Arc::clone(&chunks),
+                defect_boosts: defect_boosts.clone(),
+                df: Arc::clone(&df),
+                postings: Arc::clone(&postings),
+                avgdl,
+            });
+        }
+    }
+    (chunks, defect_boosts, Some(df), Some(postings), Some(avgdl))
+}
+
+struct WarmHit {
+    chunks: Arc<Vec<Chunk>>,
+    df: Arc<HashMap<String, u32>>,
+    postings: Arc<HashMap<String, Vec<usize>>>,
+    avgdl: f64,
+    indexed_bytes: u64,
+}
+
+fn lookup_warm_corpus(root: &Path, roots: &[String], fingerprint: &str) -> Option<WarmHit> {
+    let Ok(guard) = warm_corpus_cache().lock() else {
+        return None;
+    };
+    let cached = guard.as_ref()?;
+    let canon = root
+        .canonicalize()
+        .unwrap_or_else(|_| root.to_path_buf());
+    if cached.root != canon {
+        return None;
+    }
+    if cached.roots_key != roots_cache_key(roots) {
+        return None;
+    }
+    if cached.fingerprint != fingerprint {
+        return None;
+    }
+    Some(WarmHit {
+        chunks: Arc::clone(&cached.chunks),
+        df: Arc::clone(&cached.df),
+        postings: Arc::clone(&cached.postings),
+        avgdl: cached.avgdl,
+        indexed_bytes: cached.indexed_bytes,
+    })
+}
+
+fn store_warm_corpus(
+    root: &Path,
+    roots: &[String],
+    fingerprint: String,
+    chunks: Vec<Chunk>,
+    indexed_bytes: u64,
+) -> WarmHit {
+    let (df, postings, avgdl) = build_bm25_stats(&chunks);
+    let arc = Arc::new(chunks);
+    let df = Arc::new(df);
+    let postings = Arc::new(postings);
+    let canon = root
+        .canonicalize()
+        .unwrap_or_else(|_| root.to_path_buf());
+    let hit = WarmHit {
+        chunks: Arc::clone(&arc),
+        df: Arc::clone(&df),
+        postings: Arc::clone(&postings),
+        avgdl,
+        indexed_bytes,
+    };
+    if let Ok(mut guard) = warm_corpus_cache().lock() {
+        *guard = Some(WarmDocCorpus {
+            root: canon,
+            roots_key: roots_cache_key(roots),
+            fingerprint,
+            chunks: arc,
+            df,
+            postings,
+            avgdl,
+            indexed_bytes,
+        });
+    }
+    hit
+}
+
+/// Drop cached chunking for a markdown file in a known workspace root
+/// (spatial coeffect on agent writes). Deletes the file row from the workspace
+/// SQLite store so `doc_chunks`, `doc_chunks_fts`, and `file_stages` stay fresh.
+pub fn invalidate_markdown_chunks_in(root: &Path, rel: &str) {
+    let norm = rel.replace('\\', "/");
+    invalidate_warm_corpus_cache();
+    if let Ok(store) = Store::open(root) {
+        let _ = store.delete_file(&norm);
+    }
+}
+
+/// Drop cached chunking for a markdown file given only its path.
+/// Walks ancestors for `.wordkeep` or `.git` to find the workspace root,
+/// falling back to `path.parent()`.
+#[allow(dead_code)]
+pub fn invalidate_markdown_chunks(path: &Path) {
+    let root = infer_root_for_path(path);
+    let rel = crate::store::normalize_rel(&root, path);
+    invalidate_markdown_chunks_in(&root, &rel);
+}
+
+#[allow(dead_code)]
+fn infer_root_for_path(path: &Path) -> std::path::PathBuf {
+    let start = path.parent().unwrap_or(path);
+    for anc in start.ancestors() {
+        if anc.join(".wordkeep").is_dir() || anc.join(".git").exists() {
+            return anc.to_path_buf();
+        }
+    }
+    start.to_path_buf()
 }
 
 const STOP: [&str; 22] = [
@@ -54,6 +373,7 @@ struct Chunk {
     path: String,
     heading: String,
     body: String,
+    sha256: String,
     tf: HashMap<String, u32>,
     len: u32,
 }
@@ -64,13 +384,14 @@ impl Clone for Chunk {
             path: self.path.clone(),
             heading: self.heading.clone(),
             body: self.body.clone(),
+            sha256: self.sha256.clone(),
             tf: self.tf.clone(),
             len: self.len,
         }
     }
 }
 
-/// One BM25 (optionally semantically reranked) hit with path/heading/body.
+/// One 3-way RRF (and optionally SemIf-reranked) hit with path/heading/body.
 struct ScoredHit {
     score: f64,
     path: String,
@@ -78,18 +399,36 @@ struct ScoredHit {
     body: String,
 }
 
+#[derive(Clone, Copy, Default)]
+struct DocIndexStats {
+    indexed_bytes: u64,
+    bytes_read: u64,
+    cache_hits: u64,
+    cache_misses: u64,
+}
+
 /// Shared retrieval result for `search` and `answer`.
 struct Retrieval {
     query: String,
     q_terms: Vec<String>,
     hits: Vec<ScoredHit>,
-    indexed_bytes: u64,
+    io: DocIndexStats,
     /// True when the index (docs + optional defects) had zero chunks.
     empty_index: bool,
 }
 
-/// Index + BM25 (+ optional embedding rerank). Shared by `search` and `answer`.
+/// Index + 3-way RRF (SQLite FTS5 BM25 + lexical Okapi BM25 + SQLite-cached
+/// dense vectors) + defect boost + optional SemIf rerank. Shared by `search`
+/// and `answer`.
 fn retrieve(root: &Path, args: &Value) -> Result<Retrieval, String> {
+    retrieve_with_embedder(root, args, None)
+}
+
+fn retrieve_with_embedder(
+    root: &Path,
+    args: &Value,
+    custom_embedder: Option<&dyn Embedder>,
+) -> Result<Retrieval, String> {
     let query = args
         .get("query")
         .and_then(Value::as_str)
@@ -105,30 +444,25 @@ fn retrieve(root: &Path, args: &Value) -> Result<Retrieval, String> {
         .and_then(Value::as_bool)
         .unwrap_or(true);
 
-    let (mut chunks, indexed_bytes) = index(root, &roots);
-    let mut defect_boosts: HashMap<usize, f64> = HashMap::new();
+    let store = Store::open(root).ok();
+    let warm = index_with_store(root, &roots, store.as_ref());
+    let io = warm.io;
+    let defects_mt = if include_defects {
+        std::fs::metadata(root.join(".wordkeep/defects.json"))
+            .ok()
+            .map(|m| cache::mtime_ns(&m))
+            .unwrap_or(0)
+    } else {
+        0
+    };
     if include_defects {
-        for d in defects::unresolved(root) {
-            let boost = defects::boost_for_status(&d.status);
-            if boost <= 0.0 {
-                continue;
-            }
-            let (path, heading, body) = defects::defect_chunk_text(&d);
-            let mut tf = HashMap::new();
-            for t in tokenize(&format!("{heading} {body}")) {
-                *tf.entry(t).or_insert(0u32) += 1;
-            }
-            let len = tf.values().sum();
-            defect_boosts.insert(chunks.len(), boost);
-            chunks.push(Chunk {
-                path,
-                heading,
-                body,
-                tf,
-                len,
-            });
+        if let Some(st) = store.as_ref() {
+            defects::ensure_defect_links_indexed(root, st);
         }
     }
+    let (chunks_arc, defect_boosts, cached_df, cached_postings, cached_avgdl) =
+        merge_docs_with_defects(root, &roots, &warm, include_defects, defects_mt);
+    let chunks: &[Chunk] = chunks_arc.as_slice();
 
     let q_terms = tokenize(&query);
     if q_terms.is_empty() {
@@ -140,22 +474,76 @@ fn retrieve(root: &Path, args: &Value) -> Result<Retrieval, String> {
             query,
             q_terms,
             hits: Vec::new(),
-            indexed_bytes,
+            io,
             empty_index: true,
         });
     }
 
-    let n = chunks.len() as f64;
-    let avgdl = chunks.iter().map(|c| c.len as f64).sum::<f64>() / n;
-    let mut df: HashMap<&str, u32> = HashMap::new();
-    for c in &chunks {
-        for term in c.tf.keys() {
-            *df.entry(term.as_str()).or_insert(0) += 1;
+    // Leg 1: SQLite FTS5 BM25 over `doc_chunks_fts` (scoped to active `roots`).
+    let mut by_path_sha: HashMap<(&str, &str), Vec<usize>> = HashMap::with_capacity(chunks.len());
+    let mut by_path_heading: HashMap<(&str, &str), Vec<usize>> =
+        HashMap::with_capacity(chunks.len());
+    for (i, c) in chunks.iter().enumerate() {
+        if defect_boosts.contains_key(&i) {
+            continue;
+        }
+        by_path_sha
+            .entry((c.path.as_str(), c.sha256.as_str()))
+            .or_default()
+            .push(i);
+        by_path_heading
+            .entry((c.path.as_str(), c.heading.as_str()))
+            .or_default()
+            .push(i);
+    }
+
+    let mut fts5_ranks: Vec<usize> = Vec::new();
+    if let Some(st) = store.as_ref() {
+        let fts_limit = chunks.len().clamp(64, 512);
+        if let Ok(fts_hits) = st.search_docs_fts_scoped(&query, &roots, fts_limit) {
+            let mut seen_fts: HashSet<usize> = HashSet::with_capacity(fts_hits.len());
+            for hit in &fts_hits {
+                let candidates = by_path_sha
+                    .get(&(hit.rel_path.as_str(), hit.sha256.as_str()))
+                    .or_else(|| by_path_heading.get(&(hit.rel_path.as_str(), hit.heading.as_str())));
+                if let Some(indices) = candidates {
+                    if let Some(&idx) = indices.iter().find(|&&i| seen_fts.insert(i)) {
+                        fts5_ranks.push(idx);
+                    }
+                }
+            }
         }
     }
 
-    let mut scored: Vec<(f64, usize)> = Vec::new();
-    for (i, c) in chunks.iter().enumerate() {
+    // Leg 2: In-memory Okapi BM25 + exact heading/phrase affinity over all
+    // chunks (including unresolved defects injected from `.wordkeep/defects.json`).
+    let n = chunks.len() as f64;
+    let (df_arc, postings_arc, avgdl): (
+        Arc<HashMap<String, u32>>,
+        Option<Arc<HashMap<String, Vec<usize>>>>,
+        f64,
+    ) = if let (Some(df), Some(avg)) = (cached_df.as_ref(), cached_avgdl) {
+        (Arc::clone(df), cached_postings.clone(), avg)
+    } else {
+        let (df, postings, avg) = build_bm25_stats(chunks);
+        (Arc::new(df), Some(Arc::new(postings)), avg)
+    };
+    let query_lower = query.to_ascii_lowercase();
+
+    // Score only chunks that contain at least one query term (postings union).
+    let mut cand: HashSet<usize> = HashSet::new();
+    if let Some(ref postings) = postings_arc {
+        for qt in &q_terms {
+            if let Some(ids) = postings.get(qt.as_str()) {
+                cand.extend(ids.iter().copied());
+            }
+        }
+    } else {
+        cand.extend(0..chunks.len());
+    }
+    let mut bm25_scored: Vec<(f64, usize)> = Vec::new();
+    for i in cand {
+        let c = &chunks[i];
         let dl = c.len as f64;
         let mut score = 0.0;
         for qt in &q_terms {
@@ -163,73 +551,182 @@ fn retrieve(root: &Path, args: &Value) -> Result<Retrieval, String> {
             if f == 0.0 {
                 continue;
             }
-            let n_qi = *df.get(qt.as_str()).unwrap_or(&0) as f64;
+            let n_qi = *df_arc.get(qt.as_str()).unwrap_or(&0) as f64;
             let idf = ((n - n_qi + 0.5) / (n_qi + 0.5) + 1.0).ln();
             score += idf * (f * (K1 + 1.0)) / (f + K1 * (1.0 - B + B * dl / avgdl));
         }
-        if let Some(boost) = defect_boosts.get(&i) {
-            score *= boost;
-        }
         if score > 0.0 {
-            scored.push((score, i));
+            let heading_lower = c.heading.to_ascii_lowercase();
+            if heading_lower.contains(&query_lower) {
+                score *= 1.25;
+            } else if q_terms.len() > 1
+                && q_terms
+                    .iter()
+                    .all(|qt| heading_lower.contains(qt.as_str()))
+            {
+                score *= 1.15;
+            }
+            bm25_scored.push((score, i));
         }
     }
-      scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    bm25_scored.sort_by(|a, b| {
+        b.0.partial_cmp(&a.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.1.cmp(&b.1))
+    });
+    let bm25_ranks: Vec<usize> = bm25_scored.iter().map(|&(_, idx)| idx).collect();
+    let bm25_rank_of: HashMap<usize, usize> = bm25_ranks
+        .iter()
+        .enumerate()
+        .map(|(r, &idx)| (idx, r + 1))
+        .collect();
+    // Leg 3: Dense vector cosine similarity over all chunks in scope, cached by
+    // `(content_sha256, model_tag)` in SQLite `embeddings` table.
+    let want_semantic = args
+        .get("semantic")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    let mut dense_ranks: Vec<usize> = Vec::new();
+    if want_semantic {
+        let owned_embedder = if custom_embedder.is_none() {
+            match embed::resolve_embedder(root, EmbedDomain::Docs) {
+                Ok(e) => e,
+                Err(e) => {
+                    eprintln!("[wordkeep] dense retrieval unavailable, using lexical RRF: {e}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let active_embedder: Option<&dyn Embedder> =
+            custom_embedder.or_else(|| owned_embedder.as_deref());
 
-      // Optional semantic rerank of the BM25 head (opt-in `embeddings` feature).
-      #[cfg(feature = "embeddings")]
-      let scored = if args
-          .get("semantic")
-          .and_then(Value::as_bool)
-          .unwrap_or(true)
-      {
-          match embed::rerank(&query, &chunks, scored.clone()) {
-              Ok(reranked) => reranked,
-              Err(e) => {
-                  eprintln!("[wordkeep] semantic rerank unavailable, using BM25: {e}");
-                  scored
-              }
-          }
-      } else {
-          scored
-      };
+        if let Some(emb) = active_embedder {
+            // Warm corpus: skip reallocating every chunk body; SQLite/RAM hits
+            // only need the content sha. Fill text for cold misses below.
+            let warm_dense = io.cache_hits > 0;
+            let mut items: Vec<(String, String)> = chunks
+                .iter()
+                .map(|c| {
+                    if warm_dense {
+                        (c.sha256.clone(), String::new())
+                    } else {
+                        (c.sha256.clone(), format!("{}\n{}", c.heading, c.body))
+                    }
+                })
+                .collect();
+            if warm_dense {
+                // Ensure priority candidates have text if they miss the RAM/SQL cache.
+                for &idx in fts5_ranks.iter().chain(bm25_ranks.iter()).take(DENSE_RRF_TOP) {
+                    if let Some(c) = chunks.get(idx) {
+                        if let Some(slot) = items.get_mut(idx) {
+                            if slot.1.is_empty() {
+                                slot.1 = format!("{}\n{}", c.heading, c.body);
+                            }
+                        }
+                    }
+                }
+            }
+            let mut priority: Vec<usize> = Vec::with_capacity(fts5_ranks.len() + bm25_ranks.len());
+            priority.extend_from_slice(&fts5_ranks);
+            priority.extend_from_slice(&bm25_ranks);
 
-      // Optional SemIf heuristic rerank (distinct from embedding `semantic`).
-      // Also used as a soft fallback when `semantic:true` but embeddings are off.
-      let want_semif = args
-          .get("semif")
-          .and_then(Value::as_bool)
-          .unwrap_or(false)
-          || {
-              #[cfg(not(feature = "embeddings"))]
-              {
-                  args.get("semantic")
-                      .and_then(Value::as_bool)
-                      .unwrap_or(false)
-              }
-              #[cfg(feature = "embeddings")]
-              {
-                  false
-              }
-          };
-      let scored = if want_semif {
-          let candidates: Vec<(String, String)> = chunks
-              .iter()
-              .map(|c| (c.heading.clone(), c.body.clone()))
-              .collect();
-          let bm25 = scored.clone();
-          match semif::rerank_knowledge(root, &query, &candidates, scored) {
-              Ok((reranked, _fallback)) => reranked,
-              Err(e) => {
-                  eprintln!("[wordkeep] semif knowledge rerank unavailable, using BM25: {e}");
-                  bm25
-              }
-          }
-      } else {
-          scored
-      };
+            match (
+                embed::embed_cached(store.as_ref(), emb, &items, &priority),
+                emb.embed_one(&query),
+            ) {
+                (Ok((vecs, _cache_stats)), Ok(q_vec)) => {
+                    let mut dense_scored: Vec<(f64, usize)> = Vec::new();
+                    for (idx, maybe_vec) in vecs.iter().enumerate() {
+                        if let Some(v) = maybe_vec {
+                            let sim = embed::cosine(&q_vec, v.as_slice());
+                            if sim >= MIN_DOC_DENSE_COSINE {
+                                dense_scored.push((sim, idx));
+                            }
+                        }
+                    }
+                    dense_scored.sort_by(|a, b| {
+                        b.0.partial_cmp(&a.0)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                            .then_with(|| a.1.cmp(&b.1))
+                    });
+                    dense_ranks = dense_scored
+                        .into_iter()
+                        .take(DENSE_RRF_TOP)
+                        .map(|(_, idx)| idx)
+                        .collect();
+                }
+                (Err(e), _) | (_, Err(e)) => {
+                    eprintln!("[wordkeep] dense embedding failed, using lexical RRF: {e}");
+                }
+            }
+        }
+    }
 
-      let hits = scored
+    // True 3-way Reciprocal Rank Fusion over FTS5 BM25 + lexical Okapi BM25 + dense vectors.
+    let mut scored = embed::rrf_fuse(
+        &[
+            (&fts5_ranks, W_FTS5),
+            (&bm25_ranks, W_BM25),
+            (&dense_ranks, W_DENSE),
+        ],
+        RRF_K,
+    );
+
+    // Preserve unresolved defect boosting (`eyeball_fail` 8x, `open` 4x, `gated` 2x).
+    // Defects are injected from `.wordkeep/defects.json` rather than `doc_chunks_fts`,
+    // so grant FTS5-leg parity when they matched lexically before scaling by boost.
+    if !defect_boosts.is_empty() && !scored.is_empty() {
+        let fts_active = !fts5_ranks.is_empty();
+        for (score, idx) in &mut scored {
+            if let Some(&boost) = defect_boosts.get(idx) {
+                if fts_active {
+                    if let Some(&r) = bm25_rank_of.get(idx) {
+                        *score += (W_FTS5 * (RRF_K + 1.0)) / (RRF_K + r as f64);
+                    }
+                }
+                *score *= boost;
+            }
+        }
+        scored.sort_by(|a, b| {
+            b.0.partial_cmp(&a.0)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.1.cmp(&b.1))
+        });
+    }
+
+    // Optional Ereshkigal SemIf head reranking (`semif:true`, distinct from dense
+    // embeddings). Also retained as a soft fallback when `semantic:true` is
+    // explicitly requested in a build with no compiled embedding backend.
+    let want_semif = args
+        .get("semif")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        || (!embed::has_compiled_backend()
+            && custom_embedder.is_none()
+            && args
+                .get("semantic")
+                .and_then(Value::as_bool)
+                .unwrap_or(false));
+    let scored = if want_semif {
+        let candidates: Vec<(String, String)> = chunks
+            .iter()
+            .map(|c| (c.heading.clone(), c.body.clone()))
+            .collect();
+        let before = scored.clone();
+        match semif::rerank_knowledge(root, &query, &candidates, scored) {
+            Ok((reranked, _fallback)) => reranked,
+            Err(e) => {
+                eprintln!("[wordkeep] semif knowledge rerank unavailable, keeping RRF: {e}");
+                before
+            }
+        }
+    } else {
+        scored
+    };
+
+    let hits: Vec<ScoredHit> = scored
         .into_iter()
         .map(|(score, idx)| {
             let c = &chunks[idx];
@@ -246,18 +743,27 @@ fn retrieve(root: &Path, args: &Value) -> Result<Retrieval, String> {
         query,
         q_terms,
         hits,
-        indexed_bytes,
+        io,
         empty_index: false,
     })
 }
 
 pub fn search(root: &Path, args: &Value) -> Result<String, String> {
+    search_with_embedder(root, args, None)
+}
+
+fn search_with_embedder(
+    root: &Path,
+    args: &Value,
+    custom_embedder: Option<&dyn Embedder>,
+) -> Result<String, String> {
     const FP_KEYS: &[&str] = &[
         "query",
         "k",
         "roots",
         "include_defects",
         "semantic",
+        "semif",
         "optical",
         "optical_max_ratio",
         "optical_mode",
@@ -273,9 +779,19 @@ pub fn search(root: &Path, args: &Value) -> Result<String, String> {
         continuation::resume_offset(args, "knowledge_search", FP_KEYS, KIND_HIT_SKIP)? as usize;
 
     progress::tick(0, None, "knowledge_search: retrieve");
-    let retrieval = retrieve(root, args)?;
+    let retrieval = retrieve_with_embedder(root, args, custom_embedder)?;
     if retrieval.hits.is_empty() {
-        stats::record("knowledge_search", retrieval.indexed_bytes / 4, 0);
+        stats::record_ext(
+            "knowledge_search",
+            stats::RecordMeta {
+                baseline: retrieval.io.indexed_bytes / 4,
+                returned: 0,
+                bytes_read: retrieval.io.bytes_read,
+                cache_hits: retrieval.io.cache_hits,
+                cache_misses: retrieval.io.cache_misses,
+                reason: None,
+            },
+        );
         if retrieval.empty_index {
             return Ok("knowledge_search: no documents indexed".into());
         }
@@ -297,18 +813,57 @@ pub fn search(root: &Path, args: &Value) -> Result<String, String> {
         out.push_str(&format!(" [continuation from hit #{resume_at}]"));
     }
     out.push('\n');
+    let mut obs_keys: Vec<(String, String)> = Vec::new();
+    let mut seen_obs: HashSet<(String, String)> = HashSet::new();
+    for rank in start..end {
+        let hit = &retrieval.hits[rank];
+        if hit.path == ".wordkeep/defects.json" {
+            if let Some(rest) = hit.heading.strip_prefix("DEFECT [") {
+                if let Some((_, defect_id)) = rest.split_once("] ") {
+                    let key = ("defect".to_string(), defect_id.trim().to_string());
+                    if seen_obs.insert(key.clone()) {
+                        obs_keys.push(key);
+                    }
+                }
+            }
+        } else if let Some((obs_kind, obs_id)) = obs_kind_and_id_for_note_rel(&hit.path) {
+            let key = (obs_kind.to_string(), obs_id);
+            if seen_obs.insert(key.clone()) {
+                obs_keys.push(key);
+            }
+        }
+    }
+    let mut stale_lookup: HashMap<(String, String), Vec<String>> = HashMap::new();
+    if !obs_keys.is_empty() {
+        if let Ok(st) = Store::open(root) {
+            if let Ok(stale) = st.stale_anchors_for_observations(root, &obs_keys) {
+                for s in stale {
+                    let entry = stale_lookup
+                        .entry((s.obs_kind.clone(), s.obs_id.clone()))
+                        .or_default();
+                    let lbl = s.label();
+                    if !entry.contains(&lbl) {
+                        entry.push(lbl);
+                    }
+                }
+            }
+        }
+    }
+
     let mut used = out.len() / 4;
     let mut truncated_at: Option<usize> = None;
     let mut shown = 0usize;
     let mut shown_hits: Vec<(String, String, String)> = Vec::new();
     for rank in start..end {
         let hit = &retrieval.hits[rank];
+        let stale_tag = stale_badge_for_hit(&hit.path, &hit.heading, &stale_lookup);
         let snippet = snippet_for(&hit.body, &retrieval.q_terms, 280);
         let block = format!(
-            "\n[{}] {} - {}  (score {:.2})\n{}\n",
+            "\n[{}] {} - {}{}  (score {:.2})\n{}\n",
             rank + 1,
             hit.path,
             hit.heading,
+            stale_tag,
             hit.score,
             snippet
         );
@@ -366,10 +921,16 @@ pub fn search(root: &Path, args: &Value) -> Result<String, String> {
     }
 
     progress::tick(shown as u64, Some(end as u64), "knowledge_search: done");
-    stats::record(
+    stats::record_ext(
         "knowledge_search",
-        retrieval.indexed_bytes / 4,
-        (out.len() / 4) as u64,
+        stats::RecordMeta {
+            baseline: retrieval.io.indexed_bytes / 4,
+            returned: (out.len() / 4) as u64,
+            bytes_read: retrieval.io.bytes_read,
+            cache_hits: retrieval.io.cache_hits,
+            cache_misses: retrieval.io.cache_misses,
+            reason: None,
+        },
     );
     Ok(out)
 }
@@ -393,7 +954,17 @@ pub fn answer(root: &Path, args: &Value) -> Result<String, String> {
 
     let retrieval = retrieve(root, args)?;
     if retrieval.hits.is_empty() {
-        stats::record("knowledge_answer", retrieval.indexed_bytes / 4, 0);
+        stats::record_ext(
+            "knowledge_answer",
+            stats::RecordMeta {
+                baseline: retrieval.io.indexed_bytes / 4,
+                returned: 0,
+                bytes_read: retrieval.io.bytes_read,
+                cache_hits: retrieval.io.cache_hits,
+                cache_misses: retrieval.io.cache_misses,
+                reason: None,
+            },
+        );
         return Ok(format!(
             "knowledge_answer - query {:?}\nanswer: (no matching documents)\ncitations:\n",
             retrieval.query
@@ -471,10 +1042,16 @@ pub fn answer(root: &Path, args: &Value) -> Result<String, String> {
         out.push_str("\n… (truncated by token_budget)\n");
     }
 
-    stats::record(
+    stats::record_ext(
         "knowledge_answer",
-        retrieval.indexed_bytes / 4,
-        (out.len() / 4) as u64,
+        stats::RecordMeta {
+            baseline: retrieval.io.indexed_bytes / 4,
+            returned: (out.len() / 4) as u64,
+            bytes_read: retrieval.io.bytes_read,
+            cache_hits: retrieval.io.cache_hits,
+            cache_misses: retrieval.io.cache_misses,
+            reason: None,
+        },
     );
     Ok(out)
 }
@@ -670,6 +1247,26 @@ pub fn upsert(root: &Path, args: &Value) -> Result<String, String> {
     }
 
     write_atomic(&full, &src)?;
+    if let Some((obs_kind, obs_id)) = obs_kind_and_id_for_note_rel(&rel_key) {
+        if let Ok(st) = Store::open(root) {
+            let (mt, sz) = std::fs::metadata(&full)
+                .map(|m| (cache::mtime_ns(&m), m.len()))
+                .unwrap_or((0, src.len() as u64));
+            let fid = if mt > 0 {
+                st.upsert_file(&rel_key, mt, sz, "markdown").ok()
+            } else {
+                None
+            };
+            if st
+                .sync_observation_links(root, obs_kind, &obs_id, fid, &src, &[])
+                .is_ok()
+            {
+                if let Some(fid) = fid {
+                    let _ = st.set_file_stage(fid, store::STAGE_OBS_LINKS, mt, None);
+                }
+            }
+        }
+    }
     let effect_sess = args
         .get("effect_session")
         .and_then(Value::as_str)
@@ -823,13 +1420,105 @@ fn write_atomic(path: &Path, contents: &str) -> Result<(), String> {
     std::fs::rename(&tmp, path).map_err(|e| format!("rename {}: {e}", path.display()))
 }
 
+/// Try to satisfy a warm query from the process-local corpus cache or a single
+/// bulk SQLite load (no walk / N+1). Returns `None` when any staged file's
+/// on-disk mtime has drifted.
+struct WarmIndex {
+    chunks: Arc<Vec<Chunk>>,
+    df: Option<Arc<HashMap<String, u32>>>,
+    postings: Option<Arc<HashMap<String, Vec<usize>>>>,
+    avgdl: Option<f64>,
+    fingerprint: String,
+    io: DocIndexStats,
+}
+
+fn try_warm_doc_corpus(root: &Path, roots: &[String], store: &Store) -> Option<WarmIndex> {
+    let (file_stages, fingerprint) = store.doc_stage_fingerprint(roots).ok()?;
+    if file_stages.is_empty() {
+        return None;
+    }
+    // Process-cache hit: trust SQLite fingerprint + invalidation coeffects
+    // (skip per-file disk stats — that was the warm-path multi-hundred-ms tax).
+    if let Some(hit) = lookup_warm_corpus(root, roots, &fingerprint) {
+        let n = hit.chunks.len() as u64;
+        return Some(WarmIndex {
+            chunks: hit.chunks,
+            df: Some(hit.df),
+            postings: Some(hit.postings),
+            avgdl: Some(hit.avgdl),
+            fingerprint,
+            io: DocIndexStats {
+                indexed_bytes: hit.indexed_bytes,
+                bytes_read: 0,
+                cache_hits: n,
+                cache_misses: 0,
+            },
+        });
+    }
+
+    // Process-cache miss: verify on-disk mtimes once, then bulk-load + tokenize.
+    let mut indexed_bytes = 0u64;
+    for (rel, stage_mt) in &file_stages {
+        let meta = std::fs::metadata(root.join(rel)).ok()?;
+        if cache::mtime_ns(&meta) != *stage_mt {
+            return None;
+        }
+        indexed_bytes = indexed_bytes.saturating_add(meta.len());
+    }
+    let (hits, _, fp2) = store.doc_chunks_for_roots(roots).ok()?;
+    if hits.is_empty() || fp2 != fingerprint {
+        return None;
+    }
+    let mut chunks: Vec<Chunk> = Vec::with_capacity(hits.len());
+    for hit in hits {
+        let mut tf = HashMap::new();
+        for t in tokenize(&format!("{} {}", hit.heading, hit.body)) {
+            *tf.entry(t).or_insert(0u32) += 1;
+        }
+        let len = tf.values().sum();
+        chunks.push(Chunk {
+            path: hit.rel_path,
+            heading: hit.heading,
+            body: hit.body,
+            sha256: hit.sha256,
+            tf,
+            len,
+        });
+    }
+    let n = chunks.len() as u64;
+    let hit = store_warm_corpus(root, roots, fingerprint.clone(), chunks, indexed_bytes);
+    Some(WarmIndex {
+        chunks: hit.chunks,
+        df: Some(hit.df),
+        postings: Some(hit.postings),
+        avgdl: Some(hit.avgdl),
+        fingerprint,
+        io: DocIndexStats {
+            indexed_bytes,
+            bytes_read: 0,
+            cache_hits: n,
+            cache_misses: 0,
+        },
+    })
+}
+
 /// Index the configured roots into chunks, returning the chunks and the total
 /// bytes of document text scanned (the baseline an agent would otherwise read).
-/// Skips pruned directories and persists newly chunked files to disk.
-fn index(root: &Path, roots: &[String]) -> (Vec<Chunk>, u64) {
+/// Skips pruned directories and persists newly chunked files into the
+/// per-workspace SQLite store (`doc_chunks` + `doc_chunks_fts`).
+fn index_with_store(root: &Path, roots: &[String], store: Option<&Store>) -> WarmIndex {
+    if let Some(st) = store {
+        // Warm hit: skip note-link re-walk; links were synced when chunks were written.
+        if let Some(warm) = try_warm_doc_corpus(root, roots, st) {
+            return warm;
+        }
+    }
+
     let mut chunks = Vec::new();
-    let mut bytes = 0u64;
+    let mut io = DocIndexStats::default();
     let prune = walk::prune_set(root);
+    let mut pending: Vec<(String, u64, u64, Vec<(String, String)>)> = Vec::new();
+
     for r in roots {
         let base = root.join(r);
         if base.is_file() {
@@ -838,11 +1527,17 @@ fn index(root: &Path, roots: &[String]) -> (Vec<Chunk>, u64) {
                 .unwrap_or(&base)
                 .to_string_lossy()
                 .replace('\\', "/");
-            chunks.extend(cached_chunks(&base, &rel, &mut bytes));
+            chunks.extend(cached_chunks_in(
+                store,
+                &mut pending,
+                &base,
+                &rel,
+                &mut io,
+            ));
             continue;
         }
-        for entry in walk::files(&base, &prune) {
-            let path = entry.path();
+        for path_owned in walk::files(&base, &prune) {
+            let path = path_owned.as_path();
             let ok = path
                 .extension()
                 .and_then(|e| e.to_str())
@@ -856,79 +1551,336 @@ fn index(root: &Path, roots: &[String]) -> (Vec<Chunk>, u64) {
                 .unwrap_or(path)
                 .to_string_lossy()
                 .replace('\\', "/");
-            chunks.extend(cached_chunks(path, &rel, &mut bytes));
+            chunks.extend(cached_chunks_in(
+                store,
+                &mut pending,
+                path,
+                &rel,
+                &mut io,
+            ));
         }
     }
-    if let Some(c) = CHUNK_CACHE.get() {
-        if let Ok(mut store) = c.lock() {
-            store.save();
+
+    if !pending.is_empty() {
+        invalidate_warm_corpus_cache();
+        if let Some(st) = store {
+            let _ = st.with_immediate_tx(|s| {
+                for (rel, mtime_ns, len, pairs) in &pending {
+                    let file_id = s.upsert_file(rel, *mtime_ns, *len, "markdown")?;
+                    s.replace_doc_chunks(file_id, pairs)?;
+                    s.set_file_stage(file_id, STAGE_DOC_CHUNKS, *mtime_ns, None)?;
+                    if let Some((obs_kind, obs_id)) = obs_kind_and_id_for_note_rel(rel) {
+                        if let Ok(full_src) = std::fs::read_to_string(root.join(rel)) {
+                            if s.sync_observation_links(
+                                root,
+                                obs_kind,
+                                &obs_id,
+                                Some(file_id),
+                                &full_src,
+                                &[],
+                            )
+                            .is_ok()
+                            {
+                                let _ = s.set_file_stage(
+                                    file_id,
+                                    store::STAGE_OBS_LINKS,
+                                    *mtime_ns,
+                                    None,
+                                );
+                            }
+                        }
+                    }
+                }
+                Ok(())
+            });
         }
     }
-    (chunks, bytes)
+    if let Some(st) = store {
+        let touches_notes = roots.iter().any(|r| {
+            let n = r.replace('\\', "/");
+            let n = n.trim_matches('/');
+            n.is_empty()
+                || n == "."
+                || n == ".wordkeep"
+                || n == ".wordkeep/notes"
+                || n.starts_with(".wordkeep/notes/")
+        });
+        if touches_notes {
+            ensure_note_obs_links_indexed(root, st);
+        }
+        // Always seed the process-local warm cache after a walk — even when some
+        // files were cold — so the next call hits Arc corpus instead of re-walking.
+        if !chunks.is_empty() {
+            let fingerprint = st
+                .doc_stage_fingerprint(roots)
+                .map(|(_, fp)| fp)
+                .unwrap_or_default();
+            if !fingerprint.is_empty() {
+                let hit =
+                    store_warm_corpus(root, roots, fingerprint.clone(), chunks, io.indexed_bytes);
+                return WarmIndex {
+                    chunks: hit.chunks,
+                    df: Some(hit.df),
+                    postings: Some(hit.postings),
+                    avgdl: Some(hit.avgdl),
+                    fingerprint,
+                    io,
+                };
+            }
+        }
+    }
+    WarmIndex {
+        chunks: Arc::new(chunks),
+        df: None,
+        postings: None,
+        avgdl: None,
+        fingerprint: String::new(),
+        io,
+    }
 }
 
-/// Return a document's chunks, reusing the cached chunking when the on-disk mtime
-/// is unchanged. Adds the file size to `bytes` (the read-it-yourself baseline).
-/// Falls back to a fresh read plus the shared Markdown chunker on cache miss
-/// or stat error.
-fn cached_chunks(path: &Path, rel: &str, bytes: &mut u64) -> Vec<Chunk> {
-    // Keep the established cache file visible to index_stale, but version each
-    // key so pre-fence-aware chunks are never reused.
-    let key = format!("{}::{}", path.to_string_lossy(), CHUNK_KEY_SUFFIX);
+fn obs_kind_and_id_for_note_rel(rel: &str) -> Option<(&'static str, String)> {
+    let norm = rel.replace('\\', "/");
+    if norm == ".wordkeep/notes/shrift-ledger.md" {
+        return None;
+    }
+    if let Some(rest) = norm.strip_prefix(".wordkeep/notes/shrift/") {
+        let slug = Path::new(rest)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or(rest);
+        if !slug.is_empty() {
+            return Some(("shrift", slug.to_string()));
+        }
+    }
+    if norm.starts_with(".wordkeep/notes/") {
+        return Some(("note", norm));
+    }
+    None
+}
+
+const META_NOTES_OBS_SCAN: &str = "obs_notes_dir_scan_mtime_ns";
+
+/// Ensure `.wordkeep/notes/**` Markdown files have `STAGE_OBS_LINKS` populated
+/// even when their `doc_chunks` were already warm-cached prior to v0.5 Phase 6.
+pub fn ensure_note_obs_links_indexed(root: &Path, store: &Store) {
+    let notes_dir = root.join(".wordkeep/notes");
+    if !notes_dir.is_dir() {
+        return;
+    }
+    // Directory mtime watermark: skip the walk when notes tree is unchanged.
+    if let Ok(dir_meta) = notes_dir.metadata() {
+        let dir_mt = cache::mtime_ns(&dir_meta);
+        if dir_mt > 0 {
+            let want = dir_mt.to_string();
+            if store
+                .get_meta(META_NOTES_OBS_SCAN)
+                .ok()
+                .flatten()
+                .as_deref()
+                == Some(want.as_str())
+            {
+                return;
+            }
+        }
+    }
+    let prune = walk::prune_set(root);
+    let mut cold: Vec<(String, &'static str, String, u64, u64, String)> = Vec::new();
+    for path_owned in walk::files(&notes_dir, &prune) {
+        let path = path_owned.as_path();
+        let ok = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| DOC_EXT.contains(&e));
+        if !ok {
+            continue;
+        }
+        let rel = path
+            .strip_prefix(root)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        let Some((obs_kind, obs_id)) = obs_kind_and_id_for_note_rel(&rel) else {
+            continue;
+        };
+        let Ok(meta) = path.metadata() else {
+            continue;
+        };
+        let mt = cache::mtime_ns(&meta);
+        if mt == 0 {
+            continue;
+        }
+        if let Ok(Some((_, stored_mt))) = store.file_stage_mtime(&rel, store::STAGE_OBS_LINKS) {
+            if stored_mt == mt {
+                continue;
+            }
+        }
+        let Ok(src) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        cold.push((rel, obs_kind, obs_id, mt, meta.len(), src));
+    }
+    let dir_mt = notes_dir
+        .metadata()
+        .ok()
+        .map(|m| cache::mtime_ns(&m))
+        .unwrap_or(0);
+    if cold.is_empty() {
+        if dir_mt > 0 {
+            let _ = store.set_meta(META_NOTES_OBS_SCAN, &dir_mt.to_string());
+        }
+        return;
+    }
+    crate::symbol_resolve::ensure_symbols_warm(root, store);
+    let _ = store.with_immediate_tx(|s| {
+        for (rel, obs_kind, obs_id, mt, sz, src) in &cold {
+            if let Ok(fid) = s.upsert_file(rel, *mt, *sz, "markdown") {
+                if s.sync_observation_links(root, obs_kind, obs_id, Some(fid), src, &[])
+                    .is_ok()
+                {
+                    let _ = s.set_file_stage(fid, store::STAGE_OBS_LINKS, *mt, None);
+                }
+            }
+        }
+        if dir_mt > 0 {
+            let _ = s.set_meta(META_NOTES_OBS_SCAN, &dir_mt.to_string());
+        }
+        Ok(())
+    });
+}
+
+fn stale_badge_for_hit(
+    path: &str,
+    heading: &str,
+    stale_lookup: &HashMap<(String, String), Vec<String>>,
+) -> String {
+    if stale_lookup.is_empty() {
+        return String::new();
+    }
+    if path == ".wordkeep/defects.json" {
+        if let Some(rest) = heading.strip_prefix("DEFECT [") {
+            if let Some((_, defect_id)) = rest.split_once("] ") {
+                if let Some(targets) =
+                    stale_lookup.get(&("defect".to_string(), defect_id.trim().to_string()))
+                {
+                    if !targets.is_empty() {
+                        return format!(" [stale-anchor: {}]", targets.join(", "));
+                    }
+                }
+            }
+        }
+        return String::new();
+    }
+    if let Some((obs_kind, obs_id)) = obs_kind_and_id_for_note_rel(path) {
+        if let Some(targets) = stale_lookup.get(&(obs_kind.to_string(), obs_id)) {
+            if !targets.is_empty() {
+                return format!(" [stale-anchor: {}]", targets.join(", "));
+            }
+        }
+    }
+    String::new()
+}
+
+/// Return a document's chunks, reusing the SQLite `doc_chunks` cache when the
+/// on-disk mtime is unchanged. Updates `io`. Queues cold parses
+/// into `pending` for batch persistence into `doc_chunks` + `doc_chunks_fts`.
+fn cached_chunks_in(
+    store: Option<&Store>,
+    pending: &mut Vec<(String, u64, u64, Vec<(String, String)>)>,
+    path: &Path,
+    rel: &str,
+    io: &mut DocIndexStats,
+) -> Vec<Chunk> {
     let (mtime_ns, len) = match std::fs::metadata(path) {
         Ok(m) => (cache::mtime_ns(&m), m.len()),
         Err(_) => (0, 0),
     };
-    *bytes += len;
-    let cell = CHUNK_CACHE.get_or_init(|| Mutex::new(DiskMap::load("knowledge-chunks.json")));
-    if let Ok(store) = cell.lock() {
-        if let Some(v) = store.get(key.as_ref(), mtime_ns) {
-            if let Some(arr) = v.as_array() {
-                return arr.iter().filter_map(chunk_from_value).collect();
+    io.indexed_bytes += len;
+    if mtime_ns > 0 {
+        if let Some(st) = store {
+            if let Ok(Some((file_id, stored_mt))) = st.file_stage_mtime(rel, STAGE_DOC_CHUNKS) {
+                if stored_mt == mtime_ns {
+                    if let Ok(rows) = st.doc_chunks_for_file(file_id) {
+                        io.cache_hits += 1;
+                        let mut out = Vec::with_capacity(rows.len());
+                        for r in rows {
+                            push_chunk_with_sha(
+                                &mut out,
+                                &r.rel_path,
+                                &r.heading,
+                                &r.body,
+                                if r.sha256.is_empty() {
+                                    None
+                                } else {
+                                    Some(r.sha256.as_str())
+                                },
+                            );
+                        }
+                        return out;
+                    }
+                }
             }
         }
     }
     let Ok(src) = std::fs::read_to_string(path) else {
         return Vec::new();
     };
+    io.cache_misses += 1;
+    io.bytes_read += src.len() as u64;
+    let pairs = chunk_bodies(rel, &src);
     let mut chunks = Vec::new();
-    for (heading, body) in chunk_bodies(rel, &src) {
-        push_chunk(&mut chunks, rel, &heading, &body);
+    let mut stored_pairs = Vec::new();
+    for (heading, body) in pairs {
+        let trimmed = body.trim();
+        if !trimmed.is_empty() {
+            let before = chunks.len();
+            push_chunk(&mut chunks, rel, &heading, trimmed);
+            if chunks.len() > before {
+                stored_pairs.push((heading, trimmed.to_string()));
+            }
+        }
     }
-    if let Ok(mut store) = cell.lock() {
-        let payload = Value::Array(
-            chunks
-                .iter()
-                .map(|c| json!({ "path": c.path, "heading": c.heading, "body": c.body }))
-                .collect(),
-        );
-        store.put(key.as_ref(), mtime_ns, payload);
+    if mtime_ns > 0 {
+        pending.push((rel.to_string(), mtime_ns, len, stored_pairs));
     }
     chunks
 }
 
-/// Rebuild a `Chunk` from its cached `{path, heading, body}`, recomputing term
-/// frequencies/length so BM25 scoring is identical to a fresh parse.
-fn chunk_from_value(v: &Value) -> Option<Chunk> {
-    let path = v.get("path").and_then(Value::as_str)?.to_string();
-    let heading = v.get("heading").and_then(Value::as_str)?.to_string();
-    let body = v.get("body").and_then(Value::as_str)?.to_string();
-    let text = format!("{heading}\n{body}");
-    let tf = term_freqs(&text);
-    let len: u32 = tf.values().sum();
-    if len == 0 {
-        return None;
+/// Single-file convenience wrapper over [`cached_chunks_in`] (flushes immediately).
+#[cfg(test)]
+fn cached_chunks(path: &Path, rel: &str, bytes: &mut u64) -> Vec<Chunk> {
+    let root = infer_root_for_path(path);
+    let store = Store::open(&root).ok();
+    let mut pending = Vec::new();
+    let mut io = DocIndexStats::default();
+    let out = cached_chunks_in(store.as_ref(), &mut pending, path, rel, &mut io);
+    *bytes += io.indexed_bytes;
+    if !pending.is_empty() {
+        if let Some(st) = store.as_ref() {
+            let _ = st.with_immediate_tx(|s| {
+                for (r, mt, len, pairs) in &pending {
+                    let fid = s.upsert_file(r, *mt, *len, "markdown")?;
+                    s.replace_doc_chunks(fid, pairs)?;
+                    s.set_file_stage(fid, STAGE_DOC_CHUNKS, *mt, None)?;
+                }
+                Ok(())
+            });
+        }
     }
-    Some(Chunk {
-        path,
-        heading,
-        body,
-        tf,
-        len,
-    })
+    out
 }
 
 fn push_chunk(out: &mut Vec<Chunk>, path: &str, heading: &str, buf: &str) {
+    push_chunk_with_sha(out, path, heading, buf, None);
+}
+
+fn push_chunk_with_sha(
+    out: &mut Vec<Chunk>,
+    path: &str,
+    heading: &str,
+    buf: &str,
+    known_sha: Option<&str>,
+) {
     let body = buf.trim();
     if body.is_empty() {
         return;
@@ -939,10 +1891,15 @@ fn push_chunk(out: &mut Vec<Chunk>, path: &str, heading: &str, buf: &str) {
     if len == 0 {
         return;
     }
+    let sha256 = match known_sha {
+        Some(s) if !s.is_empty() => s.to_string(),
+        _ => store::sha256_hex(&text),
+    };
     out.push(Chunk {
         path: path.to_string(),
         heading: heading.to_string(),
         body: body.to_string(),
+        sha256,
         tf,
         len,
     });
@@ -1097,36 +2054,33 @@ mod tests {
 
     #[test]
     fn invalidate_markdown_chunks_evicts_disk_entry() {
-        let _guard = cache::test_env_lock();
+        let _env = crate::cache::test_env_lock();
         let dir = std::env::temp_dir().join(format!("cbtest_kbinv_{}", std::process::id()));
-        let cache = std::env::temp_dir().join(format!("cbtest_kbinv_cache_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let _ = std::fs::remove_dir_all(&cache);
-        std::env::set_var("XDG_CACHE_HOME", &cache);
         std::fs::create_dir_all(&dir).unwrap();
         let f = dir.join("n.md");
         std::fs::write(&f, "# One\nalpha content\n").unwrap();
         let mut bytes = 0u64;
         let _ = cached_chunks(&f, "n.md", &mut bytes);
         let mtime = cache::mtime_ns(&std::fs::metadata(&f).unwrap());
-        let key = format!("{}::{}", f.to_string_lossy(), CHUNK_KEY_SUFFIX);
-        let cell = CHUNK_CACHE.get_or_init(|| Mutex::new(DiskMap::load("knowledge-chunks.json")));
-        assert!(cell.lock().unwrap().get(&key, mtime).is_some());
+        let st = Store::open(&dir).unwrap();
+        assert_eq!(
+            st.file_stage_mtime("n.md", STAGE_DOC_CHUNKS)
+                .unwrap()
+                .map(|(_, mt)| mt),
+            Some(mtime)
+        );
+        assert_eq!(st.search_docs_fts("alpha", 5).unwrap().len(), 1);
         invalidate_markdown_chunks(&f);
-        assert!(cell.lock().unwrap().get(&key, mtime).is_none());
+        assert!(st.file_stage_mtime("n.md", STAGE_DOC_CHUNKS).unwrap().is_none());
+        assert!(st.search_docs_fts("alpha", 5).unwrap().is_empty());
         let _ = std::fs::remove_dir_all(&dir);
-        let _ = std::fs::remove_dir_all(&cache);
     }
 
     #[test]
     fn upsert_notifies_coeffects_for_search() {
-        let _guard = cache::test_env_lock();
         let dir = std::env::temp_dir().join(format!("cbtest_kb_coeffect_{}", std::process::id()));
-        let cache_dir =
-            std::env::temp_dir().join(format!("cbtest_kb_coeffect_cache_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let _ = std::fs::remove_dir_all(&cache_dir);
-        std::env::set_var("XDG_CACHE_HOME", &cache_dir);
         let docs = dir.join("docs");
         std::fs::create_dir_all(&docs).unwrap();
         let rel = "docs/agent-note.md";
@@ -1151,7 +2105,6 @@ mod tests {
             "search should see post-upsert body: {out}"
         );
         let _ = std::fs::remove_dir_all(&dir);
-        let _ = std::fs::remove_dir_all(&cache_dir);
     }
 
     #[test]
@@ -1295,5 +2248,287 @@ mod tests {
         assert!(s.contains("## Beta"));
         assert!(s.contains("tail"));
         assert!(!s.contains("old"));
+    }
+
+    #[test]
+    fn search_boosts_unresolved_defects_and_respects_include_defects_false() {
+        let _env = crate::cache::test_env_lock();
+        let dir = std::env::temp_dir().join(format!("cbtest_kb_defect_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let docs = dir.join("docs");
+        std::fs::create_dir_all(&docs).unwrap();
+        std::fs::write(
+            docs.join("water.md"),
+            "# Water Foam\nWater foam shader renders foam crest on water waves.\n",
+        )
+        .unwrap();
+        defects::upsert(
+            &dir,
+            &json!({
+                "id": "eyeball-water-foam",
+                "status": "eyeball_fail",
+                "subsystem": "water",
+                "summary": "Water foam shader clips shoreline"
+            }),
+        )
+        .unwrap();
+
+        let with_defects = search(
+            &dir,
+            &json!({
+                "query": "water foam shader",
+                "roots": ["docs"],
+                "include_defects": true,
+                "semantic": false
+            }),
+        )
+        .unwrap();
+        let def_pos = with_defects.find("DEFECT [eyeball_fail] eyeball-water-foam");
+        let doc_pos = with_defects.find("water.md");
+        assert!(def_pos.is_some(), "defect missing: {with_defects}");
+        assert!(
+            doc_pos.map_or(true, |d| def_pos.unwrap() < d),
+            "eyeball_fail defect must rank above normal doc: {with_defects}"
+        );
+
+        let without_defects = search(
+            &dir,
+            &json!({
+                "query": "water foam shader",
+                "roots": ["docs"],
+                "include_defects": false,
+                "semantic": false
+            }),
+        )
+        .unwrap();
+        assert!(
+            !without_defects.contains("DEFECT [eyeball_fail]"),
+            "include_defects:false leaked defect: {without_defects}"
+        );
+        assert!(without_defects.contains("water.md"), "{without_defects}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn search_preserves_semif_head_rerank() {
+        let _env = crate::cache::test_env_lock();
+        let dir = std::env::temp_dir().join(format!("cbtest_kb_semif_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let docs = dir.join("docs");
+        std::fs::create_dir_all(&docs).unwrap();
+        std::fs::write(
+            docs.join("phys.md"),
+            "# Physics Step\nPhysics step runs deterministic fixed timestep simulation.\n",
+        )
+        .unwrap();
+        std::fs::write(
+            docs.join("audio.md"),
+            "# Audio Step\nAudio step mixes emitters on audio thread.\n",
+        )
+        .unwrap();
+        let out = search(
+            &dir,
+            &json!({
+                "query": "physics step deterministic",
+                "roots": ["docs"],
+                "include_defects": false,
+                "semantic": false,
+                "semif": true
+            }),
+        )
+        .unwrap();
+        assert!(out.contains("phys.md"), "{out}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rrf_three_way_retrieves_zero_overlap_semantic_hit_and_caches_in_sqlite() {
+        let _env = crate::cache::test_env_lock();
+        let dir = std::env::temp_dir().join(format!("cbtest_kb_rrf_zero_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let docs = dir.join("docs");
+        std::fs::create_dir_all(&docs).unwrap();
+        std::fs::write(
+            docs.join("slab.md"),
+            "# Memory Pool\nFixed-size slab recycler avoids heap fragmentation.\n",
+        )
+        .unwrap();
+        std::fs::write(
+            docs.join("audio.md"),
+            "# Audio Mixer\nAudio voice mixer streams sound channels.\n",
+        )
+        .unwrap();
+
+        let stub = crate::embed::test_helpers::KeywordStubEmbedder::new(
+            crate::embed::TAG_M2V_DOCS_DEFAULT,
+            &[
+                &["arena", "bump", "allocator", "slab", "recycler", "pool"],
+                &["audio", "mixer", "voice", "sound"],
+            ],
+        );
+
+        // Zero lexical token overlap with `docs/slab.md`!
+        let out = search_with_embedder(
+            &dir,
+            &json!({
+                "query": "arena bump allocator",
+                "roots": ["docs"],
+                "include_defects": false,
+                "semantic": true
+            }),
+            Some(&stub),
+        )
+        .unwrap();
+        assert!(
+            out.contains("slab.md"),
+            "zero-overlap semantic hit missing: {out}"
+        );
+        assert!(
+            !out.contains("audio.md"),
+            "orthogonal doc should not pass dense threshold: {out}"
+        );
+
+        // Verify the chunk vector was cached in SQLite `embeddings` by content_sha256.
+        let store = Store::open(&dir).unwrap();
+        let slab_sha = store::sha256_hex(
+            "Memory Pool\nFixed-size slab recycler avoids heap fragmentation.",
+        );
+        assert!(
+            store
+                .get_embedding(&slab_sha, crate::embed::TAG_M2V_DOCS_DEFAULT)
+                .unwrap()
+                .is_some(),
+            "chunk embedding must be cached by content_sha256 in sqlite embeddings table"
+        );
+
+        // Second query must reuse SQLite-cached chunk vectors (only embedding the 1 query).
+        let before_texts = stub.embedded_count();
+        let out2 = search_with_embedder(
+            &dir,
+            &json!({
+                "query": "bump arena",
+                "roots": ["docs"],
+                "include_defects": false,
+                "semantic": true
+            }),
+            Some(&stub),
+        )
+        .unwrap();
+        assert!(out2.contains("slab.md"), "{out2}");
+        assert_eq!(
+            stub.embedded_count() - before_texts,
+            1,
+            "warm query should embed only the query, not cached chunks"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rrf_preserves_defect_boost_and_semif_with_dense_leg() {
+        let _env = crate::cache::test_env_lock();
+        let dir = std::env::temp_dir().join(format!("cbtest_kb_rrf_def_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let docs = dir.join("docs");
+        std::fs::create_dir_all(&docs).unwrap();
+        std::fs::write(
+            docs.join("water.md"),
+            "# Water Foam\nWater foam crest rendering shader pipeline.\n",
+        )
+        .unwrap();
+        defects::upsert(
+            &dir,
+            &json!({
+                "id": "eyeball-water-crest",
+                "status": "eyeball_fail",
+                "subsystem": "water",
+                "summary": "Water foam crest shader clips near shore"
+            }),
+        )
+        .unwrap();
+
+        let stub = crate::embed::test_helpers::KeywordStubEmbedder::new(
+            crate::embed::TAG_M2V_DOCS_DEFAULT,
+            &[&["water", "foam", "crest", "shader"]],
+        );
+
+        let out = search_with_embedder(
+            &dir,
+            &json!({
+                "query": "water foam crest shader",
+                "roots": ["docs"],
+                "include_defects": true,
+                "semantic": true,
+                "semif": true
+            }),
+            Some(&stub),
+        )
+        .unwrap();
+        let def_pos = out.find("DEFECT [eyeball_fail] eyeball-water-crest");
+        let doc_pos = out.find("water.md");
+        assert!(def_pos.is_some(), "defect missing: {out}");
+        assert!(
+            doc_pos.map_or(true, |d| def_pos.unwrap() < d),
+            "eyeball_fail defect must stay ahead of normal doc under 3-way RRF + semif: {out}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(feature = "semantic-m2v")]
+    #[test]
+    fn knowledge_search_zero_overlap_with_real_model2vec() {
+        let _env = crate::cache::test_env_lock();
+        let dir = std::env::temp_dir().join(format!("cbtest_kb_m2v_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let docs = dir.join("docs");
+        std::fs::create_dir_all(&docs).unwrap();
+        std::fs::write(
+            docs.join("slab.md"),
+            "# Memory Pool\nFixed-size slab recycler eliminates fragmentation.\n",
+        )
+        .unwrap();
+        std::fs::write(
+            docs.join("audio.md"),
+            "# Audio Mixer\nMixer blends voices per frame.\n",
+        )
+        .unwrap();
+
+        let model_dir = dir
+            .join(".wordkeep/models")
+            .join(crate::embed::TAG_M2V_DOCS_DEFAULT);
+        crate::embed::test_helpers::write_synthetic_m2v_model(
+            &model_dir,
+            &[
+                ("arena", &[1.0, 0.0]),
+                ("allocator", &[1.0, 0.0]),
+                ("slab", &[1.0, 0.0]),
+                ("recycler", &[1.0, 0.0]),
+                ("audio", &[0.0, 1.0]),
+                ("mixer", &[0.0, 1.0]),
+            ],
+        )
+        .unwrap();
+
+        let out = search(
+            &dir,
+            &json!({
+                "query": "arena allocator",
+                "roots": ["docs"],
+                "include_defects": false,
+                "semantic": true
+            }),
+        )
+        .unwrap();
+        assert!(
+            out.contains("slab.md"),
+            "real model2vec-rs must retrieve zero-overlap doc: {out}"
+        );
+        assert!(
+            !out.contains("audio.md"),
+            "orthogonal doc should not match: {out}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

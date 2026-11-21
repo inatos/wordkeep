@@ -234,6 +234,17 @@ fn load_live(root: &Path) -> Result<Live, String> {
 }
 
 fn ensure_arc(root: &Path) -> Result<Arc<Live>, String> {
+    // Refuse a process-warm engine when this root has no GGUF configured —
+    // otherwise clearing ERESHKIGAL_GGUF in tests (or switching workspaces)
+    // would keep serving the previous checkpoint.
+    if config::semif_gguf_path(root).is_none() {
+        let mut g = SLOT.lock().map_err(|e| e.to_string())?;
+        *g = Some(Err("semif.gguf / ERESHKIGAL_GGUF is not set".into()));
+        if let Ok(mut w) = WARM.lock() {
+            *w = false;
+        }
+        return Err("semif.gguf / ERESHKIGAL_GGUF is not set".into());
+    }
     let mut g = SLOT.lock().map_err(|e| e.to_string())?;
     let retry = match g.as_ref() {
         None => true,
@@ -657,4 +668,15 @@ pub fn ensure_loaded(root: &Path) -> Result<(), String> {
 /// True after at least one successful `ensure_arc` / score path warmed the slot.
 pub fn is_warm() -> bool {
     WARM.lock().map(|g| *g).unwrap_or(false)
+}
+
+/// Drop the process-global GGUF slot (unit-test isolation only).
+#[cfg(test)]
+pub fn reset_for_tests() {
+    if let Ok(mut g) = SLOT.lock() {
+        *g = None;
+    }
+    if let Ok(mut w) = WARM.lock() {
+        *w = false;
+    }
 }

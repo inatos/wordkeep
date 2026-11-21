@@ -9,9 +9,37 @@ const DEFAULT_DOC_ROOTS: [&str; 5] = [
     ".wordkeep/notes",
 ];
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SearchBackendMode {
+    Auto,
+    Sqlite,
+    Meili,
+}
+
+impl SearchBackendMode {
+    pub fn parse(raw: &str) -> Result<Self, String> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "" | "auto" => Ok(Self::Auto),
+            "sqlite" | "fts5" => Ok(Self::Sqlite),
+            "meili" | "meilisearch" => Ok(Self::Meili),
+            other => Err(format!(
+                "invalid wiki search backend '{other}'; expected auto, sqlite, or meili"
+            )),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ResolvedSearchBackend {
+    Sqlite,
+    Meili,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct WikiConfig {
     pub doc_roots: Vec<String>,
+    pub search_backend: SearchBackendMode,
+    pub meili_configured: bool,
     pub meili_url: String,
     pub meili_key: Option<String>,
     pub index_uid: String,
@@ -26,6 +54,13 @@ pub(crate) struct WikiConfig {
 
 impl WikiConfig {
     pub fn load(root: &Path) -> Result<Self, String> {
+        Self::load_with_env(root, |key| std::env::var(key).ok())
+    }
+
+    pub fn load_with_env<F>(root: &Path, env_lookup: F) -> Result<Self, String>
+    where
+        F: Fn(&str) -> Option<String>,
+    {
         let path = root.join(".wordkeep/config.json");
         let document = if path.exists() {
             let bytes = std::fs::read(&path)
@@ -69,16 +104,25 @@ impl WikiConfig {
                 .map(str::to_string)
         };
         let environment = |key: &str| {
-            std::env::var(key)
-                .ok()
+            env_lookup(key)
                 .map(|value| value.trim().to_string())
                 .filter(|value| !value.is_empty())
         };
 
-        let meili_url = environment("WIKI_MEILI_URL")
-            .or_else(|| configured("meili_url"))
-            .unwrap_or_else(|| "http://127.0.0.1:7700".to_string());
+        let search_backend = match environment("WIKI_SEARCH_BACKEND")
+            .or_else(|| configured("search_backend"))
+        {
+            Some(raw) => SearchBackendMode::parse(&raw)?,
+            None => SearchBackendMode::Auto,
+        };
+
+        let explicit_meili_url = environment("WIKI_MEILI_URL")
+            .or_else(|| environment("MEILI_URL"))
+            .or_else(|| configured("meili_url"));
+        let meili_configured = explicit_meili_url.is_some();
+        let meili_url = explicit_meili_url.unwrap_or_else(|| "http://127.0.0.1:7700".to_string());
         let meili_key = environment("WIKI_MEILI_MASTER_KEY")
+            .or_else(|| environment("MEILI_MASTER_KEY"))
             .or_else(|| configured("meili_key"))
             .or_else(|| Some("wordkeep_dev_key".to_string()));
         let index_uid = configured("index").unwrap_or_else(|| "wiki_chunks".to_string());
@@ -121,6 +165,8 @@ impl WikiConfig {
 
         Ok(Self {
             doc_roots,
+            search_backend,
+            meili_configured,
             meili_url: meili_url.trim_end_matches('/').to_string(),
             meili_key,
             index_uid,
@@ -129,6 +175,20 @@ impl WikiConfig {
             project_name,
             read_only,
         })
+    }
+
+    pub fn resolved_search_backend(&self) -> ResolvedSearchBackend {
+        match self.search_backend {
+            SearchBackendMode::Sqlite => ResolvedSearchBackend::Sqlite,
+            SearchBackendMode::Meili => ResolvedSearchBackend::Meili,
+            SearchBackendMode::Auto => {
+                if self.meili_configured {
+                    ResolvedSearchBackend::Meili
+                } else {
+                    ResolvedSearchBackend::Sqlite
+                }
+            }
+        }
     }
 
     pub fn configured_path(&self, root: &Path, configured: &str) -> PathBuf {
@@ -309,6 +369,8 @@ mod tests {
     fn root_labels_match_files_and_directories() {
         let config = WikiConfig {
             doc_roots: vec!["docs".into(), "README.md".into()],
+            search_backend: SearchBackendMode::Auto,
+            meili_configured: false,
             meili_url: String::new(),
             meili_key: None,
             index_uid: String::new(),
@@ -323,6 +385,63 @@ mod tests {
             Some("README.md")
         );
         assert!(config.root_label_for("docs-old/a.md").is_none());
+    }
+
+    #[test]
+    fn search_backend_resolves_auto_sqlite_and_meili() {
+        let dir = std::env::temp_dir().join(format!("wordkeep_wiki_backend_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".wordkeep")).unwrap();
+
+        // Default auto without MEILI_URL -> sqlite.
+        let cfg = WikiConfig::load_with_env(&dir, |_| None).unwrap();
+        assert_eq!(cfg.search_backend, SearchBackendMode::Auto);
+        assert!(!cfg.meili_configured);
+        assert_eq!(cfg.resolved_search_backend(), ResolvedSearchBackend::Sqlite);
+
+        // Auto with MEILI_URL -> preserves meili.
+        let cfg_meili_env = WikiConfig::load_with_env(&dir, |k| match k {
+            "MEILI_URL" => Some("http://127.0.0.1:7700".into()),
+            _ => None,
+        })
+        .unwrap();
+        assert!(cfg_meili_env.meili_configured);
+        assert_eq!(
+            cfg_meili_env.resolved_search_backend(),
+            ResolvedSearchBackend::Meili
+        );
+
+        // Explicit sqlite overrides MEILI_URL.
+        let cfg_sqlite = WikiConfig::load_with_env(&dir, |k| match k {
+            "WIKI_SEARCH_BACKEND" => Some("sqlite".into()),
+            "MEILI_URL" => Some("http://127.0.0.1:7700".into()),
+            _ => None,
+        })
+        .unwrap();
+        assert_eq!(
+            cfg_sqlite.resolved_search_backend(),
+            ResolvedSearchBackend::Sqlite
+        );
+
+        // Explicit meili without MEILI_URL -> meili.
+        let cfg_meili = WikiConfig::load_with_env(&dir, |k| match k {
+            "WIKI_SEARCH_BACKEND" => Some("meili".into()),
+            _ => None,
+        })
+        .unwrap();
+        assert_eq!(
+            cfg_meili.resolved_search_backend(),
+            ResolvedSearchBackend::Meili
+        );
+
+        // Invalid backend errors cleanly.
+        assert!(WikiConfig::load_with_env(&dir, |k| match k {
+            "WIKI_SEARCH_BACKEND" => Some("bogus".into()),
+            _ => None,
+        })
+        .is_err());
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

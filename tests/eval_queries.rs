@@ -102,7 +102,12 @@ struct Server {
 
 impl Server {
     fn start() -> Server {
+        Self::start_with_setup(|_| {})
+    }
+
+    fn start_with_setup<F: FnOnce(&Path)>(setup: F) -> Server {
         let fixture = FixtureRepo::new();
+        setup(&fixture.root);
         let cache_home = std::env::temp_dir().join(format!(
             "wk_eval_cache_{}_{}",
             std::process::id(),
@@ -114,16 +119,19 @@ impl Server {
             COUNTER.fetch_add(1, Ordering::Relaxed)
         ));
         std::fs::create_dir_all(&workdir).expect("cwd");
-        let mut child = Command::new(env!("CARGO_BIN_EXE_wordkeep"))
-            .arg("--root")
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_wordkeep"));
+        cmd.arg("--root")
             .arg(&fixture.root)
             .current_dir(&workdir)
             .env("XDG_CACHE_HOME", &cache_home)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn wordkeep");
+            .stderr(Stdio::null());
+        // Avoid unexpected HF downloads during offline cargo test unless opted in.
+        if std::env::var("WORDKEEP_EVAL_REAL_MODELS").ok().as_deref() != Some("1") {
+            cmd.env("WORDKEEP_EMBED_OFFLINE", "1");
+        }
+        let mut child = cmd.spawn().expect("spawn wordkeep");
         let stdin = child.stdin.take().unwrap();
         let stdout = BufReader::new(child.stdout.take().unwrap());
         let mut s = Server {
@@ -478,10 +486,11 @@ fn eval_new_tools_are_listed() {
         "shrift_review",
         "semantic_decide",
         "decree",
+        "tool_discover",
     ] {
         assert!(names.contains(&n), "missing {n} in {names:?}");
     }
-    assert_eq!(names.len(), 67, "surface drift: {names:?}");
+    assert_eq!(names.len(), 68, "surface drift: {names:?}");
 }
 
 fn extract_continuation(text: &str) -> Option<String> {
@@ -579,4 +588,149 @@ fn eval_progress_notifications_on_repo_map() {
         json!("eval-progress-1"),
         "{first}"
     );
+}
+
+#[test]
+fn eval_symbol_resolve_fts5_fallback_on_multiword_miss() {
+    let mut s = Server::start();
+    // Multi-word reversed query misses exact lookup and edit-distance fuzzy,
+    // exercising the SQLite symbols_fts fallback path over MCP stdio.
+    let (err, text) = s.tool(
+        "symbol_resolve",
+        json!({ "symbol": "area widget", "paths": ["src"] }),
+    );
+    assert!(!err, "{text}");
+    assert!(
+        text.contains("widget_area"),
+        "expected FTS5 fallback to locate widget_area: {text}"
+    );
+    assert!(
+        text.contains("did you mean") || text.contains("fallback"),
+        "{text}"
+    );
+}
+
+#[cfg(feature = "semantic-m2v")]
+fn write_eval_synthetic_m2v_model(dir: &Path, vocab_vectors: &[(&str, &[f32])]) {
+    std::fs::create_dir_all(dir).expect("model dir");
+    let dim = vocab_vectors[0].1.len();
+    let mut vocab = serde_json::Map::new();
+    vocab.insert("[UNK]".to_string(), json!(0));
+    let mut floats: Vec<f32> = vec![0.0; dim];
+    for (i, (tok, vec)) in vocab_vectors.iter().enumerate() {
+        vocab.insert(tok.to_ascii_lowercase(), json!(i + 1));
+        floats.extend_from_slice(vec);
+    }
+    let rows = vocab_vectors.len() + 1;
+    std::fs::write(
+        dir.join("config.json"),
+        serde_json::to_vec(&json!({ "normalize": true, "max_length": 512 })).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("tokenizer.json"),
+        serde_json::to_vec(&json!({
+            "added_tokens": [],
+            "normalizer": {
+                "type": "BertNormalizer",
+                "clean_text": true,
+                "handle_chinese_chars": true,
+                "strip_accents": true,
+                "lowercase": true
+            },
+            "pre_tokenizer": { "type": "BertPreTokenizer" },
+            "model": {
+                "type": "WordPiece",
+                "unk_token": "[UNK]",
+                "continuing_subword_prefix": "##",
+                "max_input_chars_per_word": 100,
+                "vocab": vocab
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let byte_len = floats.len() * 4;
+    let header = serde_json::to_vec(&json!({
+        "embeddings": {
+            "dtype": "F32",
+            "shape": [rows, dim],
+            "data_offsets": [0, byte_len]
+        }
+    }))
+    .unwrap();
+    let mut st = Vec::with_capacity(8 + header.len() + byte_len);
+    st.extend_from_slice(&(header.len() as u64).to_le_bytes());
+    st.extend_from_slice(&header);
+    for f in floats {
+        st.extend_from_slice(&f.to_le_bytes());
+    }
+    std::fs::write(dir.join("model.safetensors"), st).unwrap();
+}
+
+#[cfg(feature = "semantic-m2v")]
+#[test]
+fn eval_semantic_zero_overlap_end_to_end_m2v() {
+    let mut s = Server::start_with_setup(|root| {
+        std::fs::write(
+            root.join("docs/pool.md"),
+            "# Slab Pool\nFixed-size slab recycler eliminates fragmentation.\n",
+        )
+        .unwrap();
+        let docs_model = root.join(".wordkeep/models/potion-retrieval-32M");
+        write_eval_synthetic_m2v_model(
+            &docs_model,
+            &[
+                ("arena", &[1.0, 0.0]),
+                ("allocator", &[1.0, 0.0]),
+                ("slab", &[1.0, 0.0]),
+                ("recycler", &[1.0, 0.0]),
+                ("physics", &[0.0, 1.0]),
+                ("audio", &[0.0, 1.0]),
+            ],
+        );
+        let code_model = root.join(".wordkeep/models/potion-code-16M-v2");
+        write_eval_synthetic_m2v_model(
+            &code_model,
+            &[
+                ("rectangle", &[1.0, 0.0]),
+                ("surface", &[1.0, 0.0]),
+                ("widget", &[1.0, 0.0]),
+                ("area", &[1.0, 0.0]),
+                ("run", &[0.0, 1.0]),
+            ],
+        );
+    });
+
+    // Zero lexical overlap with `docs/pool.md`: only dense model2vec RRF can find it.
+    let (err, kb_out) = s.tool(
+        "knowledge_search",
+        json!({
+            "query": "arena allocator",
+            "roots": ["docs"],
+            "include_defects": false,
+            "semantic": true
+        }),
+    );
+    assert!(!err, "{kb_out}");
+    assert!(
+        kb_out.contains("pool.md"),
+        "expected model2vec-rs 3-way RRF to surface zero-overlap doc: {kb_out}"
+    );
+
+    // Zero lexical overlap with `widget_area`: potion-code fallback must find it.
+    let (err2, sym_out) = s.tool(
+        "symbol_resolve",
+        json!({
+            "symbol": "rectangle_surface",
+            "paths": ["src"],
+            "semantic": true
+        }),
+    );
+    assert!(!err2, "{sym_out}");
+    assert!(
+        sym_out.contains("widget_area"),
+        "expected potion-code semantic fallback to surface widget_area: {sym_out}"
+    );
+    assert!(sym_out.contains("[semantic]"), "{sym_out}");
 }

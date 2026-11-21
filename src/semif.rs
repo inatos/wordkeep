@@ -647,7 +647,7 @@ impl Scorer for RemoteHttpScorer {
     fn score_one(&self, req: &DecisionRequest) -> Result<Vec<(String, f64)>, String> {
         match self.try_remote_score(req) {
             Ok(s) => Ok(s),
-            Err(e) => cascade_after_copper_fail(&self.root, req, &e),
+            Err(e) => cascade_after_copper_fail(&self.root, req, &e).map(|(s, _)| s),
         }
     }
     fn score_detailed(&self, req: &DecisionRequest) -> Result<ScoreBundle, String> {
@@ -660,9 +660,10 @@ impl Scorer for RemoteHttpScorer {
                 Ok(b)
             }
             Err(e) => {
-                let raw = cascade_after_copper_fail(&self.root, req, &e)?;
+                let (raw, backend) = cascade_after_copper_fail(&self.root, req, &e)?;
                 let mut b = ScoreBundle::from_raw(raw);
-                b.cascade_source = Some(format!("{name}→heuristic:{e}", name = self.scorer_name));
+                b.cascade_source =
+                    Some(format!("{name}→{backend}:{e}", name = self.scorer_name));
                 Ok(b)
             }
         }
@@ -706,7 +707,8 @@ impl Scorer for RemoteCopperScorer {
                     &self.root,
                     req,
                     &format!("caps_missing:{}", h.caps),
-                );
+                )
+                .map(|(s, _)| s);
             }
         }
 
@@ -792,16 +794,19 @@ impl Scorer for RemoteCopperScorer {
             req,
             &format!("backoff_exhausted:{last_err}"),
         )
+        .map(|(s, _)| s)
     }
 }
 
 /// After Copper mid-call / caps failure: re-resolve Aeron → GGUF → heuristic.
 /// Explicit `WORDKEEP_SEMIF_BACKEND=remote-copper|copper` stays heuristic-only (no cascade).
+/// Returns `(scores, winning_backend)` where backend is one of
+/// `"remote-aeron"`, `"ereshkigal"`, or `"heuristic"`.
 fn cascade_after_copper_fail(
     root: &Path,
     req: &DecisionRequest,
     reason: &str,
-) -> Result<Vec<(String, f64)>, String> {
+) -> Result<(Vec<(String, f64)>, &'static str), String> {
     let backend = config::semif_backend(root);
     if matches!(backend.as_str(), "remote-copper" | "copper") {
         eprintln!(
@@ -814,7 +819,7 @@ fn cascade_after_copper_fail(
             "reason": reason,
             "cascade": false,
         }));
-        return HeuristicScorer.score_one(req);
+        return Ok((HeuristicScorer.score_one(req)?, "heuristic"));
     }
 
     if copper_health::prefer_aeron(root) {
@@ -827,7 +832,7 @@ fn cascade_after_copper_fail(
             "cascade": true,
         }));
         match aeron_scorer(root).score_one(req) {
-            Ok(scores) => return Ok(scores),
+            Ok(scores) => return Ok((scores, "remote-aeron")),
             Err(e) => {
                 eprintln!("[wordkeep] remote-aeron cascade failed: {e}");
             }
@@ -846,7 +851,7 @@ fn cascade_after_copper_fail(
                     "reason": reason,
                     "cascade": true,
                 }));
-                return s.score_one(req);
+                return Ok((s.score_one(req)?, "ereshkigal"));
             }
             ResolvedScorer::Unavailable(e) => {
                 eprintln!("[wordkeep] ereshkigal cascade unavailable: {e}");
@@ -862,7 +867,7 @@ fn cascade_after_copper_fail(
         "reason": reason,
         "cascade": true,
     }));
-    HeuristicScorer.score_one(req)
+    Ok((HeuristicScorer.score_one(req)?, "heuristic"))
 }
 
 fn resolve_ereshkigal(root: &Path, for_decide: bool) -> ResolvedScorer {
@@ -1089,22 +1094,19 @@ fn decide_one_at(
     let (bundle, fallback, winning_scorer) = match root {
         Some(root) => match score_with_policy(root, scorer, req) {
             Ok(b) => {
-                let cascaded = b
-                    .cascade_source
-                    .as_deref()
-                    .map(|s| s.contains('→') || s.contains("heuristic"))
-                    .unwrap_or(false);
-                let name = if cascaded
-                    && b.cascade_source
-                        .as_deref()
-                        .map(|s| s.contains("heuristic"))
-                        .unwrap_or(false)
-                {
-                    "heuristic"
+                let src = b.cascade_source.as_deref().unwrap_or("");
+                let cascaded = src.contains('→');
+                // Cascade to local Ereshkigal is a real scorer win, not a heuristic fallback.
+                let (name, is_fallback) = if src.contains("→ereshkigal:") {
+                    ("ereshkigal", force_fallback)
+                } else if src.contains("→remote-aeron:") {
+                    ("remote-aeron", force_fallback)
+                } else if cascaded && src.contains("heuristic") {
+                    ("heuristic", true)
                 } else {
-                    scorer.name()
+                    (scorer.name(), force_fallback || cascaded)
                 };
-                (b, force_fallback || cascaded, name)
+                (b, is_fallback, name)
             }
             Err(e) => {
                 eprintln!("[wordkeep] semif scorer error → heuristic: {e}");
@@ -1387,6 +1389,7 @@ pub fn decide(root: &Path, args: &Value) -> Result<String, String> {
             "results": results.iter().map(result_to_json).collect::<Vec<_>>(),
         });
         let text = serde_json::to_string_pretty(&out).map_err(|e| e.to_string())?;
+        crate::mcp::set_structured_content(out);
         stats::record("semantic_decide", 64, (text.len() / 4) as u64);
         return Ok(text);
     }
@@ -1409,6 +1412,7 @@ pub fn decide(root: &Path, args: &Value) -> Result<String, String> {
         }
     }
     let text = serde_json::to_string_pretty(&out).map_err(|e| e.to_string())?;
+    crate::mcp::set_structured_content(out);
     stats::record("semantic_decide", 64, (text.len() / 4) as u64);
     Ok(text)
 }
@@ -1776,6 +1780,41 @@ mod tests {
         }
     }
 
+    /// Clear host SemIf env so isolated temp trees are not promoted by a live GGUF.
+    struct SemifEnvGuard {
+        saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    }
+
+    impl SemifEnvGuard {
+        fn clear_host() -> Self {
+            const KEYS: &[&str] = &[
+                "WORDKEEP_SEMIF_BACKEND",
+                "ERESHKIGAL_BACKEND",
+                "ERESHKIGAL_GGUF",
+                "ERESHKIGAL_GGUF_VERIFY",
+            ];
+            let saved = KEYS
+                .iter()
+                .map(|&k| (k, std::env::var_os(k)))
+                .collect::<Vec<_>>();
+            for (k, _) in &saved {
+                std::env::remove_var(k);
+            }
+            #[cfg(feature = "ereshkigal")]
+            crate::semif_gguf::reset_for_tests();
+            Self { saved }
+        }
+    }
+
+    impl Drop for SemifEnvGuard {
+        fn drop(&mut self) {
+            // Do not restore host SemIf env. Re-injecting ERESHKIGAL_GGUF mid-suite
+            // poisons later hermetic tests via process-global engine state and
+            // env races with libtest worker threads.
+            self.saved.clear();
+        }
+    }
+
     #[test]
     fn heuristic_argmax_stable_and_prompt_hash_deterministic() {
         let s = HeuristicScorer;
@@ -1978,8 +2017,9 @@ mod tests {
             r#"{"semif":{"enabled":true,"backend":"remote-copper"}}"#,
         )
         .unwrap();
-        let scores = cascade_after_copper_fail(&dir, &support_req(), "test_pinned")
+        let (scores, backend) = cascade_after_copper_fail(&dir, &support_req(), "test_pinned")
             .expect("heuristic cascade");
+        assert_eq!(backend, "heuristic");
         assert!(!scores.is_empty());
         let ids: Vec<_> = scores.iter().map(|(id, _)| id.as_str()).collect();
         assert!(ids.contains(&"yes") || ids.contains(&"no"));
@@ -1988,6 +2028,7 @@ mod tests {
 
     #[test]
     fn copper_fail_cascade_auto_reaches_heuristic_without_aeron() {
+        let _env = SemifEnvGuard::clear_host();
         let dir = std::env::temp_dir().join(format!("wk_semif_cu_auto_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join(".wordkeep")).unwrap();
@@ -1997,9 +2038,49 @@ mod tests {
         )
         .unwrap();
         // No aeron-cli / ereshkigal in temp tree → cascade ends at heuristic.
-        let scores = cascade_after_copper_fail(&dir, &support_req(), "test_auto")
+        let (scores, backend) = cascade_after_copper_fail(&dir, &support_req(), "test_auto")
             .expect("heuristic cascade");
+        assert_eq!(backend, "heuristic");
         assert!(!scores.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn remote_http_cascade_labels_actual_backend_not_always_heuristic() {
+        let _env = SemifEnvGuard::clear_host();
+        let dir = std::env::temp_dir().join(format!("wk_semif_label_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".wordkeep")).unwrap();
+        std::fs::write(
+            dir.join(".wordkeep/config.json"),
+            r#"{"semif":{"enabled":true,"backend":"auto"}}"#,
+        )
+        .unwrap();
+        let scorer = RemoteHttpScorer {
+            base_url: "http://127.0.0.1:1".into(),
+            root: dir.clone(),
+            connect_timeout_ms: 50,
+            calibrated_proxy: false,
+            question_kind: "support".into(),
+            scorer_name: "remote-myridos",
+        };
+        let bundle = scorer
+            .score_detailed(&support_req())
+            .expect("cascade must score");
+        let src = bundle.cascade_source.expect("cascade_source required");
+        assert!(
+            src.starts_with("remote-myridos→"),
+            "expected remote-myridos→… label, got {src}"
+        );
+        assert!(
+            !src.contains("→heuristic:") || src.ends_with("heuristic") || src.contains("heuristic:"),
+            "label must name the real backend: {src}"
+        );
+        // Without aeron/ereshkigal in the temp tree the winning backend is heuristic.
+        assert!(
+            src.contains("→heuristic:"),
+            "temp tree should cascade to heuristic, got {src}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2051,8 +2132,9 @@ mod tests {
             r#"{"semif":{"enabled":true,"backend":"remote-copper"}}"#,
         )
         .unwrap();
-        let scores = cascade_after_copper_fail(&dir, &support_req(), "honesty_pin")
+        let (scores, backend) = cascade_after_copper_fail(&dir, &support_req(), "honesty_pin")
             .expect("cascade must return scores");
+        assert_eq!(backend, "heuristic");
         assert!(!scores.is_empty());
         for (id, s) in &scores {
             assert!(!id.is_empty(), "empty option id in cascade scores");
@@ -2099,6 +2181,7 @@ mod tests {
     #[test]
     fn fixture_run_record_evidence() {
         use crate::runs;
+        let _guard = crate::cache::test_env_lock();
         let dir = std::env::temp_dir().join(format!("wk_semif_run_{}", std::process::id()));
         let cache = std::env::temp_dir().join(format!("wk_semif_cache_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -2145,6 +2228,7 @@ mod tests {
 
     #[test]
     fn ereshkigal_backend_without_gguf_is_unavailable() {
+        let env = SemifEnvGuard::clear_host();
         let dir = std::env::temp_dir().join(format!("wk_semif_noggu_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join(".wordkeep")).unwrap();
@@ -2153,6 +2237,11 @@ mod tests {
             r#"{"semif":{"enabled":true,"backend":"ereshkigal","debias":"none"}}"#,
         )
         .unwrap();
+        assert!(
+            config::semif_gguf_path(&dir).is_none(),
+            "host GGUF leaked into isolated tree: {:?}",
+            config::semif_gguf_path(&dir)
+        );
         match resolve_scorer(&dir) {
             ResolvedScorer::Unavailable(e) => {
                 assert!(
@@ -2162,6 +2251,17 @@ mod tests {
             }
             ResolvedScorer::Ready(_, _) => panic!("missing GGUF must not silently use heuristic"),
         }
+        // Re-clear global slot in case a prior ensure_loaded cached a live engine.
+        #[cfg(feature = "ereshkigal")]
+        crate::semif_gguf::reset_for_tests();
+        assert!(
+            config::semif_gguf_path(&dir).is_none(),
+            "GGUF leaked before decide: path={:?} ERESHKIGAL_GGUF={:?} WORDKEEP_SEMIF_BACKEND={:?} ERESHKIGAL_BACKEND={:?}",
+            config::semif_gguf_path(&dir),
+            std::env::var_os("ERESHKIGAL_GGUF"),
+            std::env::var_os("WORDKEEP_SEMIF_BACKEND"),
+            std::env::var_os("ERESHKIGAL_BACKEND"),
+        );
         let err = decide(
             &dir,
             &json!({
@@ -2172,6 +2272,7 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("unavailable"), "{err}");
+        drop(env);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2321,12 +2422,28 @@ mod tests {
     #[cfg(feature = "ereshkigal")]
     #[test]
     fn gguf_after_fixture_when_env_set() {
-        let Ok(gguf) = std::env::var("ERESHKIGAL_GGUF") else {
+        // Prefer env; fall back to the lab draft checkpoint so prior SemifEnvGuard
+        // clears in this process do not skip the optional live GGUF fixture.
+        let raw = std::env::var("ERESHKIGAL_GGUF").ok().or_else(|| {
+            let p = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../.wordkeep/models/Qwen3-0.6B-Q8_0.gguf");
+            p.is_file()
+                .then(|| p.canonicalize().ok())
+                .flatten()
+                .map(|p| p.to_string_lossy().into_owned())
+        });
+        let Some(gguf) = raw else {
             return;
         };
-        if !Path::new(&gguf).is_file() {
+        // Canonicalize so a CWD-relative env value still resolves when `decide`
+        // uses an isolated temp workspace as its root (TMPDIR ≠ repo).
+        let Ok(gguf) = Path::new(&gguf).canonicalize() else {
+            return;
+        };
+        if !gguf.is_file() {
             return;
         }
+        let gguf = gguf.to_string_lossy().into_owned();
         let dir = std::env::temp_dir().join(format!("wk_semif_gguf_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join(".wordkeep")).unwrap();

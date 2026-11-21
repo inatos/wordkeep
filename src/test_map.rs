@@ -14,6 +14,7 @@ use crate::symbol_refs;
 pub fn build(root: &Path, args: &Value) -> Result<String, String> {
     let raw = args
         .get("symbol")
+        .or_else(|| args.get("name"))
         .and_then(Value::as_str)
         .unwrap_or("")
         .trim();
@@ -233,6 +234,8 @@ mod tests {
         assert!(out.contains("test_unit.cpp"), "{out}");
         assert!(!out.contains("test_other.cpp"), "{out}");
         assert!(out.contains("[unit]"), "{out}");
+        let by_name = build(&dir, &serde_json::json!({ "name": "helper_fn" })).unwrap();
+        assert!(by_name.contains("test_unit.cpp"), "{by_name}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

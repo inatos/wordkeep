@@ -123,6 +123,7 @@ pub fn mcp_tools(root: PathBuf) -> Vec<mcp::Tool> {
             "include_checked_out":{"type":"boolean"},
             "verbose":{"type":"boolean","description":"Include stale ids, handoff summaries, unread message bodies, and stale advisory lines. Default is active leases only."},
             "format":{"type":"string","enum":["text","json"]},
+            "if_none_match":{"type":"string","description":"Optional ETag from a prior izakaya_status call; returns 1-line unchanged (etag=...) when journal/board hash matches."},
             "token_budget":{"type":"integer"}
         }})),
         tool(&root, "izakaya_check_in", "Check in before the first live edit, or resume with lease_id. Returns a lease. Claims are advisory. Optional handoff_id accepts an offered handoff. Does not finalize MAS sessions.", json!({"type":"object","properties":{
@@ -142,10 +143,10 @@ pub fn mcp_tools(root: PathBuf) -> Vec<mcp::Tool> {
             "format":{"type":"string"},
             "token_budget":{"type":"integer"}
         },"required":["agent_id"]})),
-        tool(&root, "izakaya_update", "Heartbeat or move among checked_in, live_code, and suspended. Suspend of dirty work requires checkpoint. Optional note is a directed message. Requires lease_id.", json!({"type":"object","properties":{
+        tool(&root, "izakaya_update", "Heartbeat or move among checked_in, live_code, suspended, and done (checked_out). Suspend of dirty work requires checkpoint. Optional note is a directed message. Auto-resolves lease_id when agent_id has a single active lease.", json!({"type":"object","properties":{
             "agent_id":{"type":"string"},
-            "lease_id":{"type":"string"},
-            "state":{"type":"string"},
+            "lease_id":{"type":"string","description":"Optional when agent_id has a single active lease."},
+            "state":{"type":"string","description":"checked_in|live_code|suspended|done"},
             "summary":{"type":"string"},
             "claims":{"type":"array","items":{"type":"object","properties":{"path":{"type":"string"},"symbols":{"type":"array","items":{"type":"string"}},"intent":{"type":"string"}},"additionalProperties":true}},
             "checkpoint":{"type":"string"},
@@ -157,17 +158,17 @@ pub fn mcp_tools(root: PathBuf) -> Vec<mcp::Tool> {
             "observe_git":{"type":"boolean"},
             "format":{"type":"string"},
             "token_budget":{"type":"integer"}
-        },"required":["agent_id","lease_id"]})),
-        tool(&root, "izakaya_check_out", "Release claims and close this incarnation. reason completed|handed_off|abandoned. handed_off requires a handoff capsule referencing MAS/notes; Izakaya does not call mas_finalize. Idempotent if already checked out.", json!({"type":"object","properties":{
+        },"required":["agent_id"]})),
+        tool(&root, "izakaya_check_out", "Release claims and close this incarnation. reason completed|done|handed_off|abandoned. handed_off requires a handoff capsule referencing MAS/notes; Izakaya does not call mas_finalize. Auto-resolves lease_id when agent_id has an active lease. Idempotent if already checked out.", json!({"type":"object","properties":{
             "agent_id":{"type":"string"},
-            "lease_id":{"type":"string"},
+            "lease_id":{"type":"string","description":"Optional when agent_id has an active lease."},
             "reason":{"type":"string"},
             "handoff":{"type":"object","additionalProperties":true},
             "idempotency_key":{"type":"string"},
             "expected_revision":{"type":"integer"},
             "format":{"type":"string"},
             "token_budget":{"type":"integer"}
-        },"required":["agent_id","lease_id"]})),
+        },"required":["agent_id"]})),
         tool(&root, "izakaya_advise", "Apply the promoted advisory policy to current presence and return recommendations. Read-only: cannot assign, suspend, check out, or run git.", json!({"type":"object","properties":{
             "format":{"type":"string"},
             "token_budget":{"type":"integer"}
@@ -194,6 +195,13 @@ fn dispatch(name: &str, root: &Path, args: &Value) -> Result<String, String> {
         "izakaya_advise" => policy::advise(root, args)?,
         other => return Err(format!("unknown izakaya tool {other}")),
     };
+    if name == "izakaya_status" {
+        let mut sc = value.clone();
+        if let Some(obj) = sc.as_object_mut() {
+            obj.remove("text");
+        }
+        crate::mcp::set_structured_content(sc);
+    }
     let format = args.get("format").and_then(Value::as_str).unwrap_or("text");
     let mut text = if format == "json" {
         serde_json::to_string_pretty(&value).unwrap_or_else(|_| "{}".into())
@@ -292,6 +300,9 @@ fn parse_flags(argv: &[String]) -> Result<Value, String> {
             }
             "--format" => {
                 obj.insert("format".into(), json!(take(&mut i)?));
+            }
+            "--if-none-match" => {
+                obj.insert("if_none_match".into(), json!(take(&mut i)?));
             }
             "--spec" => {
                 obj.insert("spec".into(), json!(take(&mut i)?));

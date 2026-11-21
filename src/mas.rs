@@ -1173,10 +1173,36 @@ fn append_mas_optical(
     let mut decoded_parts = Vec::new();
     let mut backends = Vec::new();
     let mut png_paths = Vec::new();
+    let mut page_metrics = Vec::new();
+    let mut receipts = Vec::new();
+    let mut precision_sum = 0.0f64;
+    let mut nonce_verified = false;
+    let mut last_nonce: Option<String> = None;
     for page in &pages {
         png_paths.push(page.png_path.display().to_string());
-        let (text, backend, _receipt) =
+        let (text, backend, receipt) =
             crate::optical::ocr_decode_page(root, page, policy.prefer_gpu)?;
+        precision_sum += crate::optical::decode_precision(&page.text, &text);
+        if let Some(ref r) = receipt {
+            if let Some((_, n)) = r.split_once("nonce=") {
+                nonce_verified = true;
+                last_nonce = Some(n.trim().to_string());
+            }
+            receipts.push(r.clone());
+        } else {
+            last_nonce = Some(page.nonce.clone());
+        }
+        page_metrics.push(json!({
+            "png": page.png_path.display().to_string(),
+            "sidecar": page.sidecar_path.display().to_string(),
+            "mode": page.mode.as_str(),
+            "nonce": page.nonce,
+            "text_tokens": page.text_tokens,
+            "vision_tokens": page.vision_tokens,
+            "ratio": page.ratio,
+            "cols": page.cols,
+            "rows": page.rows,
+        }));
         backends.push(backend);
         decoded_parts.push(text);
     }
@@ -1185,6 +1211,18 @@ fn append_mas_optical(
         .first()
         .cloned()
         .unwrap_or_else(|| "glyph-ocr".into());
+    let avg_precision = if pages.is_empty() {
+        0.0
+    } else {
+        precision_sum / pages.len() as f64
+    };
+    let total_text_tok: u64 = pages.iter().map(|p| p.text_tokens).sum();
+    let total_vis_tok: u64 = pages.iter().map(|p| p.vision_tokens).sum();
+    let total_ratio = if total_vis_tok > 0 {
+        crate::optical::compression_ratio(total_text_tok, total_vis_tok)
+    } else {
+        0.0
+    };
 
     // Manifest — disposable derivative; session JSON + spill md remain immutable.
     let session_file = session_path(root, &s.session)?;
@@ -1220,6 +1258,10 @@ fn append_mas_optical(
         "entry_order": order,
         "spill_hashes": spill_hashes,
         "png_paths": png_paths,
+        "pages": page_metrics,
+        "receipts": receipts,
+        "precision": avg_precision,
+        "ratio": total_ratio,
         "backend": backend,
         "mode": mode.as_str(),
     });
@@ -1232,11 +1274,12 @@ fn append_mas_optical(
 
     out.push_str("\n---\n");
     out.push_str(&format!(
-        "mas_optical: backend={} pages={} clipped={} ratio≈{:.2}x\n",
+        "mas_optical: backend={} pages={} clipped={} ratio≈{:.2}x precision={:.3}\n",
         backend,
         pages.len(),
         clipped,
-        pages.first().map(|p| p.ratio).unwrap_or(0.0)
+        total_ratio,
+        avg_precision
     ));
     out.push_str(&format!("mas_manifest: {}\n", manifest_path.display()));
     for p in &png_paths {
@@ -1249,18 +1292,65 @@ fn append_mas_optical(
     }
     // Exact SoT reminder — never treat OCR as authoritative.
     out.push_str("mas_sot: session JSON + spill note_ref Markdown remain Source of Truth\n");
-    stats::record_optical_mas(
-        !clipped && backend == "deepseek-ocr",
-        pages.first().map(|p| p.ratio).unwrap_or(0.0),
-        1.0,
-    );
+    stats::record_optical_event(stats::OpticalTelemetry {
+        used_optical_path: !clipped && backend == "deepseek-ocr",
+        from_mas: true,
+        ratio: total_ratio,
+        precision: avg_precision,
+        pages: pages.len() as u64,
+        clipped,
+        nonce_verified,
+        nonce: last_nonce,
+    });
     Ok(())
+}
+
+/// Find the most recently updated MAS session slug in the workspace cache, if any.
+fn latest_workspace_session(root: &Path) -> Option<String> {
+    let dir = workspace::workspace_dir(root).join("mas");
+    let entries = std::fs::read_dir(&dir).ok()?;
+    let mut best: Option<(u64, String)> = None;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if validate_session_id(stem).is_err() {
+            continue;
+        }
+        let ts = workspace::read_json(&path)
+            .ok()
+            .flatten()
+            .and_then(|v| v.get("updated").and_then(Value::as_u64))
+            .or_else(|| {
+                std::fs::metadata(&path)
+                    .ok()
+                    .and_then(|m| m.modified().ok())
+                    .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs())
+            })
+            .unwrap_or(0);
+        match &best {
+            Some((best_ts, best_name))
+                if *best_ts > ts || (*best_ts == ts && best_name.as_str() >= stem) => {}
+            _ => best = Some((ts, stem.to_string())),
+        }
+    }
+    best.map(|(_, s)| s)
 }
 
 /// Build a paste-ready next-session prompt from MAS + defects + runs.
 /// Works for already-finalized sessions. May finalize + promote in one call.
+/// When `session` is omitted, uses the most recently updated workspace MAS session
+/// or synthesizes a workspace-level handoff from defects + recent runs.
 pub fn session_handoff(root: &Path, args: &Value) -> Result<String, String> {
-    let session = required_str(args, "session")?;
+    let explicit_session = optional_str(args, "session");
+    if let Some(ref s) = explicit_session {
+        validate_session_id(s)?;
+    }
     let finalize_now = args
         .get("finalize")
         .and_then(Value::as_bool)
@@ -1270,6 +1360,43 @@ pub fn session_handoff(root: &Path, args: &Value) -> Result<String, String> {
         .and_then(Value::as_bool)
         .unwrap_or_else(|| config::mas_auto_promote(root));
     let result = optional_str(args, "result");
+
+    let resolved_session = match explicit_session {
+        Some(s) => Some(s),
+        None => latest_workspace_session(root),
+    };
+
+    let Some(session) = resolved_session else {
+        // No MAS session exists in this workspace; produce a workspace-level handoff.
+        let _ = session_pressure::mark_handoff(root);
+        let mut body = compact_pressure_handoff(root, None);
+        body = body.replacen(
+            "# Next-session prime (Wordkeep autopilot draft)\n\n",
+            "# Next-session prime (Wordkeep workspace handoff)\n\n",
+            1,
+        );
+        body = body.replace(
+            "\nNOTE: draft only — call `session_handoff` to persist / reset pressure.\n\n",
+            "\n",
+        );
+        if let Some(ref res) = result {
+            body.push_str(&format!("\n## Session summary\n\n{res}\n"));
+        }
+        let status_label = if finalize_now { "final" } else { "workspace" };
+        let out = format!("session_handoff - session default status={status_label}\n\n{body}");
+        let defects_tokens = std::fs::metadata(root.join(".wordkeep/defects.json"))
+            .map(|m| m.len() / 4)
+            .unwrap_or(0);
+        let runs_tokens = std::fs::metadata(workspace::workspace_file(root, "runs.json"))
+            .map(|m| m.len() / 4)
+            .unwrap_or(0);
+        stats::record(
+            "session_handoff",
+            (defects_tokens + runs_tokens).max(64),
+            estimate_tokens(&out) as u64,
+        );
+        return Ok(out);
+    };
 
     if finalize_now {
         let result = result.clone().unwrap_or_else(|| "session handoff".into());
@@ -1553,6 +1680,37 @@ mod tests {
                     || s.entries[0].summary.contains("truncated")
                     || s.entries[0].summary.contains("spilled")
             );
+            let _ = std::fs::remove_dir_all(&root);
+        });
+    }
+
+    #[test]
+    fn session_handoff_defaults_when_session_omitted() {
+        with_cache(|| {
+            let root = std::env::temp_dir().join(format!("wk_mas_default_{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(root.join(".wordkeep")).unwrap();
+
+            // 1. No MAS sessions yet -> workspace-level handoff succeeds.
+            let ws_out = session_handoff(&root, &json!({"result": "checkpoint"})).unwrap();
+            assert!(ws_out.contains("session default"), "{ws_out}");
+            assert!(ws_out.contains("checkpoint"), "{ws_out}");
+
+            // 2. Once a MAS session exists -> omitted session picks the latest workspace session.
+            post(
+                &root,
+                &json!({
+                    "session": "auto-pick",
+                    "role": "planner",
+                    "summary": "picked automatically",
+                    "decisions": ["picked automatically"]
+                }),
+            )
+            .unwrap();
+            let picked = session_handoff(&root, &json!({})).unwrap();
+            assert!(picked.contains("session auto-pick"), "{picked}");
+            assert!(picked.contains("picked automatically"), "{picked}");
+
             let _ = std::fs::remove_dir_all(&root);
         });
     }

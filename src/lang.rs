@@ -77,6 +77,21 @@ impl Lang {
             .and_then(Lang::from_ext)
     }
 
+    /// Short stable lowercase label for persistence (e.g. SQLite `files.lang`).
+    pub fn label(self) -> &'static str {
+        match self {
+            Lang::Cpp => "cpp",
+            Lang::Rust => "rust",
+            Lang::Python => "python",
+            Lang::Daslang => "daslang",
+            Lang::Glsl => "glsl",
+            Lang::Ts => "ts",
+            Lang::Tsx => "tsx",
+            Lang::Svelte => "svelte",
+            Lang::CSharp => "csharp",
+        }
+    }
+
     /// The tree-sitter grammar for this language, or `None` when it is handled
     /// by the line scanner (Daslang, unless the `daslang` feature is enabled).
     /// TSX and Svelte both parse with the TypeScript grammar - TSX uses the JSX

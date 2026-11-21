@@ -234,9 +234,30 @@ struct OpticalAgg {
     /// Subset of `calls` from `session_handoff` / `mas_timeline` optical skim.
     mas_calls: u64,
     fallback_calls: u64,
+    /// Total rendered optical PNG pages across calls.
+    pages: u64,
+    /// Calls where rendered corpus clipped against `max_pages`.
+    clipped_calls: u64,
+    /// Calls where an OCR job receipt echoed a verified per-attempt nonce.
+    nonce_verified_calls: u64,
+    /// Most recent verified or rendered page nonce observed.
+    last_nonce: Option<String>,
     sum_ratio: f64,
     sum_precision: f64,
     precision_samples: u64,
+}
+
+/// Structured telemetry payload for one Optical Compression Tier invocation.
+#[derive(Debug, Clone, Default)]
+pub struct OpticalTelemetry {
+    pub used_optical_path: bool,
+    pub from_mas: bool,
+    pub ratio: f64,
+    pub precision: f64,
+    pub pages: u64,
+    pub clipped: bool,
+    pub nonce_verified: bool,
+    pub nonce: Option<String>,
 }
 
 impl OpticalAgg {
@@ -251,14 +272,21 @@ impl OpticalAgg {
         } else {
             self.sum_precision / self.precision_samples as f64
         };
-        json!({
+        let mut obj = json!({
             "calls": self.calls,
             "mas_calls": self.mas_calls,
             "fallback_calls": self.fallback_calls,
+            "pages": self.pages,
+            "clipped_calls": self.clipped_calls,
+            "nonce_verified_calls": self.nonce_verified_calls,
             "avg_ratio": avg_ratio,
             "avg_precision": avg_precision,
             "precision_samples": self.precision_samples,
-        })
+        });
+        if let Some(ref n) = self.last_nonce {
+            obj["last_nonce"] = json!(n);
+        }
+        obj
     }
 
     fn from_value(v: &Value) -> Self {
@@ -266,6 +294,14 @@ impl OpticalAgg {
             calls: field(v, "calls"),
             mas_calls: field(v, "mas_calls"),
             fallback_calls: field(v, "fallback_calls"),
+            pages: field(v, "pages"),
+            clipped_calls: field(v, "clipped_calls"),
+            nonce_verified_calls: field(v, "nonce_verified_calls"),
+            last_nonce: v
+                .get("last_nonce")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(String::from),
             sum_ratio: v
                 .get("avg_ratio")
                 .and_then(Value::as_f64)
@@ -529,40 +565,66 @@ impl Store {
 }
 
 /// Record one Optical Compression Tier call (ratio + precision; split from text tools).
+#[allow(dead_code)]
 pub fn record_optical(used_optical_path: bool, ratio: f64, precision: f64) {
-      record_optical_inner(used_optical_path, ratio, precision, false);
-  }
+    record_optical_event(OpticalTelemetry {
+        used_optical_path,
+        from_mas: false,
+        ratio,
+        precision,
+        pages: 0,
+        clipped: false,
+        nonce_verified: false,
+        nonce: None,
+    });
+}
 
-  /// Same as [`record_optical`] but marks a MAS timeline skim call.
-  pub fn record_optical_mas(used_optical_path: bool, ratio: f64, precision: f64) {
-      record_optical_inner(used_optical_path, ratio, precision, true);
-  }
+/// Same as [`record_optical`] but marks a MAS timeline skim call.
+#[allow(dead_code)]
+pub fn record_optical_mas(used_optical_path: bool, ratio: f64, precision: f64) {
+    record_optical_event(OpticalTelemetry {
+        used_optical_path,
+        from_mas: true,
+        ratio,
+        precision,
+        pages: 0,
+        clipped: false,
+        nonce_verified: false,
+        nonce: None,
+    });
+}
 
-  fn record_optical_inner(
-      used_optical_path: bool,
-      ratio: f64,
-      precision: f64,
-      from_mas: bool,
-  ) {
-      if let Ok(mut s) = cell().lock() {
-          s.optical.calls += 1;
-          if from_mas {
-              s.optical.mas_calls += 1;
-          }
-          if !used_optical_path {
-              s.optical.fallback_calls += 1;
-          }
-          s.optical.sum_ratio += ratio;
-          if precision.is_finite() {
-              s.optical.sum_precision += precision;
-              s.optical.precision_samples += 1;
-          }
-          s.pending_flush += 1;
-          if s.needs_flush() {
-              s.flush_aggregates();
-          }
-      }
-  }
+/// Record full Optical Compression Tier telemetry including rendered page count and nonce verification.
+pub fn record_optical_event(ev: OpticalTelemetry) {
+    if let Ok(mut s) = cell().lock() {
+        s.optical.calls += 1;
+        if ev.from_mas {
+            s.optical.mas_calls += 1;
+        }
+        if !ev.used_optical_path {
+            s.optical.fallback_calls += 1;
+        }
+        s.optical.pages += ev.pages;
+        if ev.clipped {
+            s.optical.clipped_calls += 1;
+        }
+        if ev.nonce_verified {
+            s.optical.nonce_verified_calls += 1;
+        }
+        if let Some(n) = ev.nonce.filter(|n| !n.is_empty()) {
+            s.optical.last_nonce = Some(n);
+        }
+        s.optical.sum_ratio += ev.ratio;
+        if ev.precision.is_finite() {
+            s.optical.sum_precision += ev.precision;
+            s.optical.precision_samples += 1;
+        }
+        s.pending_flush += 1;
+        if s.needs_flush() {
+            s.flush_aggregates();
+        }
+    }
+}
 
 /// Snapshot optical aggregates for wiki / `stats` JSON.
 pub fn optical_json() -> Value {
@@ -782,12 +844,39 @@ pub fn classify_outcome(result: &Result<String, String>, returned_tokens: u64) -
     Outcome::Ok
 }
 
+/// Compact write confirmations intentionally emit one-line receipts (<=25 tok)
+/// and must not be penalized as `low_yield`.
+pub fn is_compact_mutation(tool: &str) -> bool {
+    matches!(tool, "run_record" | "defect_upsert" | "izakaya_check_out")
+}
+
+/// Tool-aware outcome classifier: exempts compact mutations from false `low_yield`.
+pub fn classify_outcome_for(
+    tool: &str,
+    result: &Result<String, String>,
+    returned_tokens: u64,
+) -> Outcome {
+    let raw = classify_outcome(result, returned_tokens);
+    if raw == Outcome::LowYield && is_compact_mutation(tool) {
+        Outcome::Ok
+    } else {
+        raw
+    }
+}
+
 /// Finalize telemetry for one instrumented tool call.
 ///
 /// `elapsed_us` is wall time in **microseconds** (see `main::instrument`).
 pub fn finish(tool: &str, elapsed_us: u64, result: &Result<String, String>) {
     let mut meta = PENDING.with(|p| p.borrow_mut().take()).unwrap_or_default();
-    let outcome = classify_outcome(result, meta.returned);
+    if meta.returned == 0 {
+        if let Ok(text) = result {
+            if !text.is_empty() {
+                meta.returned = (text.len() as u64).div_ceil(4).max(1);
+            }
+        }
+    }
+    let outcome = classify_outcome_for(tool, result, meta.returned);
     if meta.reason.is_none() {
         meta.reason = outcome_reason(result, outcome);
     }
@@ -876,8 +965,15 @@ fn outcome_from_str(s: &str) -> Outcome {
 /// Fold per-call events into tool totals. Used for the default 30-day window.
 fn aggregate_events(events: &[Event]) -> BTreeMap<String, Tool> {
     let mut tools: BTreeMap<String, Tool> = BTreeMap::new();
-    let meta = RecordMeta::default();
     for event in events {
+        let meta = RecordMeta {
+            baseline: event.baseline,
+            returned: event.returned,
+            bytes_read: event.bytes_read,
+            cache_hits: event.cache_hits,
+            cache_misses: event.cache_misses,
+            reason: event.reason.clone(),
+        };
         tools.entry(event.tool.clone()).or_default().observe(
             event.baseline,
             event.returned,
@@ -925,6 +1021,11 @@ pub fn report(args: &Value) -> Result<String, String> {
         s.pending_flush = 0;
         s.save();
         s.last_flush = Instant::now();
+        crate::mcp::set_structured_content(json!({
+            "version": 5,
+            "reset": true,
+            "since": s.since,
+        }));
         return Ok("wordkeep estimated context avoided - counters reset.".to_string());
     }
     // Ensure a fresh read of aggregates for long-lived servers.
@@ -971,16 +1072,19 @@ pub fn report(args: &Value) -> Result<String, String> {
         }
     };
 
+    let structured = render_json_value(
+        lifetime_since,
+        now,
+        &tools,
+        &events,
+        workspace_filter.as_deref(),
+        window_days,
+        &window_label,
+    );
+    crate::mcp::set_structured_content(structured.clone());
+
     let out = if format == "json" {
-        render_json(
-            lifetime_since,
-            now,
-            &tools,
-            &events,
-            workspace_filter.as_deref(),
-            window_days,
-            &window_label,
-        )
+        serde_json::to_string_pretty(&structured).unwrap_or_else(|_| "{}".into())
     } else {
         let mut text = render(&window_label, &tools);
         text.push_str(&format!(
@@ -1247,7 +1351,7 @@ fn percentile_us(samples: &mut [u64], p: f64) -> Option<u64> {
     Some(samples[idx.min(samples.len() - 1)])
 }
 
-fn render_json(
+fn render_json_value(
     since: u64,
     now: u64,
     tools: &BTreeMap<String, Tool>,
@@ -1255,7 +1359,7 @@ fn render_json(
     workspace_filter: Option<&str>,
     window_days: u64,
     window_label: &str,
-) -> String {
+) -> Value {
     let tools_json: serde_json::Map<String, Value> = tools
         .iter()
         .map(|(k, t)| (k.clone(), t.to_json()))
@@ -1284,7 +1388,7 @@ fn render_json(
         let rb = tools[*b].returned_tokens;
         rb.cmp(&ra).then_with(|| a.cmp(b))
     });
-    let doc = json!({
+    json!({
         "version": 5,
         "label": "returned tokens",
         "baseline_label": "scanned_counterfactual",
@@ -1307,7 +1411,29 @@ fn render_json(
                 "p99": p99,
             }
         },
-    });
+    })
+}
+
+#[cfg(test)]
+#[allow(dead_code)]
+fn render_json(
+    since: u64,
+    now: u64,
+    tools: &BTreeMap<String, Tool>,
+    events: &VecDeque<Event>,
+    workspace_filter: Option<&str>,
+    window_days: u64,
+    window_label: &str,
+) -> String {
+    let doc = render_json_value(
+        since,
+        now,
+        tools,
+        events,
+        workspace_filter,
+        window_days,
+        window_label,
+    );
     serde_json::to_string_pretty(&doc).unwrap_or_else(|_| "{}".into())
 }
 
@@ -2036,5 +2162,40 @@ mod tests {
         assert!(!is_net_negative(100, 400));
         assert!(is_net_negative(500, 500));
         assert!(is_net_negative(1_000, 2_000));
+    }
+
+    #[test]
+    fn compact_mutations_exempt_from_low_yield_and_events_keep_cache_stats() {
+        for tool in ["run_record", "defect_upsert", "izakaya_check_out"] {
+            assert_eq!(
+                classify_outcome_for(tool, &Ok(format!("{tool} - ok")), 8),
+                Outcome::Ok,
+                "{tool} must not be marked low_yield"
+            );
+        }
+        assert_eq!(
+            classify_outcome_for("repo_map", &Ok("tiny".into()), 8),
+            Outcome::LowYield
+        );
+
+        let ev = Event {
+            ts: 100,
+            tool: "repo_map".into(),
+            baseline: 1000,
+            returned: 120,
+            elapsed_us: 2500,
+            outcome: "ok".into(),
+            reason: None,
+            workspace_id: "ws1".into(),
+            bytes_read: 4096,
+            cache_hits: 7,
+            cache_misses: 2,
+            wordkeep_version: "0.5.0".into(),
+        };
+        let agg = aggregate_events(&[ev]);
+        let rm = &agg["repo_map"];
+        assert_eq!(rm.bytes_read, 4096);
+        assert_eq!(rm.cache_hits, 7);
+        assert_eq!(rm.cache_misses, 2);
     }
 }

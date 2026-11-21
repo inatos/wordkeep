@@ -160,6 +160,7 @@ mod tests {
 
     #[test]
     fn empty_write_status_keeps_load_extras() {
+        let _guard = crate::cache::test_env_lock();
         let cache = std::env::temp_dir().join(format!(
             "wk_semif_status_{}_{}",
             std::process::id(),

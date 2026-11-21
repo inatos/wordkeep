@@ -25,6 +25,7 @@ mod digest;
 pub mod diff_map;
 mod doc_comment;
 mod effect_journal;
+pub mod embed;
 mod include_graph;
 mod incremental;
 mod index_stale;
@@ -42,6 +43,7 @@ mod progress;
 pub mod repo_map;
 mod runs;
 mod runtime;
+pub mod scip;
 mod semif;
 mod semif_cascade;
 mod semif_debias;
@@ -51,7 +53,8 @@ mod semif_telemetry;
 mod semif_visual;
 mod session_pressure;
 mod shrift;
-mod stats;
+pub mod stats;
+pub mod store;
 mod tacet;
 mod task_lan;
 
@@ -64,15 +67,15 @@ pub fn task_lan_submit_for_test(
     let args = serde_json::json!({ "job": job, "wait": wait });
     task_lan::submit(root, &args)
 }
-mod symbol_context;
+pub mod symbol_context;
 mod symbol_def;
 mod symbol_diff;
 mod symbol_refs;
-mod symbol_resolve;
+pub mod symbol_resolve;
 mod test_map;
 mod trace;
 mod trace_profile;
-mod triage;
+pub mod triage;
 mod type_layout;
 mod undocumented;
 mod usage_examples;

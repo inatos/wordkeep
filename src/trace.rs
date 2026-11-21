@@ -8,9 +8,10 @@
 //! surfacing per-zone regressions.
 //!
 //! Either input may be a raw `.tracy` capture rather than a pre-exported CSV; in
-//! that case we shell out to Tracy's own `tracy-csvexport` (override the binary
-//! via `WORDKEEP_TRACY_CSVEXPORT`) and parse its stdout, so the native
-//! format never has to be re-decoded here.
+//! that case we shell out to Tracy's own `tracy-csvexport` and parse its stdout,
+//! so the native format never has to be re-decoded here. `WORDKEEP_TRACY_CSVEXPORT`
+//! wins when set; otherwise `build-tracy/bin/tracy-csvexport` (vendored v0.13.1)
+//! is preferred over whatever `tracy-csvexport` is on `PATH`.
 
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
@@ -49,7 +50,7 @@ pub fn summary(root: &Path, args: &Value) -> Result<String, String> {
         return diff(root, &file, &base, top, budget);
     }
 
-    let text = read_trace(&file)?;
+    let text = read_trace(root, &file)?;
     let mut rows = parse(&text)?;
     if rows.is_empty() {
         return Ok(format!("trace_summary: no zones in {}", file.display()));
@@ -125,8 +126,8 @@ fn diff(
     top: usize,
     budget: usize,
 ) -> Result<String, String> {
-    let new_text = read_trace(new_file)?;
-    let base_text = read_trace(base_file)?;
+    let new_text = read_trace(root, new_file)?;
+    let base_text = read_trace(root, base_file)?;
     let new_rows = parse(&new_text)?;
     let base_rows = parse(&base_text)?;
     let a_new = aggregate(&new_rows);
@@ -253,12 +254,26 @@ fn aggregate(rows: &[Row]) -> HashMap<String, Agg> {
     m
 }
 
+/// Vendored csvexport matches cmake's Tracy pin. The system binary often
+/// rejects v0.13.1 captures with an empty stderr.
+fn tracy_csvexport(root: &Path) -> String {
+    if let Ok(explicit) = std::env::var("WORDKEEP_TRACY_CSVEXPORT") {
+        if !explicit.is_empty() {
+            return explicit;
+        }
+    }
+    let vendored = root.join("build-tracy/bin/tracy-csvexport");
+    if vendored.is_file() {
+        return vendored.to_string_lossy().into_owned();
+    }
+    "tracy-csvexport".to_string()
+}
+
 /// Read a capture as CSV text. A `.tracy` file is exported on the fly via
 /// `tracy-csvexport`; anything else is read straight from disk.
-fn read_trace(p: &Path) -> Result<String, String> {
+fn read_trace(root: &Path, p: &Path) -> Result<String, String> {
     if p.extension().and_then(|e| e.to_str()) == Some("tracy") {
-        let exporter = std::env::var("WORDKEEP_TRACY_CSVEXPORT")
-            .unwrap_or_else(|_| "tracy-csvexport".to_string());
+        let exporter = tracy_csvexport(root);
         let out = std::process::Command::new(&exporter)
             .arg(p)
             .output()
@@ -268,13 +283,22 @@ fn read_trace(p: &Path) -> Result<String, String> {
                     p.display()
                 )
             })?;
-        if !out.status.success() {
-            return Err(format!(
-                "{exporter} failed on {}: {}",
-                p.display(),
-                String::from_utf8_lossy(&out.stderr).trim()
-            ));
-        }
+          if !out.status.success() {
+              let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+              let stdout_hint = String::from_utf8_lossy(&out.stdout);
+              let stdout_trim = stdout_hint.trim();
+              let detail = if !stderr.is_empty() {
+                  stderr
+              } else if !stdout_trim.is_empty() {
+                  format!("(empty stderr; stdout: {})", truncate(stdout_trim, 200))
+              } else {
+                  format!(
+                      "(empty stderr/stdout; exit {:?}). System tracy-csvexport often rejects Tracy v0.13 captures — set WORDKEEP_TRACY_CSVEXPORT or build vendored build-tracy/bin/tracy-csvexport",
+                      out.status.code()
+                  )
+              };
+              return Err(format!("{exporter} failed on {}: {detail}", p.display()));
+          }
         return String::from_utf8(out.stdout)
             .map_err(|e| format!("{exporter} produced non-UTF-8 output: {e}"));
     }

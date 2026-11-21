@@ -3,7 +3,7 @@
 //! Coeffect names come from `resources/capabilities.json`. When a tool with declared
 //! coeffects mutates durable state, dependent caches are notified here.
 
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::path::Path;
 use std::sync::OnceLock;
 
@@ -41,6 +41,71 @@ pub fn tool_has_effects(tool: &str) -> bool {
         .is_some_and(|a| !a.is_empty())
 }
 
+/// MCP 2025-11 tool annotations derived from `resources/capabilities.json` effects & hints.
+pub fn tool_annotations(tool: &str) -> Value {
+    let cap = capabilities();
+    let entry = cap.get("tools").and_then(|tools| tools.get(tool));
+    let effects = entry
+        .and_then(|t| t.get("effects"))
+        .and_then(Value::as_array);
+    let has_effects = effects.is_some_and(|a| !a.is_empty());
+    let ann = entry.and_then(|t| t.get("annotations"));
+
+    let read_only = ann
+        .and_then(|a| a.get("readOnlyHint"))
+        .and_then(Value::as_bool)
+        .unwrap_or(!has_effects);
+
+    let default_destructive = !read_only
+        && effects.is_some_and(|arr| {
+            arr.iter().filter_map(Value::as_str).any(|e| {
+                e.starts_with("kill-") || e.starts_with("reset-") || e.starts_with("delete-")
+            })
+        });
+    let destructive = if read_only {
+        false
+    } else {
+        ann.and_then(|a| a.get("destructiveHint"))
+            .and_then(Value::as_bool)
+            .unwrap_or(default_destructive)
+    };
+
+    let default_idempotent = if read_only {
+        true
+    } else {
+        !effects.is_some_and(|arr| {
+            arr.iter()
+                .filter_map(Value::as_str)
+                .any(|e| e.starts_with("spawn-"))
+        })
+    };
+    let idempotent = ann
+        .and_then(|a| a.get("idempotentHint"))
+        .and_then(Value::as_bool)
+        .unwrap_or(default_idempotent);
+
+    let listed_open_world = cap
+        .get("open_world_tools")
+        .and_then(Value::as_array)
+        .is_some_and(|arr| arr.iter().any(|v| v.as_str() == Some(tool)));
+    let effect_open_world = effects.is_some_and(|arr| {
+        arr.iter()
+            .filter_map(Value::as_str)
+            .any(|e| e.contains("remote"))
+    });
+    let open_world = ann
+        .and_then(|a| a.get("openWorldHint"))
+        .and_then(Value::as_bool)
+        .unwrap_or(listed_open_world || effect_open_world);
+
+    json!({
+        "readOnlyHint": read_only,
+        "destructiveHint": destructive,
+        "idempotentHint": idempotent,
+        "openWorldHint": open_world,
+    })
+}
+
 /// Invalidate caches declared as coeffects for `tool` after a write.
 pub fn notify(root: &Path, tool: &str, ctx: NotifyCtx<'_>) {
     let Some(coeffects) = capabilities()
@@ -58,7 +123,7 @@ pub fn notify(root: &Path, tool: &str, ctx: NotifyCtx<'_>) {
         match name {
             "knowledge-chunks-cache" => {
                 for rel in ctx.rel_paths {
-                    knowledge::invalidate_markdown_chunks(&root.join(rel));
+                    knowledge::invalidate_markdown_chunks_in(root, rel);
                 }
             }
             "mas-session" => {
@@ -97,6 +162,26 @@ mod tests {
         assert!(tool_has_effects("run_record"));
         assert!(tool_has_effects("tacet"));
         assert!(!tool_has_effects("repo_map"));
+
+        let ro = tool_annotations("repo_map");
+        assert_eq!(ro["readOnlyHint"], true);
+        assert_eq!(ro["destructiveHint"], false);
+        assert_eq!(ro["idempotentHint"], true);
+        assert_eq!(ro["openWorldHint"], false);
+
+        let copper = tool_annotations("copper_status");
+        assert_eq!(copper["readOnlyHint"], true);
+        assert_eq!(copper["openWorldHint"], true);
+
+        let rr = tool_annotations("run_record");
+        assert_eq!(rr["readOnlyHint"], false);
+        assert_eq!(rr["destructiveHint"], false);
+        assert_eq!(rr["idempotentHint"], true);
+
+        let cancel = tool_annotations("task_cancel");
+        assert_eq!(cancel["readOnlyHint"], false);
+        assert_eq!(cancel["destructiveHint"], true);
+        assert_eq!(cancel["openWorldHint"], true);
     }
 
     #[test]

@@ -224,10 +224,90 @@ pub fn upsert(root: &Path, args: &Value) -> Result<String, String> {
         "created"
     };
     save_all(root, &defects)?;
+    if let (Ok(st), Some(saved)) = (crate::store::Store::open(root), defects.iter().find(|d| d.id == id)) {
+        sync_one_defect_links(root, &st, saved);
+    }
     coeffects::notify(root, "defect_upsert", coeffects::NotifyCtx::EMPTY);
     let out = format!("defect_upsert - {action} {id} status={status} {summary}");
     stats::record("defect_upsert", 64, (out.len() / 4) as u64);
     Ok(out)
+}
+
+fn combined_defect_text(d: &Defect) -> String {
+    let mut s = d.summary.clone();
+    for a in &d.acceptance {
+        s.push('\n');
+        s.push_str(a);
+    }
+    for e in &d.evidence {
+        s.push('\n');
+        s.push_str(e);
+    }
+    s
+}
+
+fn sync_one_defect_links(root: &Path, store: &crate::store::Store, d: &Defect) {
+    let text = combined_defect_text(d);
+    if store
+        .sync_observation_links(root, "defect", &d.id, None, &text, &d.anchors)
+        .is_ok()
+    {
+        let _ = store.set_meta(&format!("obs_defect_ts:{}", d.id), &d.updated.to_string());
+    }
+}
+
+const META_DEFECTS_FILE_MTIME: &str = "obs_defects_file_mtime_ns";
+
+/// Ensure all supplied defects have their `observation_links` indexed at their
+/// recorded `updated` timestamp without overwriting `anchor_hash` on later code edits.
+pub fn ensure_defect_links_indexed(root: &Path, store: &crate::store::Store) {
+    let path = root.join(REL);
+    let file_mt = std::fs::metadata(&path)
+        .ok()
+        .map(|m| crate::cache::mtime_ns(&m))
+        .unwrap_or(0);
+    if file_mt > 0 {
+        let want = file_mt.to_string();
+        if store
+            .get_meta(META_DEFECTS_FILE_MTIME)
+            .ok()
+            .flatten()
+            .as_deref()
+            == Some(want.as_str())
+        {
+            return;
+        }
+    }
+    let Ok(all) = load_all(root) else {
+        return;
+    };
+    let mut unsynced: Vec<&Defect> = Vec::new();
+    for d in &all {
+        if d.status == "done" {
+            continue;
+        }
+        let meta_key = format!("obs_defect_ts:{}", d.id);
+        let up_s = d.updated.to_string();
+        if store.get_meta(&meta_key).ok().flatten().as_deref() != Some(up_s.as_str()) {
+            unsynced.push(d);
+        }
+    }
+    if unsynced.is_empty() {
+        if file_mt > 0 {
+            let _ = store.set_meta(META_DEFECTS_FILE_MTIME, &file_mt.to_string());
+        }
+        return;
+    }
+    crate::symbol_resolve::ensure_symbols_warm(root, store);
+    let _ = store.with_immediate_tx(|s| {
+        for d in unsynced {
+            sync_one_defect_links(root, s, d);
+        }
+        if file_mt > 0 {
+            let _ = s.set_meta(META_DEFECTS_FILE_MTIME, &file_mt.to_string());
+        }
+        Ok(())
+    });
 }
 
 /// List defects (default: unresolved), ordered eyeball_fail → open → gated → done.
@@ -288,10 +368,25 @@ pub fn list(root: &Path, args: &Value) -> Result<String, String> {
             .then_with(|| a.id.cmp(&b.id))
     });
 
+    let mut stale_by_id: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
+    if let Ok(st) = crate::store::Store::open(root) {
+        ensure_defect_links_indexed(root, &st);
+        if let Ok(stale) = st.stale_anchors(root, Some("defect")) {
+            for s in stale {
+                let entry = stale_by_id.entry(s.obs_id.clone()).or_default();
+                let lbl = s.label();
+                if !entry.contains(&lbl) {
+                    entry.push(lbl);
+                }
+            }
+        }
+    }
+
     let mut out = if digest {
-        format_digest(&defects, max)
+        format_digest(&defects, max, &stale_by_id)
     } else {
-        format_full(&defects)
+        format_full(&defects, &stale_by_id)
     };
 
     if let Some(budget) = budget {
@@ -322,7 +417,11 @@ fn resolve_digest_mode(args: &Value) -> bool {
     args.get("digest").and_then(Value::as_bool).unwrap_or(true)
 }
 
-fn format_digest(defects: &[Defect], max: usize) -> String {
+fn format_digest(
+    defects: &[Defect],
+    max: usize,
+    stale_by_id: &std::collections::BTreeMap<String, Vec<String>>,
+) -> String {
     let mut open = 0usize;
     let mut eyeball_fail = 0usize;
     let mut gated = 0usize;
@@ -363,7 +462,15 @@ fn format_digest(defects: &[Defect], max: usize) -> String {
         out.push_str("  (no matching defects)\n");
     } else {
         for d in defects.iter().take(max) {
-            out.push_str(&format!("  [{}] {} — {}\n", d.status, d.id, d.summary));
+            let stale_tag = stale_by_id
+                .get(&d.id)
+                .filter(|v| !v.is_empty())
+                .map(|v| format!(" [stale-anchor: {}]", v.join(", ")))
+                .unwrap_or_default();
+            out.push_str(&format!(
+                "  [{}] {}{} — {}\n",
+                d.status, d.id, stale_tag, d.summary
+            ));
         }
         if defects.len() > max {
             out.push_str(&format!("  … ({} more)\n", defects.len() - max));
@@ -375,12 +482,20 @@ fn format_digest(defects: &[Defect], max: usize) -> String {
     out
 }
 
-fn format_full(defects: &[Defect]) -> String {
+fn format_full(
+    defects: &[Defect],
+    stale_by_id: &std::collections::BTreeMap<String, Vec<String>>,
+) -> String {
     let mut out = format!("defect_list - {} defect(s)\n", defects.len());
     for d in defects {
+        let stale_tag = stale_by_id
+            .get(&d.id)
+            .filter(|v| !v.is_empty())
+            .map(|v| format!(" [stale-anchor: {}]", v.join(", ")))
+            .unwrap_or_default();
         out.push_str(&format!(
-            "\n[{}] {} — {}\n  subsystem: {}\n  summary: {}\n",
-            d.status, d.id, d.updated, d.subsystem, d.summary
+            "\n[{}] {}{} — {}\n  subsystem: {}\n  summary: {}\n",
+            d.status, d.id, stale_tag, d.updated, d.subsystem, d.summary
         ));
         if !d.acceptance.is_empty() {
             out.push_str("  acceptance:\n");
@@ -393,6 +508,9 @@ fn format_full(defects: &[Defect]) -> String {
         }
         if !d.anchors.is_empty() {
             out.push_str(&format!("  anchors: {}\n", d.anchors.join(", ")));
+        }
+        if let Some(stale) = stale_by_id.get(&d.id).filter(|v| !v.is_empty()) {
+            out.push_str(&format!("  stale_anchors: [stale-anchor] {}\n", stale.join(", ")));
         }
         if !d.tags.is_empty() {
             out.push_str(&format!("  tags: {}\n", d.tags.join(", ")));
@@ -457,6 +575,15 @@ pub fn defect_chunk_text(d: &Defect) -> (String, String, String) {
 #[allow(dead_code)]
 pub fn store_rel() -> &'static str {
     REL
+}
+
+/// Look up a single defect record as JSON by id (for `wordkeep://defect/{id}`).
+pub fn get_json(root: &Path, id: &str) -> Option<Value> {
+    load_all(root)
+        .ok()?
+        .into_iter()
+        .find(|d| d.id == id)
+        .map(|d| defect_to_value(&d))
 }
 
 #[cfg(test)]

@@ -4,7 +4,7 @@ resolver = "2"
 
 [package]
 name = "wordkeep"
-version = "0.4.3"
+version = "0.5.0"
 edition = "2021"
 rust-version = "1.74"
 description = "Token-budgeted MCP server for coding agents: tree-sitter maps, call graphs, and project docs over stdio."
@@ -21,10 +21,15 @@ path = "src/main.rs"
 
 [features]
 default = []
-# Opt-in semantic reranking for knowledge_search. Pulls fastembed (ONNX Runtime +
-# tokenizers) and downloads a small embedding model on first use, so it is NOT in
-# the default build - BM25 stays the lean, deterministic, offline baseline.
-embeddings = ["dep:fastembed"]
+# Pure-Rust Model2Vec static embeddings (no ONNX). Uses potion-retrieval-32M for
+# markdown docs/rules/notes and potion-code-16M-v2 for code symbols.
+semantic-m2v = ["dep:model2vec-rs"]
+# Legacy fastembed (ONNX Runtime + tokenizers) compatibility backend; kept until
+# evals verify semantic-m2v parity. Prefer `semantic-m2v` for new builds.
+embeddings-fastembed = ["dep:fastembed"]
+# Compatibility alias for legacy fastembed so existing scripts/launchers keep
+# building until evals flip defaults to `semantic-m2v`.
+embeddings = ["embeddings-fastembed"]
 # Opt-in exact Daslang (.das) support. Compiles the vendored tree-sitter grammar
 # (vendor/tree-sitter-daslang/, ~12 MB of generated C) via build.rs + cc, so it
 # is NOT in the default build - without it Daslang uses the line scanner in
@@ -45,13 +50,21 @@ visual_logits = ["ereshkigal", "ereshkigal-core/vision"]
 serde_json = "1"
 sha2 = "0.10"
 walkdir = "2"
+ignore = "0.4"
 fs2 = "0.4"
+rusqlite = { version = "0.32", features = ["bundled"] }
+notify = "6"
+notify-debouncer-mini = "0.4"
 image = "0.25"
 wordkeep-knowledge = { path = "crates/wordkeep-knowledge" }
 ereshkigal-lang = { path = "../ereshkigal/ereshkigal-lang" }
 ereshkigal-core = { path = "../ereshkigal/ereshkigal-core", optional = true }
 tree-sitter = "0.25"
 tree-sitter-cpp = "0.23"
+# Pure-Rust Model2Vec static embeddings (feature = "semantic-m2v"); fancy-regex
+# avoids C onig_sys and pulls zero ONNX Runtime.
+model2vec-rs = { version = "0.5", default-features = false, features = ["fancy-regex", "hf-hub"], optional = true }
+# Legacy ONNX embedding backend (feature = "embeddings-fastembed" / "embeddings").
 fastembed = { version = "4", optional = true }
 tree-sitter-rust = "0.24.2"
 tree-sitter-python = "0.25.0"

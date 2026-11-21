@@ -3,11 +3,11 @@ use crate::garden::{self, html_anchor_id};
 use crate::indexer::{
     collect_docs, global_cache_dir, is_markdown_path, kind_for_path, load_manifest, watch_workspace,
 };
-use crate::meili::MeiliClient;
 use crate::runtime::ecs_layout;
 use crate::runtime::maps;
 use crate::runtime::peek::{self, MAX_PEEK};
 use crate::runtime::RuntimeHub;
+use crate::search_backend::{SearchBackend, SearchParams};
 use crate::telemetry;
 use axum::extract::{Path as RoutePath, Query, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -31,7 +31,7 @@ use wordkeep_knowledge::parse_markdown;
 struct AppState {
     root: PathBuf,
     config: WikiConfig,
-    meili: MeiliClient,
+    search: SearchBackend,
     runtime: RuntimeHub,
 }
 
@@ -41,23 +41,26 @@ type ApiResult = Result<Json<Value>, ApiError>;
 pub(crate) async fn serve(
     root: PathBuf,
     config: WikiConfig,
-    meili: MeiliClient,
+    search_backend: SearchBackend,
     bind: &str,
     allow_non_loopback: bool,
     watch: bool,
     runtime_attach: bool,
 ) -> Result<(), String> {
     let address = parse_bind(bind, allow_non_loopback)?;
-    if let Err(error) = meili.ensure_index().await {
-        eprintln!("wordkeep-wiki: Meilisearch unavailable at startup: {error}");
+    if let Err(error) = search_backend.ensure_index(&root, &config).await {
+        eprintln!(
+            "wordkeep-wiki: search backend ({}) unavailable at startup: {error}",
+            search_backend.backend_name()
+        );
     }
 
     if watch {
         let watch_root = root.clone();
         let watch_config = config.clone();
-        let watch_meili = meili.clone();
+        let watch_search = search_backend.clone();
         tokio::spawn(async move {
-            if let Err(error) = watch_workspace(watch_root, watch_config, watch_meili).await {
+            if let Err(error) = watch_workspace(watch_root, watch_config, watch_search).await {
                 eprintln!("wordkeep-wiki: watcher stopped: {error}");
             }
         });
@@ -81,7 +84,7 @@ pub(crate) async fn serve(
     let state = AppState {
         root,
         config,
-        meili,
+        search: search_backend,
         runtime,
     };
     let app = Router::new()
@@ -198,20 +201,30 @@ pub fn parse_bind(bind: &str, allow_non_loopback: bool) -> Result<SocketAddr, St
 }
 
 async fn health(State(state): State<AppState>) -> (StatusCode, Json<Value>) {
-    let meili = state.meili.health().await;
-    let index = state.meili.index_stats().await;
+    let backend_health = state.search.health().await;
+    let index = state.search.index_stats().await;
     let manifest = load_manifest(&state.root).unwrap_or_default();
-    let manifest_files = manifest.len();
-    let manifest_chunks: usize = manifest.values().map(|entry| entry.chunk_ids.len()).sum();
+    let mut manifest_files = manifest.len();
+    let mut manifest_chunks: usize = manifest.values().map(|entry| entry.chunk_ids.len()).sum();
+    if let Ok(ref stats) = index {
+        if let Some(n) = stats.get("files").and_then(Value::as_u64) {
+            manifest_files = manifest_files.max(n as usize);
+        }
+        if let Some(n) = stats.get("numberOfDocuments").and_then(Value::as_u64) {
+            manifest_chunks = manifest_chunks.max(n as usize);
+        }
+    }
     let search_telemetry = telemetry::summary(&state.root);
+    let backend_name = state.search.backend_name();
 
-    match meili {
-        Ok(meili) => (
+    match backend_health {
+        Ok(bh) => (
             StatusCode::OK,
             Json(json!({
                 "status": "ok",
+                "search_backend": backend_name,
                 "project_name": state.config.project_name,
-                "meilisearch": meili,
+                "meilisearch": bh,
                 "index": result_or_error(index),
                 "manifest": {
                     "files": manifest_files,
@@ -226,6 +239,7 @@ async fn health(State(state): State<AppState>) -> (StatusCode, Json<Value>) {
             StatusCode::SERVICE_UNAVAILABLE,
             Json(json!({
                 "status": "degraded",
+                "search_backend": backend_name,
                 "project_name": state.config.project_name,
                 "error": error,
                 "index": result_or_error(index),
@@ -258,35 +272,19 @@ struct SearchQuery {
 }
 
 async fn search(State(state): State<AppState>, Query(query): Query<SearchQuery>) -> ApiResult {
-    let mut filters = Vec::new();
-    if let Some(kind) = nonempty(query.kind) {
-        filters.push(format!("kind = \"{}\"", filter_value(&kind)));
-    }
-    if let Some(root) = nonempty(query.root) {
-        filters.push(format!("root = \"{}\"", filter_value(&root)));
-    }
-    if let Some(tag) = nonempty(query.tag) {
-        filters.push(format!("tags = \"{}\"", filter_value(&tag)));
-    }
-
     let q = query.q.unwrap_or_default();
-    let mut request = json!({
-        "q": q,
-        "limit": query.limit.unwrap_or(20).clamp(1, 100),
-        "attributesToHighlight": ["content", "heading", "body"],
-        "highlightPreTag": "<em>",
-        "highlightPostTag": "</em>",
-        "attributesToCrop": ["content", "body"],
-        "cropLength": 40
-    });
-    if !filters.is_empty() {
-        request["filter"] = Value::String(filters.join(" AND "));
-    }
+    let params = SearchParams {
+        q: q.clone(),
+        kind: nonempty(query.kind),
+        root: nonempty(query.root),
+        tag: nonempty(query.tag),
+        limit: query.limit.unwrap_or(20).clamp(1, 100),
+    };
 
     let started = Instant::now();
     let mut response = state
-        .meili
-        .search(request)
+        .search
+        .search(&state.root, &state.config, &params)
         .await
         .map_err(|error| api_error(StatusCode::BAD_GATEWAY, error))?;
     let latency_ms = started.elapsed().as_millis() as u64;
@@ -1517,10 +1515,6 @@ fn nonempty(value: Option<String>) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-fn filter_value(value: &str) -> String {
-    value.replace('\\', "\\\\").replace('"', "\\\"")
-}
-
 fn api_error(status: StatusCode, error: impl Into<String>) -> ApiError {
     (status, Json(json!({"error": error.into()})))
 }
@@ -1558,6 +1552,8 @@ mod tests {
 
         let config = WikiConfig {
             doc_roots: vec!["docs".to_string()],
+            search_backend: crate::config::SearchBackendMode::Sqlite,
+            meili_configured: false,
             meili_url: "http://127.0.0.1:7700".to_string(),
             meili_key: None,
             index_uid: "wiki_chunks".to_string(),
@@ -1566,19 +1562,72 @@ mod tests {
             project_name: "Demo".to_string(),
             read_only: false,
         };
+        let search = SearchBackend::from_config(&root, &config).unwrap();
         let state = AppState {
             root,
             config,
-            meili: MeiliClient::new(
-                "http://127.0.0.1:7700".to_string(),
-                None,
-                "wiki_chunks".to_string(),
-            )
-            .unwrap(),
+            search,
             runtime: RuntimeHub::disabled(),
         };
         let error = read_page(&state, "docs/escape.md").unwrap_err();
         assert_eq!(error.0, StatusCode::BAD_REQUEST);
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[tokio::test]
+    async fn health_and_search_routes_work_without_meilisearch_in_sqlite_mode() {
+        let base =
+            std::env::temp_dir().join(format!("wordkeep_wiki_sqlite_web_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("docs")).unwrap();
+        std::fs::write(
+            base.join("docs/sqlite_native.md"),
+            "# Native SQLite Search\n\nRuns desktop wiki without Docker Meilisearch.\n",
+        )
+        .unwrap();
+
+        let config = WikiConfig {
+            doc_roots: vec!["docs".to_string()],
+            search_backend: crate::config::SearchBackendMode::Auto,
+            meili_configured: false,
+            meili_url: "http://127.0.0.1:1".to_string(), // closed port: proves Meili is not called
+            meili_key: None,
+            index_uid: "wiki_chunks".to_string(),
+            bind: "127.0.0.1:8787".to_string(),
+            retain_search_queries: false,
+            project_name: "Demo".to_string(),
+            read_only: false,
+        };
+        let db = crate::search_backend::SqliteSearchBackend::new_at(base.join("index.sqlite3"));
+        db.ensure_index(&base, &config).unwrap();
+        let state = AppState {
+            root: base.clone(),
+            config,
+            search: SearchBackend::Sqlite(db),
+            runtime: RuntimeHub::disabled(),
+        };
+
+        let (status, Json(health_body)) = health(State(state.clone())).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(health_body["status"], "ok");
+        assert_eq!(health_body["search_backend"], "sqlite");
+
+        let Json(search_body) = search(
+            State(state),
+            Query(SearchQuery {
+                q: Some("Docker Meilisearch".to_string()),
+                kind: None,
+                root: None,
+                tag: None,
+                limit: Some(10),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(search_body["backend"], "sqlite");
+        assert_eq!(search_body["estimatedTotalHits"], 1);
+        assert_eq!(search_body["hits"][0]["path"], "docs/sqlite_native.md");
+
         let _ = std::fs::remove_dir_all(base);
     }
 

@@ -43,6 +43,33 @@ fn resolve_lib(root: &Path, args: &Value) -> Result<PathBuf, String> {
     decrees_dir(root)
 }
 
+fn lib_source_bytes(lib: &Path) -> u64 {
+    fn visit(dir: &Path, acc: &mut u64) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                visit(&p, acc);
+            } else if matches!(
+                p.extension().and_then(|e| e.to_str()),
+                Some("esk" | "toml" | "json")
+            ) {
+                if let Ok(m) = entry.metadata() {
+                    *acc += m.len();
+                }
+            }
+        }
+    }
+    if lib.is_file() {
+        return std::fs::metadata(lib).map(|m| m.len()).unwrap_or(0);
+    }
+    let mut bytes = 0u64;
+    visit(lib, &mut bytes);
+    bytes
+}
+
 pub fn dispatch(root: &Path, args: &Value) -> Result<String, String> {
     let t0 = Instant::now();
     let method = args
@@ -54,19 +81,26 @@ pub fn dispatch(root: &Path, args: &Value) -> Result<String, String> {
         let result = feedback_journal(root, args);
         let elapsed_us = t0.elapsed().as_micros() as u64;
         let text_result = match &result {
-            Ok(v) => Ok(serde_json::to_string_pretty(v).unwrap_or_else(|_| "{}".into())),
+            Ok(v) => {
+                crate::mcp::set_structured_content(v.clone());
+                Ok(serde_json::to_string_pretty(v).unwrap_or_else(|_| "{}".into()))
+            }
             Err(e) => Err(e.clone()),
         };
         let returned = match &text_result {
             Ok(t) => (t.len() as u64).div_ceil(4).max(1),
             Err(_) => 0,
         };
+        let journal_bytes = std::fs::metadata(root.join(".wordkeep/ereshkigal-feedback.jsonl"))
+            .map(|m| m.len())
+            .unwrap_or(0);
+        let baseline = (journal_bytes / 4).max(returned).max(64);
         stats::record_ext(
             "decree",
             stats::RecordMeta {
-                baseline: 64,
+                baseline,
                 returned,
-                bytes_read: 0,
+                bytes_read: journal_bytes,
                 cache_hits: 0,
                 cache_misses: 0,
                 reason: None,
@@ -84,6 +118,7 @@ pub fn dispatch(root: &Path, args: &Value) -> Result<String, String> {
         return text_result;
     }
     let lib = resolve_lib(root, args)?;
+    let bytes_read = lib_source_bytes(&lib);
     let result = match method {
         "check" => {
             let library = ereshkigal_lang::Library::load(&lib).map_err(|e| e.to_string())?;
@@ -98,7 +133,12 @@ pub fn dispatch(root: &Path, args: &Value) -> Result<String, String> {
         "lint" => {
             let library = ereshkigal_lang::Library::load(&lib).map_err(|e| e.to_string())?;
             ereshkigal_lang::lint::lint_library(&library).map_err(|e| e.to_string())?;
-            Ok(json!({"ok": true, "lib": lib.display().to_string()}))
+            Ok(json!({
+                "ok": true,
+                "lib": lib.display().to_string(),
+                "decrees": library.decrees.len(),
+                "programs": library.programs.len(),
+            }))
         }
         "schema" => {
             let schema = ereshkigal_lang::library_schema_json().map_err(|e| e.to_string())?;
@@ -116,21 +156,28 @@ pub fn dispatch(root: &Path, args: &Value) -> Result<String, String> {
     };
     let elapsed_us = t0.elapsed().as_micros() as u64;
     let text_result = match &result {
-        Ok(v) => Ok(serde_json::to_string_pretty(v).unwrap_or_else(|_| "{}".into())),
-        Err(e) => Err(e.clone()),
+        Ok(v) => {
+            crate::mcp::set_structured_content(v.clone());
+            Ok(serde_json::to_string_pretty(v).unwrap_or_else(|_| "{}".into()))
+        }
+        Err(e) => {
+            crate::mcp::clear_structured_content();
+            Err(e.clone())
+        }
     };
     let returned = match &text_result {
         Ok(t) => (t.len() as u64).div_ceil(4).max(1),
         Err(_) => 0,
     };
+    let baseline = (bytes_read / 4).max(returned).max(64);
     stats::record_ext(
         "decree",
         stats::RecordMeta {
-            baseline: 64,
+            baseline,
             returned,
-            bytes_read: 0,
+            bytes_read,
             cache_hits: 0,
-            cache_misses: 0,
+            cache_misses: if bytes_read > 0 { 1 } else { 0 },
             reason: None,
         },
     );
@@ -384,6 +431,9 @@ mod tests {
         )
         .unwrap();
         let text = dispatch(&root, &json!({"method": "check"})).unwrap();
+        let sc = crate::mcp::take_structured_content().expect("decree structuredContent");
+        assert_eq!(sc["ok"], true, "{sc}");
+        assert!(lib_source_bytes(&lib) > 256, "std decrees library should have real source bytes");
         let returned = (text.len() as u64).div_ceil(4).max(1);
         let outcome = crate::stats::classify_outcome(&Ok(text.clone()), returned);
         assert_eq!(

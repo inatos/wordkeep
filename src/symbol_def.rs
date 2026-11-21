@@ -87,6 +87,14 @@ fn supported(lang: Lang) -> bool {
     )
 }
 
+#[derive(Clone, Copy, Default)]
+pub struct LocateStats {
+    pub scanned: u64,
+    pub bytes_read: u64,
+    pub cache_hits: u64,
+    pub cache_misses: u64,
+}
+
 /// Walk `paths` in sorted order and return the first definition whose name
 /// matches `symbol`, plus the number of bytes scanned (for the savings
 /// counter). Files are parsed through the incremental cache.
@@ -96,31 +104,49 @@ pub fn locate(
     paths: &[String],
     want_body: bool,
 ) -> (Option<DefInfo>, u64) {
+    let (info, st) = locate_with_stats(root, symbol, paths, want_body);
+    (info, st.scanned)
+}
+
+pub fn locate_with_stats(
+    root: &Path,
+    symbol: &str,
+    paths: &[String],
+    want_body: bool,
+) -> (Option<DefInfo>, LocateStats) {
     let prune = walk::prune_set(root);
     let mut cands: Vec<(PathBuf, Lang, u64)> = Vec::new();
     for p in paths {
         let base = root.join(p);
-        for entry in walk::files(&base, &prune) {
-            let path = entry.path();
+        for path_owned in walk::files(&base, &prune) {
+            let path = path_owned.as_path();
             let Some(lang) = Lang::from_path(path) else {
                 continue;
             };
             if !supported(lang) {
                 continue;
-            }
-            let Ok(meta) = entry.metadata() else { continue };
+            };
+            let Ok(meta) = path.metadata() else { continue };
             cands.push((path.to_path_buf(), lang, cache::mtime_ns(&meta)));
         }
     }
     cands.sort_by(|a, b| a.0.cmp(&b.0));
 
     let mut parser = Parser::new();
-    let mut scanned = 0u64;
+    let mut st = LocateStats::default();
     for (path, lang, mt) in &cands {
-        let Some((src, tree)) = incremental::parse(&mut parser, *lang, path, *mt) else {
+        let Some((src, tree, hit, disk_bytes)) =
+            incremental::parse_with_stats(&mut parser, *lang, path, *mt)
+        else {
             continue;
         };
-        scanned += src.len() as u64;
+        st.scanned += src.len() as u64;
+        st.bytes_read += disk_bytes;
+        if hit {
+            st.cache_hits += 1;
+        } else {
+            st.cache_misses += 1;
+        }
         // Cheap prefilter: the name must literally appear to be defined here.
         if !src.contains(symbol) {
             continue;
@@ -146,10 +172,10 @@ pub fn locate(
                     String::new()
                 },
             };
-            return (Some(info), scanned);
+            return (Some(info), st);
         }
     }
-    (None, scanned)
+    (None, st)
 }
 
 /// All function/method definition spans in one already-known file, for

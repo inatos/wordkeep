@@ -43,7 +43,17 @@ pub fn build(root: &Path, args: &Value) -> Result<String, String> {
 
     let path = bfs(&adj.callees, &from_k, &to_k, max_depth);
     let out = render(from, to, &paths, &adj, &path, max_depth, budget);
-    stats::record("call_path", adj.scanned_bytes / 4, (out.len() / 4) as u64);
+    stats::record_ext(
+        "call_path",
+        stats::RecordMeta {
+            baseline: adj.scanned_bytes / 4,
+            returned: (out.len() / 4) as u64,
+            bytes_read: adj.bytes_read,
+            cache_hits: adj.cache_hits,
+            cache_misses: adj.cache_misses,
+            reason: None,
+        },
+    );
     Ok(out)
 }
 

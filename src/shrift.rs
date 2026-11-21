@@ -262,6 +262,9 @@ pub fn upsert(root: &Path, args: &Value) -> Result<String, String> {
         "shrift_upsert - {action} {}\n  path: {}\n  status: {}\n",
         idea.slug, idea.path, idea.status
     );
+    if let Ok(st) = crate::store::Store::open(root) {
+        sync_idea_links(root, &st, &idea, true);
+    }
     if !similar.is_empty() {
         out.push_str("dedupe warning (not blocked):\n");
         for (s, score) in similar.iter().filter(|(s, _)| *s != idea.slug).take(5) {
@@ -290,6 +293,9 @@ pub fn upsert(root: &Path, args: &Value) -> Result<String, String> {
 pub fn touch(root: &Path, args: &Value) -> Result<String, String> {
     let slug = required_str(args, "slug")?;
     let idea = shrift::touch(root, &slug)?;
+    if let Ok(st) = crate::store::Store::open(root) {
+        sync_idea_links(root, &st, &idea, true);
+    }
     let out = format!(
         "shrift_touch - {slug} touched={} freshness={}\n  path: {}\n",
         idea.touched, idea.freshness, idea.path
@@ -306,13 +312,96 @@ pub fn touch(root: &Path, args: &Value) -> Result<String, String> {
     Ok(out)
 }
 
+fn sync_idea_links(root: &Path, store: &crate::store::Store, idea: &Idea, force: bool) {
+    let abs = root.join(&idea.path);
+    let (mt, sz) = std::fs::metadata(&abs)
+        .map(|m| (crate::cache::mtime_ns(&m), m.len()))
+        .unwrap_or((0, 0));
+    if !force && mt > 0 {
+        if let Ok(Some((_, stored_mt))) =
+            store.file_stage_mtime(&idea.path, crate::store::STAGE_OBS_LINKS)
+        {
+            if stored_mt == mt {
+                return;
+            }
+        }
+    }
+    let file_id = if mt > 0 {
+        store.upsert_file(&idea.path, mt, sz, "markdown").ok()
+    } else {
+        None
+    };
+    let text = format!("{}\n{}", idea.title, idea.body);
+    if store
+        .sync_observation_links(root, "shrift", &idea.slug, file_id, &text, &idea.links)
+        .is_ok()
+    {
+        if let Some(fid) = file_id {
+            let _ = store.set_file_stage(fid, crate::store::STAGE_OBS_LINKS, mt, None);
+        }
+    }
+}
+
+/// Ensure all shrift ideas have their `observation_links` indexed once per idea file mtime.
+pub fn ensure_shrift_links_indexed(root: &Path, store: &crate::store::Store) {
+    let Ok(ideas) = shrift::load_all(root) else {
+        return;
+    };
+    let _ = store.with_immediate_tx(|s| {
+        for idea in &ideas {
+            if idea.status == "archived" {
+                continue;
+            }
+            sync_idea_links(root, s, idea, false);
+        }
+        Ok(())
+    });
+}
+
 pub fn review(root: &Path, args: &Value) -> Result<String, String> {
     let max = args.get("max").and_then(Value::as_u64).unwrap_or(20) as usize;
     let ideas = shrift::load_all(root)?;
     let bookmarks = shrift::load_bookmarks(root);
     let metrics = shrift::metrics(&ideas, &bookmarks);
-    let queue = shrift::review_queue(&ideas);
+    let mut queue = shrift::review_queue(&ideas);
     let stalest = shrift::stalest(&ideas, 3);
+
+    let mut stale_by_slug: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
+    if let Ok(st) = crate::store::Store::open(root) {
+        for idea in &ideas {
+            if idea.status != "archived" {
+                sync_idea_links(root, &st, idea, false);
+            }
+        }
+        if let Ok(stale) = st.stale_anchors(root, Some("shrift")) {
+            for s in stale {
+                let entry = stale_by_slug.entry(s.obs_id.clone()).or_default();
+                let lbl = s.label();
+                if !entry.contains(&lbl) {
+                    entry.push(lbl);
+                }
+            }
+        }
+    }
+
+    // Surface active ideas whose code anchors diverged in the review queue even when date-fresh.
+    for idea in &ideas {
+        if !matches!(idea.status.as_str(), "archived" | "implemented")
+            && stale_by_slug.contains_key(&idea.slug)
+            && !queue.iter().any(|q| q.slug == idea.slug)
+        {
+            queue.push(idea.clone());
+        }
+    }
+
+    let stale_badge = |slug: &str| -> String {
+        stale_by_slug
+            .get(slug)
+            .filter(|v| !v.is_empty())
+            .map(|v| format!(" [stale-anchor: {}]", v.join(", ")))
+            .unwrap_or_default()
+    };
 
     let mut out = format!(
         "shrift_review - queue={} total={} by_freshness={:?}\n",
@@ -326,8 +415,13 @@ pub fn review(root: &Path, args: &Value) -> Result<String, String> {
     } else {
         for idea in &stalest {
             out.push_str(&format!(
-                "  - [{}] {} — {} ({}d) {}\n",
-                idea.status, idea.slug, idea.freshness, idea.age_days, idea.title
+                "  - [{}] {}{} — {} ({}d) {}\n",
+                idea.status,
+                idea.slug,
+                stale_badge(&idea.slug),
+                idea.freshness,
+                idea.age_days,
+                idea.title
             ));
         }
     }
@@ -337,8 +431,13 @@ pub fn review(root: &Path, args: &Value) -> Result<String, String> {
     } else {
         for idea in queue.iter().take(max) {
             out.push_str(&format!(
-                "  - [{}|{}] {} — {}d · {}\n",
-                idea.status, idea.freshness, idea.slug, idea.age_days, idea.title
+                "  - [{}|{}] {}{} — {}d · {}\n",
+                idea.status,
+                idea.freshness,
+                idea.slug,
+                stale_badge(&idea.slug),
+                idea.age_days,
+                idea.title
             ));
         }
         if queue.len() > max {

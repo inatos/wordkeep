@@ -77,6 +77,10 @@ struct Server {
 
 impl Server {
     fn start() -> Server {
+        Self::start_with_env(&[])
+    }
+
+    fn start_with_env(extra_env: &[(&str, &str)]) -> Server {
         let fixture = FixtureRepo::new();
         let cache_home = std::env::temp_dir().join(format!(
             "wk_cache_{}_{}",
@@ -97,16 +101,25 @@ impl Server {
             r#"{"semif":{"enabled":true,"backend":"heuristic","debias":"none"}}"#,
         )
         .expect("semif cfg");
-        let mut child = Command::new(env!("CARGO_BIN_EXE_wordkeep"))
-            .arg("--root")
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_wordkeep"));
+        cmd.arg("--root")
             .arg(&fixture.root)
             .current_dir(&workdir)
             .env("XDG_CACHE_HOME", &cache_home)
+            .env("WORDKEEP_EMBED_OFFLINE", "1")
+            .env_remove("WORDKEEP_TOOLSET")
+            // Host/session SemIf env must not override the fixture's heuristic pin.
+            .env_remove("WORDKEEP_SEMIF_BACKEND")
+            .env_remove("ERESHKIGAL_BACKEND")
+            .env_remove("ERESHKIGAL_GGUF")
+            .env_remove("ERESHKIGAL_GGUF_VERIFY")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn wordkeep");
+            .stderr(Stdio::null());
+        for (k, v) in extra_env {
+            cmd.env(k, v);
+        }
+        let mut child = cmd.spawn().expect("spawn wordkeep");
         let stdin = child.stdin.take().unwrap();
         let stdout = BufReader::new(child.stdout.take().unwrap());
         Server {
@@ -261,8 +274,20 @@ fn lists_all_tools() {
         "task_cancel",
         "copper_status",
         "mas_timeline",
+        "tool_discover",
     ] {
         assert!(names.contains(&n), "missing tool {n}: {names:?}");
+    }
+    for t in tools {
+        let ann = &t["annotations"];
+        assert!(
+            ann["readOnlyHint"].is_boolean()
+                && ann["destructiveHint"].is_boolean()
+                && ann["idempotentHint"].is_boolean()
+                && ann["openWorldHint"].is_boolean(),
+            "tool {} missing MCP 2025-11 annotations: {t}",
+            t["name"]
+        );
     }
     assert!(
         !names.contains(&"izakaya_record_decision"),
@@ -278,8 +303,8 @@ fn lists_all_tools() {
     );
     assert_eq!(
         names.len(),
-        67,
-        "expected 67 tools, got {}: {names:?}",
+        68,
+        "expected 68 tools, got {}: {names:?}",
         names.len()
     );
 }
@@ -346,7 +371,7 @@ fn resources_list_and_read_readme() {
         "params": { "uri": "wordkeep://capabilities" }
     }));
     let caps_text = caps["result"]["contents"][0]["text"].as_str().unwrap_or("");
-    assert!(caps_text.contains("\"tool_count\": 67"), "{caps}");
+    assert!(caps_text.contains("\"tool_count\": 68"), "{caps}");
     assert!(caps_text.contains("knowledge_upsert"), "{caps}");
     assert!(caps_text.contains("shrift_upsert"), "{caps}");
     assert!(caps_text.contains("\"tacet\""), "{caps}");
@@ -1193,3 +1218,390 @@ fn izakaya_presence_round_trip() {
         "{advice}"
     );
 }
+
+#[test]
+fn mcp_2025_11_annotations_and_structured_content() {
+    let mut s = Server::start();
+    let list = s.call(json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }));
+    let tools = list["result"]["tools"].as_array().unwrap();
+    let by_name = |n: &str| tools.iter().find(|t| t["name"] == n).unwrap();
+
+    assert_eq!(by_name("repo_map")["annotations"]["readOnlyHint"], true);
+    assert_eq!(by_name("repo_map")["annotations"]["openWorldHint"], false);
+    assert_eq!(by_name("run_record")["annotations"]["readOnlyHint"], false);
+    assert_eq!(by_name("run_record")["annotations"]["destructiveHint"], false);
+    assert_eq!(by_name("task_cancel")["annotations"]["destructiveHint"], true);
+    assert_eq!(by_name("task_cancel")["annotations"]["openWorldHint"], true);
+    assert_eq!(by_name("copper_status")["annotations"]["readOnlyHint"], true);
+    assert_eq!(by_name("copper_status")["annotations"]["openWorldHint"], true);
+
+    // 1. stats
+    let _ = s.tool_text("repo_map", json!({}));
+    let stats_resp = s.call(json!({
+        "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+        "params": { "name": "stats", "arguments": {} }
+    }));
+    assert!(stats_resp["result"]["content"][0]["text"].is_string());
+    assert_eq!(stats_resp["result"]["structuredContent"]["version"], 5, "{stats_resp}");
+    assert!(stats_resp["result"]["structuredContent"]["tools"].is_object());
+
+    // 2. semantic_decide
+    let sd_resp = s.call(json!({
+        "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+        "params": {
+            "name": "semantic_decide",
+            "arguments": {
+                "state": "cache hit ratio 95%",
+                "question": "keep warm store?",
+                "options": [
+                    { "id": "keep", "description": "retain warm cache hit store" },
+                    { "id": "drop", "description": "discard cold files" }
+                ]
+            }
+        }
+    }));
+    assert!(sd_resp["result"]["structuredContent"]["chosen"].is_string(), "{sd_resp}");
+    assert!(sd_resp["result"]["structuredContent"]["options"].is_array(), "{sd_resp}");
+
+    // 3. decree
+    let decree_resp = s.call(json!({
+        "jsonrpc": "2.0", "id": 4, "method": "tools/call",
+        "params": {
+            "name": "decree",
+            "arguments": {
+                "method": "feedback",
+                "prompt_sha256": "abc123",
+                "chosen": "keep",
+                "outcome": "accept"
+            }
+        }
+    }));
+    assert_eq!(decree_resp["result"]["structuredContent"]["ok"], true, "{decree_resp}");
+
+    // 4. izakaya_status
+    let iz_resp = s.call(json!({
+        "jsonrpc": "2.0", "id": 5, "method": "tools/call",
+        "params": { "name": "izakaya_status", "arguments": {} }
+    }));
+    assert_eq!(iz_resp["result"]["structuredContent"]["read_only"], true, "{iz_resp}");
+    assert!(iz_resp["result"]["structuredContent"]["agents"].is_array(), "{iz_resp}");
+
+    // 5. copper_status
+    let cop_resp = s.call(json!({
+        "jsonrpc": "2.0", "id": 6, "method": "tools/call",
+        "params": { "name": "copper_status", "arguments": { "refresh": false } }
+    }));
+    assert!(cop_resp["result"]["structuredContent"]["transport_hint"].is_string(), "{cop_resp}");
+
+    // 6. index_health
+    let ih_resp = s.call(json!({
+        "jsonrpc": "2.0", "id": 7, "method": "tools/call",
+        "params": { "name": "index_health", "arguments": {} }
+    }));
+    assert_eq!(ih_resp["result"]["structuredContent"]["ref"], "HEAD", "{ih_resp}");
+    assert!(ih_resp["result"]["structuredContent"]["union_coverage_roots"].is_array(), "{ih_resp}");
+}
+
+#[test]
+fn mcp_2025_11_resource_templates_and_core_toolset() {
+    let mut s = Server::start_with_env(&[("WORDKEEP_TOOLSET", "core")]);
+    let list = s.call(json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }));
+    let tools = list["result"]["tools"].as_array().unwrap();
+    let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
+    assert!((20..=24).contains(&names.len()), "core toolset size={}: {names:?}", names.len());
+    assert!(names.contains(&"repo_map"));
+    assert!(names.contains(&"tool_discover"));
+    assert!(!names.contains(&"shrift_list"));
+
+    // Discover extended tool and invoke it directly.
+    let disc = s.call(json!({
+        "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+        "params": { "name": "tool_discover", "arguments": { "query": "shrift" } }
+    }));
+    assert!(disc["result"]["content"][0]["text"].as_str().unwrap().contains("shrift_list"), "{disc}");
+    assert!(disc["result"]["structuredContent"]["matched"].as_u64().unwrap() >= 1);
+
+    let shrift_out = s.tool_text("shrift_list", json!({}));
+    assert!(shrift_out.contains("shrift"), "{shrift_out}");
+
+    // Resource templates list + read for symbol and defect.
+    let tmpl = s.call(json!({ "jsonrpc": "2.0", "id": 3, "method": "resources/templates/list" }));
+    let templates = tmpl["result"]["resourceTemplates"].as_array().unwrap();
+    assert!(templates.iter().any(|t| t["uriTemplate"] == "wordkeep://symbol/{name}"), "{tmpl}");
+    assert!(templates.iter().any(|t| t["uriTemplate"] == "wordkeep://defect/{id}"), "{tmpl}");
+
+    let sym_read = s.call(json!({
+        "jsonrpc": "2.0", "id": 4, "method": "resources/read",
+        "params": { "uri": "wordkeep://symbol/Widget" }
+    }));
+    let sym_text = sym_read["result"]["contents"][0]["text"].as_str().unwrap_or("");
+    assert!(sym_text.contains("struct Widget"), "{sym_read}");
+
+    s.tool_text("defect_upsert", json!({ "id": "tmpl-def-1", "summary": "template read smoke" }));
+    let def_read = s.call(json!({
+        "jsonrpc": "2.0", "id": 5, "method": "resources/read",
+        "params": { "uri": "wordkeep://defect/tmpl-def-1" }
+    }));
+    let def_text = def_read["result"]["contents"][0]["text"].as_str().unwrap_or("");
+    assert!(def_text.contains("template read smoke"), "{def_read}");
+}
+
+#[test]
+fn ergonomics_aliases_markdown_outline_and_telemetry() {
+    let mut s = Server::start();
+    std::fs::write(
+        s._fixture.root.join("docs_guide.mdc"),
+        "---\ndescription: Guide rule\n---\n\n# Intro\n\nhello\n\n## Usage\n\nworld\n",
+    )
+    .unwrap();
+    let md_out = s.tool_text("outline", json!({ "file": "docs_guide.mdc" }));
+    assert!(md_out.contains("frontmatter:") && md_out.contains("Guide rule"), "{md_out}");
+    assert!(md_out.contains("# Intro") && md_out.contains("## Usage"), "{md_out}");
+
+    let tl_sym = s.tool_text("type_layout", json!({ "symbol": "Widget" }));
+    assert!(tl_sym.contains("Widget") && tl_sym.contains("id") && tl_sym.contains("POD"), "{tl_sym}");
+    let tl_name = s.tool_text("type_layout", json!({ "name": "Widget" }));
+    assert!(tl_name.contains("Widget") && tl_name.contains("value") && tl_name.contains("POD"), "{tl_name}");
+
+    let tm_name = s.tool_text("test_map", json!({ "name": "widget_area" }));
+    assert!(tm_name.contains("test_widget.cpp"), "{tm_name}");
+
+    let rr_pass = s.tool_text("run_record", json!({ "command": "ctest", "status": "pass" }));
+    assert!(rr_pass.contains("status=passed"), "{rr_pass}");
+    let rr_fail = s.tool_text("run_record", json!({ "command": "ctest", "status": "fail" }));
+    assert!(rr_fail.contains("status=failed"), "{rr_fail}");
+
+    s.tool_text("izakaya_check_in", json!({ "agent_id": "erg-agent", "observe_git": false }));
+    let iz_upd = s.tool_text("izakaya_update", json!({ "agent_id": "erg-agent", "state": "live_code", "observe_git": false }));
+    assert!(iz_upd.contains("live_code"), "{iz_upd}");
+    let iz_done = s.tool_text("izakaya_update", json!({ "agent_id": "erg-agent", "state": "done", "observe_git": false }));
+    assert!(iz_done.contains("checked out") || iz_done.contains("checked_out"), "{iz_done}");
+
+    let handoff_default = s.tool_text("session_handoff", json!({}));
+    assert!(handoff_default.contains("session_handoff"), "{handoff_default}");
+
+    // Warm store cache hits + compact mutation low_yield exemption check in stats.
+    s.tool_text("repo_map", json!({}));
+    s.tool_text("repo_map", json!({}));
+    let stats_resp = s.call(json!({
+        "jsonrpc": "2.0", "id": 99, "method": "tools/call",
+        "params": { "name": "stats", "arguments": {} }
+    }));
+    let sc = &stats_resp["result"]["structuredContent"]["tools"];
+    assert!(sc["repo_map"]["cache_hits"].as_u64().unwrap_or(0) >= 1, "{sc}");
+    assert!(sc["repo_map"]["bytes_read"].as_u64().unwrap_or(0) >= 1, "{sc}");
+    assert_eq!(sc["run_record"]["low_yield_count"].as_u64().unwrap_or(0), 0, "{sc}");
+}
+
+#[test]
+fn mcp_2025_11_async_tasks_stdio_trace_profile_and_scip_refresh() {
+    let mut s = Server::start();
+    let init = s.call(json!({
+        "jsonrpc": "2.0", "id": 1, "method": "initialize",
+        "params": { "protocolVersion": "2025-11-25" }
+    }));
+    assert!(init["result"]["capabilities"]["tasks"]["list"].is_object(), "{init}");
+    assert!(init["result"]["capabilities"]["tasks"]["cancel"].is_object(), "{init}");
+
+    let list = s.call(json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" }));
+    let tools = list["result"]["tools"].as_array().unwrap();
+    let exec_of = |n: &str| {
+        tools
+            .iter()
+            .find(|t| t["name"] == n)
+            .and_then(|t| t.get("execution"))
+            .and_then(|e| e.get("taskSupport"))
+            .and_then(Value::as_str)
+    };
+    assert_eq!(exec_of("task_submit"), Some("optional"));
+    assert_eq!(exec_of("trace_profile"), Some("optional"));
+    assert_eq!(exec_of("index_health"), Some("optional"));
+    assert_eq!(exec_of("index_stale"), Some("optional"));
+    assert_eq!(exec_of("repo_map"), None);
+
+    // 1. Async trace_profile via tools/call + params.task -> tasks/result.
+    let tp_create = s.call(json!({
+        "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+        "params": {
+            "name": "trace_profile",
+            "arguments": {},
+            "task": { "ttl": 60000 }
+        }
+    }));
+    let tp_tid = tp_create["result"]["task"]["taskId"]
+        .as_str()
+        .expect("taskId")
+        .to_string();
+    let tp_res = s.call(json!({
+        "jsonrpc": "2.0", "id": 4, "method": "tasks/result",
+        "params": { "taskId": tp_tid }
+    }));
+    assert_eq!(tp_res["result"]["isError"], false, "{tp_res}");
+    assert!(
+        tp_res["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("trace_profile"),
+        "{tp_res}"
+    );
+
+    // 2. Async SCIP refresh via index_health mode=scip_refresh + JSON SCIP fixture.
+    std::fs::write(
+        s._fixture.root.join("index.scip"),
+        r#"{"metadata":{"tool_info":{"name":"rust-analyzer","version":"0.1"}},"documents":[],"edges":[{"file":"src/sample.cpp","src_name":"widget_area","dst_name":"helper","line":4,"kind":"call","site_text":"helper()"}]}"#,
+    )
+    .unwrap();
+    let scip_create = s.call(json!({
+        "jsonrpc": "2.0", "id": 5, "method": "tools/call",
+        "params": {
+            "name": "index_health",
+            "arguments": { "mode": "scip_refresh" },
+            "task": {}
+        }
+    }));
+    let scip_tid = scip_create["result"]["task"]["taskId"]
+        .as_str()
+        .expect("scip taskId")
+        .to_string();
+    let scip_res = s.call(json!({
+        "jsonrpc": "2.0", "id": 6, "method": "tasks/result",
+        "params": { "taskId": scip_tid }
+    }));
+    assert_eq!(scip_res["result"]["isError"], false, "{scip_res}");
+    assert_eq!(scip_res["result"]["structuredContent"]["refreshed"], true, "{scip_res}");
+    assert!(
+        scip_res["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("scip_refresh"),
+        "{scip_res}"
+    );
+
+    // 3. tasks/get + tasks/list verify completed state.
+    let get_resp = s.call(json!({
+        "jsonrpc": "2.0", "id": 7, "method": "tasks/get",
+        "params": { "taskId": scip_tid }
+    }));
+    assert_eq!(get_resp["result"]["status"], "completed", "{get_resp}");
+
+    let list_resp = s.call(json!({
+        "jsonrpc": "2.0", "id": 8, "method": "tasks/list",
+        "params": {}
+    }));
+    assert!(
+        list_resp["result"]["tasks"].as_array().unwrap().len() >= 2,
+        "{list_resp}"
+    );
+
+    // 4. Async task_submit (stubbed local job) + tasks/cancel on a slow stub job.
+    let jobs_dir = s._fixture.root.join("tools/palaestra/remote/jobs");
+    std::fs::create_dir_all(&jobs_dir).unwrap();
+    let run_sh = s._fixture.root.join("tools/palaestra/remote/run_job.sh");
+    std::fs::write(
+        &run_sh,
+        "#!/usr/bin/env bash\nset -euo pipefail\nJOB=\"\"\nwhile [[ $# -gt 0 ]]; do case \"$1\" in --job) JOB=\"$2\"; shift 2;; *) shift;; esac; done\nROOT=\"$(cd \"$(dirname \"$0\")/../../..\" && pwd)\"\nmkdir -p \"$ROOT/.cache/palaestra/remote/$JOB\"\necho ok > \"$ROOT/.cache/palaestra/remote/$JOB/run.log\"\nif [[ \"$JOB\" == \"slow-stub\" ]]; then sleep 5; fi\n",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&run_sh).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&run_sh, perms).unwrap();
+    }
+    std::fs::write(jobs_dir.join("fast-stub.sh"), "#!/usr/bin/env bash\n").unwrap();
+    std::fs::write(jobs_dir.join("slow-stub.sh"), "#!/usr/bin/env bash\n").unwrap();
+
+    let sub_fast = s.call(json!({
+        "jsonrpc": "2.0", "id": 9, "method": "tools/call",
+        "params": {
+            "name": "task_submit",
+            "arguments": { "job": "fast-stub", "wait": true },
+            "task": {}
+        }
+    }));
+    let fast_tid = sub_fast["result"]["task"]["taskId"].as_str().unwrap().to_string();
+    let fast_res = s.call(json!({
+        "jsonrpc": "2.0", "id": 10, "method": "tasks/result",
+        "params": { "taskId": fast_tid }
+    }));
+    assert_eq!(fast_res["result"]["isError"], false, "{fast_res}");
+    assert_eq!(fast_res["result"]["structuredContent"]["status"], "done", "{fast_res}");
+
+    let sub_slow = s.call(json!({
+        "jsonrpc": "2.0", "id": 11, "method": "tools/call",
+        "params": {
+            "name": "task_submit",
+            "arguments": { "job": "slow-stub", "wait": true },
+            "task": {}
+        }
+    }));
+    let slow_tid = sub_slow["result"]["task"]["taskId"].as_str().unwrap().to_string();
+    std::thread::sleep(std::time::Duration::from_millis(60));
+    let cancel_resp = s.call(json!({
+        "jsonrpc": "2.0", "id": 12, "method": "tasks/cancel",
+        "params": { "taskId": slow_tid }
+    }));
+    assert_eq!(cancel_resp["result"]["status"], "cancelled", "{cancel_resp}");
+}
+
+#[test]
+fn staleness_links_stdio_surfaces_stale_anchor_in_search_shrift_defects_and_health() {
+    let mut s = Server::start();
+    // Create note, shrift, and defect referencing `widget_area` / `src/sample.cpp`.
+    s.tool_text(
+        "knowledge_upsert",
+        json!({
+            "path": ".wordkeep/notes/widget-note.md",
+            "heading": "Widget Area Contract",
+            "body": "Geometry helper calls `widget_area` in `src/sample.cpp`."
+        }),
+    );
+    s.tool_text(
+        "shrift_upsert",
+        json!({
+            "title": "SIMD widget area",
+            "body": "Vectorize `widget_area` for batch queries."
+        }),
+    );
+    s.tool_text(
+        "defect_upsert",
+        json!({
+            "id": "widget-neg-area",
+            "subsystem": "math",
+            "summary": "Guard `widget_area` against negative extents",
+            "anchors": ["src/sample.cpp:1"]
+        }),
+    );
+
+    // Index observation links while `widget_area` matches original fixture.
+    let initial_kb = s.tool_text(
+        "knowledge_search",
+        json!({ "query": "Widget Area Contract", "roots": [".wordkeep/notes"] }),
+    );
+    assert!(!initial_kb.contains("[stale-anchor"), "{initial_kb}");
+
+    // Mutate `widget_area` implementation in `src/sample.cpp`.
+    let sample_cpp = s._fixture.root.join("src/sample.cpp");
+    let orig = std::fs::read_to_string(&sample_cpp).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(15));
+    let mutated = orig.replace("return w.id;", "return w.id * 2;");
+    assert_ne!(orig, mutated, "fixture sample.cpp must contain `return w.id;`");
+    std::fs::write(&sample_cpp, mutated).unwrap();
+
+    let kb = s.tool_text(
+        "knowledge_search",
+        json!({ "query": "Widget Area Contract", "roots": [".wordkeep/notes"] }),
+    );
+    assert!(kb.contains("[stale-anchor"), "expected [stale-anchor] in knowledge_search:\n{kb}");
+
+    let sr = s.tool_text("shrift_review", json!({}));
+    assert!(sr.contains("[stale-anchor"), "expected [stale-anchor] in shrift_review:\n{sr}");
+
+    let dl = s.tool_text("defect_list", json!({}));
+    assert!(dl.contains("[stale-anchor"), "expected [stale-anchor] in defect_list:\n{dl}");
+
+    let ih = s.tool_text("index_health", json!({}));
+    assert!(ih.contains("[stale-anchor]"), "expected [stale-anchor] in index_health:\n{ih}");
+}
+

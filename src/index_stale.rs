@@ -25,6 +25,7 @@ struct HealthCache {
     key: String,
     at: Instant,
     body: String,
+    structured: Value,
     baseline: u64,
 }
 
@@ -34,7 +35,18 @@ pub fn check(root: &Path, args: &Value) -> Result<String, String> {
     if args
         .get("mode")
         .and_then(Value::as_str)
+        .is_some_and(|m| m.eq_ignore_ascii_case("scip_refresh"))
+    {
+        if let Ok(mut guard) = HEALTH_CACHE.lock() {
+            *guard = None;
+        }
+        return crate::scip::refresh(root, args);
+    }
+    if args
+        .get("mode")
+        .and_then(Value::as_str)
         .is_some_and(|m| m.eq_ignore_ascii_case("health"))
+        || args.get("refresh_scip").and_then(Value::as_bool) == Some(true)
     {
         return health(root, args);
     }
@@ -175,6 +187,31 @@ pub fn check(root: &Path, args: &Value) -> Result<String, String> {
 
 /// Profile coverage + proactive stale report (`index_health` tool).
 pub fn health(root: &Path, args: &Value) -> Result<String, String> {
+    if args
+        .get("mode")
+        .and_then(Value::as_str)
+        .is_some_and(|m| m.eq_ignore_ascii_case("scip_refresh"))
+    {
+        if let Ok(mut guard) = HEALTH_CACHE.lock() {
+            *guard = None;
+        }
+        let out = crate::scip::refresh(root, args)?;
+        stats::record("index_health", 128, (out.len() / 4) as u64);
+        return Ok(out);
+    }
+
+    let refresh_scip = args
+        .get("refresh_scip")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if refresh_scip {
+        if let Ok(mut guard) = HEALTH_CACHE.lock() {
+            *guard = None;
+        }
+        let _ = crate::scip::refresh(root, args)?;
+        crate::mcp::clear_structured_content();
+    }
+
     let gitref = args
         .get("ref")
         .and_then(Value::as_str)
@@ -186,33 +223,44 @@ pub fn health(root: &Path, args: &Value) -> Result<String, String> {
     }
 
     progress::tick(0, None, "index_health: profiles");
-    let cache_key = format!("{}|{gitref}", root.display());
-    if let Ok(guard) = HEALTH_CACHE.lock() {
-        if let Some(hit) = guard.as_ref() {
-            if hit.key == cache_key && hit.at.elapsed() < HEALTH_TTL {
-                let out = hit.body.clone();
-                stats::record("index_health", hit.baseline.max(64), (out.len() / 4) as u64);
-                return Ok(out);
+    let scip_tag = crate::scip::quick_cache_tag(root);
+    let obs_tag = crate::store::Store::open(root)
+        .ok()
+        .map(|s| s.quick_obs_cache_tag(root))
+        .unwrap_or_default();
+    let cache_key = format!("{}|{gitref}|{scip_tag}|{obs_tag}", root.display());
+    if !refresh_scip {
+        if let Ok(guard) = HEALTH_CACHE.lock() {
+            if let Some(hit) = guard.as_ref() {
+                if hit.key == cache_key && hit.at.elapsed() < HEALTH_TTL {
+                    let out = hit.body.clone();
+                    crate::mcp::set_structured_content(hit.structured.clone());
+                    stats::record("index_health", hit.baseline.max(64), (out.len() / 4) as u64);
+                    return Ok(out);
+                }
             }
         }
     }
 
-    let (out, baseline) = health_build(root, &gitref)?;
+    let (out, structured, baseline) = health_build(root, &gitref)?;
     if let Ok(mut guard) = HEALTH_CACHE.lock() {
         *guard = Some(HealthCache {
             key: cache_key,
             at: Instant::now(),
             body: out.clone(),
+            structured: structured.clone(),
             baseline,
         });
     }
+    crate::mcp::set_structured_content(structured);
     stats::record("index_health", baseline.max(64), (out.len() / 4) as u64);
     Ok(out)
 }
 
-fn health_build(root: &Path, gitref: &str) -> Result<(String, u64), String> {
+fn health_build(root: &Path, gitref: &str) -> Result<(String, Value, u64), String> {
     let profiles = config::list_profile_names(root);
     let mut all_profile_paths: Vec<String> = Vec::new();
+    let mut profiles_json: Vec<Value> = Vec::new();
     let mut out = String::from("index_health - path profile coverage + stale check\n\n");
     out.push_str("## Path profiles\n");
     if profiles.is_empty() {
@@ -221,14 +269,18 @@ fn health_build(root: &Path, gitref: &str) -> Result<(String, u64), String> {
         for name in &profiles {
             let paths = config::profile_paths(root, name).unwrap_or_default();
             let mut status = Vec::new();
+            let mut paths_json = Vec::new();
             for p in &paths {
                 let abs = root.join(p);
-                let mark = if abs.exists() { "ok" } else { "MISSING" };
+                let exists = abs.exists();
+                let mark = if exists { "ok" } else { "MISSING" };
                 status.push(format!("{p} [{mark}]"));
+                paths_json.push(serde_json::json!({ "path": p, "exists": exists }));
                 if !all_profile_paths.iter().any(|x| x == p) {
                     all_profile_paths.push(p.clone());
                 }
             }
+            profiles_json.push(serde_json::json!({ "name": name, "paths": paths_json }));
             out.push_str(&format!("  {name}: {}\n", status.join(", ")));
         }
     }
@@ -243,6 +295,7 @@ fn health_build(root: &Path, gitref: &str) -> Result<(String, u64), String> {
 
     out.push_str("\n## Coverage gaps (sample under web/, tools/)\n");
     let (gaps, sample_bytes) = sample_coverage_gaps(root, &all_profile_paths);
+    let mut gaps_json: Vec<Value> = Vec::new();
     if gaps.is_empty() {
         out.push_str("(no sampled source files outside profile union)\n");
     } else {
@@ -250,6 +303,7 @@ fn health_build(root: &Path, gitref: &str) -> Result<(String, u64), String> {
             let suggested =
                 config::infer_profile(root, g).unwrap_or_else(|| suggest_profile_name(g));
             out.push_str(&format!("  {g}  → suggest profile \"{suggested}\"\n"));
+            gaps_json.push(serde_json::json!({ "path": g, "suggested_profile": suggested }));
         }
         if gaps.len() > 16 {
             out.push_str(&format!("  … (+{} more sampled)\n", gaps.len() - 16));
@@ -272,6 +326,7 @@ fn health_build(root: &Path, gitref: &str) -> Result<(String, u64), String> {
         .iter()
         .filter(|p| !path_in_coverage(p, &all_profile_paths))
         .collect();
+    let mut outside_json: Vec<Value> = Vec::new();
     out.push_str(&format!(
         "\n## Git changes outside coverage (vs {gitref})\n"
     ));
@@ -282,6 +337,7 @@ fn health_build(root: &Path, gitref: &str) -> Result<(String, u64), String> {
             let suggested =
                 config::infer_profile(root, p).unwrap_or_else(|| suggest_profile_name(p));
             out.push_str(&format!("  {p}  → try profile \"{suggested}\"\n"));
+            outside_json.push(serde_json::json!({ "path": *p, "suggested_profile": suggested }));
         }
         if outside.len() > 12 {
             out.push_str(&format!("  … (+{} more)\n", outside.len() - 12));
@@ -290,10 +346,91 @@ fn health_build(root: &Path, gitref: &str) -> Result<(String, u64), String> {
 
     out.push_str("\n## Index freshness\n");
     let stale_args = serde_json::json!({ "ref": gitref });
-    match check_freshness_only(root, &stale_args) {
-        Ok(s) => out.push_str(&s),
-        Err(e) => out.push_str(&format!("stale check error: {e}\n")),
+    let freshness_text = match check_freshness_only(root, &stale_args) {
+        Ok(s) => {
+            out.push_str(&s);
+            s
+        }
+        Err(e) => {
+            let msg = format!("stale check error: {e}\n");
+            out.push_str(&msg);
+            msg
+        }
+    };
+
+    out.push_str("\n## SCIP / Semantic overlay\n");
+    let scip_st = crate::scip::status(root);
+    let scip_text = crate::scip::format_health_section_from(root, &scip_st);
+    out.push_str(&scip_text);
+
+    out.push_str("\n## Observation links & anchor freshness\n");
+    let mut obs_total = 0usize;
+    let mut stale_obs_json: Vec<Value> = Vec::new();
+    if let Ok(st) = crate::store::Store::open(root) {
+        crate::knowledge::ensure_note_obs_links_indexed(root, &st);
+        crate::shrift::ensure_shrift_links_indexed(root, &st);
+        crate::defects::ensure_defect_links_indexed(root, &st);
+        obs_total = st.observation_link_count().unwrap_or(0);
+        let stale_list = st.stale_anchors(root, None).unwrap_or_default();
+        out.push_str(&format!(
+            "links: {obs_total}, stale: {}\n",
+            stale_list.len()
+        ));
+        for sa in stale_list.iter().take(16) {
+            out.push_str(&format!(
+                "  [stale-anchor] {} {} → {} (target={})\n",
+                sa.obs_kind,
+                sa.obs_id,
+                sa.label(),
+                sa.target_rel
+            ));
+            stale_obs_json.push(serde_json::json!({
+                "obs_kind": sa.obs_kind,
+                "obs_id": sa.obs_id,
+                "target_rel": sa.target_rel,
+                "symbol_name": sa.symbol_name,
+                "label": sa.label(),
+            }));
+        }
+        if stale_list.len() > 16 {
+            out.push_str(&format!("  … (+{} more stale anchors)\n", stale_list.len() - 16));
+        }
+    } else {
+        out.push_str("(sqlite store unavailable)\n");
     }
+
+    let structured = serde_json::json!({
+        "ref": gitref,
+        "profiles": profiles_json,
+        "union_coverage_roots": all_profile_paths,
+        "coverage_gaps": gaps_json,
+        "git_changes_outside_coverage": outside_json,
+        "freshness": freshness_text.trim(),
+        "stale": freshness_text.contains("STALE") || !stale_obs_json.is_empty(),
+        "observation_links": {
+            "total": obs_total,
+            "stale_count": stale_obs_json.len(),
+            "stale_anchors": stale_obs_json,
+        },
+        "scip": {
+            "state": scip_st.state,
+            "index_path": scip_st.index_path.as_ref().map(|p| p.display().to_string()),
+            "tool": scip_st.tool_name,
+            "fingerprint": scip_st.fingerprint,
+            "tools": {
+                "rust_analyzer": scip_st.tools.rust_analyzer.is_some(),
+                "scip_clang": scip_st.tools.scip_clang.is_some(),
+                "clangd": scip_st.tools.clangd.is_some(),
+            },
+            "manifests": {
+                "compile_commands": scip_st.manifests.compile_commands_path,
+                "compile_commands_sha": scip_st.manifests.compile_commands_sha,
+                "cargo_lock": scip_st.manifests.cargo_lock_path,
+                "cargo_lock_sha": scip_st.manifests.cargo_lock_sha,
+            },
+            "edges": scip_st.edge_counts,
+        },
+    });
 
     let cfg = std::fs::metadata(root.join(".wordkeep/config.json"))
         .map(|m| m.len())
@@ -302,7 +439,7 @@ fn health_build(root: &Path, gitref: &str) -> Result<(String, u64), String> {
     let baseline = ((cfg + changed_bytes + sample_bytes) / 4)
         .max((out.len() / 4) as u64)
         .max(64);
-    Ok((out, baseline))
+    Ok((out, structured, baseline))
 }
 
 /// Prefer `git ls-files` (fast) under web/ + tools/; fall back to a capped walk.
@@ -333,8 +470,8 @@ fn sample_coverage_gaps(root: &Path, coverage: &[String]) -> (Vec<String>, u64) 
         if !base.is_dir() {
             continue;
         }
-        for entry in crate::walk::files(&base, &prune).take(HEALTH_SAMPLE_CAP) {
-            let path = entry.path();
+        for path in crate::walk::files(&base, &prune).into_iter().take(HEALTH_SAMPLE_CAP) {
+            let path = path.as_path();
             let Some(rel) = path.strip_prefix(root).ok() else {
                 continue;
             };
@@ -513,7 +650,9 @@ fn newest_cache_mtime(dir: &Path) -> Option<u64> {
     };
     for entry in rd.flatten() {
         let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+        let ext = path.extension().and_then(|e| e.to_str());
+        let is_cache = matches!(ext, Some("json") | Some("sqlite3") | Some("sqlite3-wal"));
+        if !is_cache {
             continue;
         }
         if let Ok(meta) = entry.metadata() {
@@ -521,14 +660,17 @@ fn newest_cache_mtime(dir: &Path) -> Option<u64> {
             best = Some(best.map_or(mt, |b: u64| b.max(mt)));
         }
     }
-    // Also scan one level of workspaces/
+    // Also scan one level of workspaces/ (SQLite store + JSON caches).
     let ws = dir.join("workspaces");
     if ws.is_dir() {
         if let Ok(rd) = std::fs::read_dir(&ws) {
             for entry in rd.flatten() {
                 if let Ok(rd2) = std::fs::read_dir(entry.path()) {
                     for f in rd2.flatten() {
-                        if f.path().extension().and_then(|e| e.to_str()) == Some("json") {
+                        let p = f.path();
+                        let ext = p.extension().and_then(|e| e.to_str());
+                        let is_cache = matches!(ext, Some("json") | Some("sqlite3") | Some("sqlite3-wal"));
+                        if is_cache {
                             if let Ok(meta) = f.metadata() {
                                 let mt = cache::mtime_ns(&meta);
                                 best = Some(best.map_or(mt, |b: u64| b.max(mt)));
@@ -596,6 +738,10 @@ mod tests {
             out.contains("Coverage gaps") || out.contains("tools/"),
             "{out}"
         );
+        assert!(out.contains("SCIP / Semantic overlay"), "{out}");
+        assert!(out.contains("rust-analyzer"), "{out}");
+        assert!(out.contains("scip-clang"), "{out}");
+        assert!(out.contains("clangd"), "{out}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

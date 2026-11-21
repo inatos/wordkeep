@@ -67,12 +67,16 @@ pub const PRECISION_GATE_10X: f64 = 0.97;
 
 /// 5×7 monospace glyph bitmaps for printable ASCII (space..~).
 /// Rows are bitmasks; bit 4 is leftmost column.
+/// Dense layout (`CELL_PAD_X = 1`, `CELL_PAD_Y = 0`, `PAGE_MARGIN_PX = 4`) gives
+/// 84×72 = 6,048 cells on `Tiny` (512², 64 vision tokens), fitting ~640-token
+/// pages cleanly at 10× without premature clipping while preserving 1px column gaps.
 const FONT_W: u32 = 5;
 const FONT_H: u32 = 7;
 const CELL_PAD_X: u32 = 1;
-const CELL_PAD_Y: u32 = 1;
+const CELL_PAD_Y: u32 = 0;
 const CELL_W: u32 = FONT_W + CELL_PAD_X;
 const CELL_H: u32 = FONT_H + CELL_PAD_Y;
+const PAGE_MARGIN_PX: u32 = 4;
 
 fn glyph_bits(ch: char) -> Option<[u8; 7]> {
     // Compact subset: digits, letters, and common punctuation for docs/code.
@@ -229,9 +233,36 @@ pub struct RenderedPage {
     pub ratio: f64,
     pub cols: u32,
     pub rows: u32,
+    pub nonce: String,
 }
 
-// Fields are consumed by eval / MCP callers; bin dead_code lint ignores lib usage.
+/// Normalize common UTF-8 Markdown punctuation into lossless ASCII equivalents
+/// before falling back to `'?'`, preserving prose/arrow/operator fidelity on the 5×7 grid.
+pub fn normalize_for_glyph_grid(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for ch in input.chars() {
+        match ch {
+            '\n' | '\r' => out.push(ch),
+            '\t' => out.push_str("  "),
+            c if (0x20..=0x7e).contains(&(c as u32)) => out.push(c),
+            '→' => out.push_str("->"),
+            '←' => out.push_str("<-"),
+            '↔' => out.push_str("<->"),
+            '—' | '–' => out.push_str("--"),
+            '≤' => out.push_str("<="),
+            '≥' => out.push_str(">="),
+            '×' => out.push('x'),
+            '≈' => out.push('~'),
+            '≠' => out.push_str("!="),
+            '…' => out.push_str("..."),
+            '•' | '·' => out.push('*'),
+            '“' | '”' => out.push('"'),
+            '‘' | '’' => out.push('\''),
+            _ => out.push('?'),
+        }
+    }
+    out
+}
 
 /// Render markdown/code as a single-layout monospace page PNG + JSON sidecar.
 pub fn render_doc_page(
@@ -241,7 +272,7 @@ pub fn render_doc_page(
     title: Option<&str>,
 ) -> Result<RenderedPage, String> {
     let edge = mode.edge_px();
-    let margin = 8u32;
+    let margin = PAGE_MARGIN_PX;
     let usable_w = edge.saturating_sub(margin * 2);
     let usable_h = edge.saturating_sub(margin * 2);
     let cols = (usable_w / CELL_W).max(1);
@@ -249,19 +280,22 @@ pub fn render_doc_page(
 
     let mut lines: Vec<String> = Vec::new();
     if let Some(t) = title {
-        lines.push(format!("# {t}"));
-        lines.push(String::new());
+        lines.push(format!("# {}", normalize_for_glyph_grid(t)));
     }
-    for raw in text.lines() {
-        let sanitized: String = raw
-            .chars()
-            .map(|c| if (0x20..=0x7e).contains(&(c as u8)) { c } else { '?' })
-            .collect();
+    let normalized = normalize_for_glyph_grid(text);
+    let mut prev_blank = false;
+    for raw in normalized.lines() {
+        let sanitized = raw.trim_end();
         if sanitized.is_empty() {
-            lines.push(String::new());
+            // Coalesce runs of blank lines to maximize vertical density.
+            if !prev_blank && !lines.is_empty() {
+                lines.push(String::new());
+                prev_blank = true;
+            }
             continue;
         }
-        let mut rest = sanitized.as_str();
+        prev_blank = false;
+        let mut rest = sanitized;
         while !rest.is_empty() {
             let take = rest.chars().take(cols as usize).collect::<String>();
             let n = take.len();
@@ -269,9 +303,10 @@ pub fn render_doc_page(
             rest = &rest[n..];
         }
     }
+    let overflowed = lines.len() > rows as usize;
     // Fit into page rows (single layout — overflow truncated with marker).
     let mut page_lines: Vec<String> = lines.into_iter().take(rows as usize).collect();
-    if page_lines.len() as u32 >= rows && text.lines().count() > rows as usize {
+    if overflowed {
         if let Some(last) = page_lines.last_mut() {
             *last = "...(truncated)".to_string();
         }
@@ -314,17 +349,25 @@ pub fn render_doc_page(
     let text_tokens = approx_tokens(&page_text);
     let vision_tokens = mode.vision_tokens();
     let ratio = compression_ratio(text_tokens, vision_tokens);
+    let nonce = out_png
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .and_then(|s| s.rsplit_once('_').map(|(_, n)| n.to_string()))
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(fresh_nonce);
 
     let sidecar_path = out_png.with_extension("page.json");
     let meta = json!({
         "v": 1,
         "mode": mode.as_str(),
+        "nonce": nonce,
         "edge_px": edge,
         "cols": cols,
         "rows": rows,
         "text_tokens": text_tokens,
         "vision_tokens": vision_tokens,
         "ratio": ratio,
+        "overflowed": overflowed,
         "text": page_text,
         "png": out_png.display().to_string(),
     });
@@ -341,6 +384,7 @@ pub fn render_doc_page(
         ratio,
         cols,
         rows,
+        nonce,
     })
 }
 
@@ -366,7 +410,7 @@ pub fn glyph_ocr_decode(png: &Path, cols: u32, rows: u32) -> Result<String, Stri
     let img = image::open(png)
         .map_err(|e| format!("open {}: {e}", png.display()))?
         .to_rgba8();
-    let margin = 8u32;
+    let margin = PAGE_MARGIN_PX;
     let mut lines = Vec::with_capacity(rows as usize);
     for row in 0..rows {
         let mut s = String::with_capacity(cols as usize);
@@ -434,7 +478,36 @@ pub fn decode_precision(ground: &str, decoded: &str) -> f64 {
     ok as f64 / n as f64
 }
 
+/// Honest source-level precision comparing decoded text (stripping synthetic page title)
+/// against raw ground-truth UTF-8 `raw_source` so non-ASCII `'?'` loss or truncation
+/// is never masked by comparing only against the already-sanitized `page.text`.
+pub fn ground_precision(raw_source: &str, decoded: &str, title_stripped: Option<&str>) -> f64 {
+    let mut decoded_body = decoded.trim();
+    if let Some(t) = title_stripped {
+        let header = format!("# {}", normalize_for_glyph_grid(t));
+        if let Some(rest) = decoded_body.strip_prefix(&header) {
+            decoded_body = rest.trim_start();
+        }
+    }
+    // Compare non-whitespace character streams so hard column wrapping at `cols`
+    // is not penalized while any dropped/corrupted/UTF-8-replaced glyph IS penalized.
+    let g: Vec<char> = raw_source.chars().filter(|c| !c.is_whitespace()).collect();
+    let d: Vec<char> = decoded_body.chars().filter(|c| !c.is_whitespace()).collect();
+    if g.is_empty() {
+        return if d.is_empty() { 1.0 } else { 0.0 };
+    }
+    let n = g.len().max(d.len());
+    let mut ok = 0usize;
+    for i in 0..n {
+        if g.get(i) == d.get(i) {
+            ok += 1;
+        }
+    }
+    ok as f64 / n as f64
+}
+
 /// Simulate higher compression by downscaling then upscaling (blur) before OCR.
+#[allow(dead_code)]
 pub fn precision_at_ratio(
     text: &str,
     work_dir: &Path,
@@ -472,7 +545,9 @@ pub fn precision_at_ratio(
     }
 
     let decoded = glyph_ocr_decode(&page.png_path, page.cols, page.rows)?;
-    let precision = decode_precision(&page.text, &decoded);
+    let grid_p = decode_precision(&page.text, &decoded);
+    let raw_p = ground_precision(text, &decoded, Some("oct-eval"));
+    let precision = grid_p.min(raw_p);
     let ratio = if target_ratio > 10.0 && target_ratio > actual {
         target_ratio
     } else {
@@ -566,22 +641,25 @@ pub fn render_pages(
 ) -> Result<(Vec<RenderedPage>, bool), String> {
     fs::create_dir_all(out_dir).map_err(|e| e.to_string())?;
     let edge = mode.edge_px();
-    let margin = 8u32;
+    let margin = PAGE_MARGIN_PX;
     let cols = ((edge.saturating_sub(margin * 2)) / CELL_W).max(1);
     let rows = ((edge.saturating_sub(margin * 2)) / CELL_H).max(1);
-    let body_rows = rows.saturating_sub(2).max(1); // leave room for title + blank
+    let body_rows = rows.saturating_sub(1).max(1); // leave room for `# title` row
 
+    let normalized = normalize_for_glyph_grid(text);
     let mut wrapped: Vec<String> = Vec::new();
-    for raw in text.lines() {
-        let sanitized: String = raw
-            .chars()
-            .map(|c| if (0x20..=0x7e).contains(&(c as u8)) { c } else { '?' })
-            .collect();
+    let mut prev_blank = false;
+    for raw in normalized.lines() {
+        let sanitized = raw.trim_end();
         if sanitized.is_empty() {
-            wrapped.push(String::new());
+            if !prev_blank && !wrapped.is_empty() {
+                wrapped.push(String::new());
+                prev_blank = true;
+            }
             continue;
         }
-        let mut rest = sanitized.as_str();
+        prev_blank = false;
+        let mut rest = sanitized;
         while !rest.is_empty() {
             let take = rest.chars().take(cols as usize).collect::<String>();
             let n = take.len();
@@ -635,7 +713,11 @@ pub fn ocr_decode_page(
     let peer_ready = copper_health::prefer_copper_cached(root);
     if prefer_gpu && peer_ready {
         match try_deepseek_ocr_task(root, &page.png_path) {
-            Ok(r) => Ok((r.text, r.backend.clone(), Some(r.backend))),
+            Ok(r) => Ok((
+                r.text,
+                r.backend.clone(),
+                Some(format!("{} nonce={}", r.backend, r.nonce)),
+            )),
             Err(e) => {
                 let text = glyph_ocr_decode(&page.png_path, page.cols, page.rows)?;
                 Ok((text, "glyph-ocr".into(), Some(format!("gpu-err:{e}"))))
@@ -684,7 +766,16 @@ pub fn compress_hits(
 
     // Hard policy: if ratio would exceed max without forcing, fall back to exact text.
     if ratio > policy.max_ratio + 0.01 && policy.mode.is_none() {
-        stats::record_optical(false, ratio, 0.0);
+        stats::record_optical_event(stats::OpticalTelemetry {
+            used_optical_path: false,
+            from_mas: false,
+            ratio,
+            precision: 1.0,
+            pages: 0,
+            clipped: false,
+            nonce_verified: false,
+            nonce: None,
+        });
         return Ok(OpticalHitBundle {
             pages: Vec::new(),
             decoded_text: corpus,
@@ -718,6 +809,8 @@ pub fn compress_hits(
 
     let mut backend = "glyph-ocr".to_string();
     let mut receipt_backend = None;
+    let mut nonce_verified = false;
+    let mut observed_nonce = Some(page.nonce.clone());
     let mut fallback = false;
     let mut fallback_reason = None;
     if clipped {
@@ -732,7 +825,9 @@ pub fn compress_hits(
             Ok(r) => {
                 // Honest label: sidecar is not GPU OCR.
                 backend = r.backend.clone();
-                receipt_backend = Some(r.backend.clone());
+                nonce_verified = true;
+                observed_nonce = Some(r.nonce.clone());
+                receipt_backend = Some(format!("{} nonce={}", r.backend, r.nonce));
                 if r.backend != "deepseek-ocr" {
                     fallback = true;
                     fallback_reason = Some(format!(
@@ -756,31 +851,44 @@ pub fn compress_hits(
         glyph_ocr_decode(&page.png_path, page.cols, page.rows)?
     };
 
-    let precision = decode_precision(&page.text, &decoded);
+    let grid_precision = decode_precision(&page.text, &decoded);
+    let raw_precision = ground_precision(&corpus, &decoded, Some("knowledge_search"));
+    let precision = grid_precision.min(raw_precision);
     // Exact drill-down if precision fails the 10× gate.
     if precision < PRECISION_GATE_10X && page.ratio <= policy.max_ratio {
         fallback = true;
         fallback_reason = Some(format!(
             "precision {precision:.3} < {PRECISION_GATE_10X} — exact text attached"
         ));
-        decoded = page.text.clone();
+        decoded = corpus.clone();
         backend = format!("{backend}+exact");
     }
     if clipped {
         // Attach full corpus so clipped skim never silently drops SoT.
         decoded = corpus.clone();
-        backend = format!("{backend}+exact");
+        if !backend.ends_with("+exact") {
+            backend = format!("{backend}+exact");
+        }
     }
 
     // Only count as GPU optical success when receipt says deepseek-ocr and no fallback.
     let gpu_ok = !fallback && backend == "deepseek-ocr";
-    stats::record_optical(gpu_ok, page.ratio, precision);
+    stats::record_optical_event(stats::OpticalTelemetry {
+        used_optical_path: gpu_ok,
+        from_mas: false,
+        ratio: page.ratio,
+        precision,
+        pages: pages.len() as u64,
+        clipped,
+        nonce_verified,
+        nonce: observed_nonce,
+    });
 
     Ok(OpticalHitBundle {
-        png_paths: vec![page.png_path.display().to_string()],
+        png_paths: pages.iter().map(|p| p.png_path.display().to_string()).collect(),
         ratio: page.ratio,
         precision: Some(precision),
-        pages: vec![page],
+        pages,
         decoded_text: decoded,
         backend,
         receipt_backend,
@@ -904,8 +1012,11 @@ pub fn format_optical_section(bundle: &OpticalHitBundle) -> String {
     let mut out = String::new();
     out.push_str("\n---\n");
     out.push_str(&format!(
-        "optical: backend={} ratio={:.2}x fallback={}",
-        bundle.backend, bundle.ratio, bundle.fallback
+        "optical: backend={} ratio={:.2}x fallback={} pages={}",
+        bundle.backend,
+        bundle.ratio,
+        bundle.fallback,
+        bundle.pages.len()
     ));
     if let Some(p) = bundle.precision {
         out.push_str(&format!(" precision={p:.3}"));
@@ -919,6 +1030,20 @@ pub fn format_optical_section(bundle: &OpticalHitBundle) -> String {
     out.push('\n');
     if let Some(r) = &bundle.fallback_reason {
         out.push_str(&format!("optical_fallback: {r}\n"));
+    }
+    for (i, page) in bundle.pages.iter().enumerate() {
+        out.push_str(&format!(
+            "optical_page[{i}]: {} sidecar={} mode={} tokens={}/{} ratio={:.2}x {}x{} nonce={}\n",
+            page.png_path.display(),
+            page.sidecar_path.display(),
+            page.mode.as_str(),
+            page.text_tokens,
+            page.vision_tokens,
+            page.ratio,
+            page.cols,
+            page.rows,
+            page.nonce
+        ));
     }
     for p in &bundle.png_paths {
         out.push_str(&format!("optical_png: {p}\n"));
@@ -937,6 +1062,13 @@ pub fn policy_allows_optical(max_ratio: f64, estimated_ratio: f64, is_code_signa
         return false;
     }
     estimated_ratio <= max_ratio + 1e-6
+}
+
+/// Snapshot of OCT counters (`calls`, `mas_calls`, `fallback_calls`, `pages`, `clipped_calls`,
+/// `nonce_verified_calls`, `last_nonce`, `avg_ratio`, `avg_precision`).
+#[allow(dead_code)]
+pub fn telemetry_snapshot() -> Value {
+    stats::optical_json()
 }
 
 #[cfg(test)]

@@ -8,6 +8,7 @@ mod izakaya;
 mod meili;
 mod providers;
 mod runtime;
+mod search_backend;
 mod semif;
 mod shrift;
 mod telemetry;
@@ -15,7 +16,7 @@ mod web;
 
 use clap::{Parser, Subcommand};
 use config::WikiConfig;
-use meili::MeiliClient;
+use search_backend::SearchBackend;
 use serde_json::json;
 use std::path::PathBuf;
 
@@ -76,15 +77,11 @@ pub async fn run() -> Result<(), String> {
         .canonicalize()
         .map_err(|error| format!("canonicalize {}: {error}", cli.root.display()))?;
     let config = WikiConfig::load(&root)?;
-    let meili = MeiliClient::new(
-        config.meili_url.clone(),
-        config.meili_key.clone(),
-        config.index_uid.clone(),
-    )?;
+    let search = SearchBackend::from_config(&root, &config)?;
 
     match cli.command {
         Command::Index { full } => {
-            let summary = indexer::index_workspace(&root, &config, &meili, full).await?;
+            let summary = indexer::index_workspace(&root, &config, &search, full).await?;
             println!(
                 "{}",
                 serde_json::to_string_pretty(&summary)
@@ -92,7 +89,7 @@ pub async fn run() -> Result<(), String> {
             );
             Ok(())
         }
-        Command::Watch => indexer::watch_workspace(root, config, meili).await,
+        Command::Watch => indexer::watch_workspace(root, config, search).await,
         Command::Serve {
             bind,
             watch,
@@ -103,7 +100,7 @@ pub async fn run() -> Result<(), String> {
             web::serve(
                 root,
                 config,
-                meili,
+                search,
                 &bind,
                 allow_non_loopback,
                 watch,
@@ -112,12 +109,13 @@ pub async fn run() -> Result<(), String> {
             .await
         }
         Command::Status => {
-            let health = meili.health().await;
-            let index = meili.index_stats().await;
+            let health = search.health().await;
+            let index = search.index_stats().await;
             let manifest = indexer::load_manifest(&root)?;
             let chunks: usize = manifest.values().map(|entry| entry.chunk_ids.len()).sum();
             let output = json!({
                 "root": root,
+                "search_backend": search.backend_name(),
                 "meilisearch": {
                     "health": result_value(health),
                     "index": result_value(index)

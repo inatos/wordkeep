@@ -99,6 +99,7 @@ mod digest;
 mod diff_map;
 mod doc_comment;
 mod effect_journal;
+mod embed;
 mod include_graph;
 mod incremental;
 mod index_stale;
@@ -116,6 +117,7 @@ mod progress;
 mod repo_map;
 mod runs;
 mod runtime;
+mod scip;
 mod semif;
 mod semif_cascade;
 mod semif_debias;
@@ -126,6 +128,7 @@ mod semif_visual;
 mod session_pressure;
 mod shrift;
 mod stats;
+mod store;
 mod tacet;
 mod task_lan;
 mod symbol_context;
@@ -350,6 +353,8 @@ fn main() {
                                  "description": "Case-insensitive substring filter on file path. With mode auto, also selects symbols mode." },
                     "mode": { "type": "string", "enum": ["auto", "files", "symbols"],
                               "description": "auto (default): files-first unless pattern is set; files = paths+counts; symbols = full signatures." },
+                    "rank": { "type": "string", "enum": ["alpha", "pagerank"],
+                              "description": "File ordering: \"alpha\" (default deterministic walk order) or \"pagerank\" (Personalized PageRank + git recency)." },
                     "expand": { "type": "array", "items": { "type": "string" },
                                 "description": "Relative file paths to fully expand with symbols even in files mode." },
                     "token_budget": { "type": "integer",
@@ -363,10 +368,11 @@ fn main() {
             name: "outline",
             description: "Token-budgeted TABLE OF CONTENTS for a SINGLE file (or a small files[] \
                           batch under one budget): top-level namespaces, types, and function \
-                          signatures, each with a line number, in source order. Use it to jump \
+                          signatures, or Markdown heading TOC + frontmatter summary (.md/.mdc/.markdown), \
+                          each with line numbers/ranges in source order. Use it to jump \
                           straight to a definition (read just that line range) instead of reading \
                           the whole file. Covers C/C++, GLSL, Rust, Python, TypeScript/TSX/Svelte, \
-                          C#, and Daslang. Accepts basename or profile/paths when resolving.",
+                          C#, Daslang, and Markdown. Accepts basename or profile/paths when resolving.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -382,6 +388,8 @@ fn main() {
                                  "description": "Named path_profiles entry for basename resolution." },
                     "token_budget": { "type": "integer",
                                       "description": "Approx max tokens to return. Default 2400." },
+                    "if_none_match": { "type": "string",
+                                       "description": "Optional ETag from a prior outline call; returns 1-line unchanged (etag=...) when source hashes match." },
                     "continuation": continuation::schema_prop()
                 }
             }),
@@ -429,7 +437,9 @@ fn main() {
                     "profile": { "type": "string",
                                  "description": "Named path_profiles entry (ignored when paths is set)." },
                     "max": { "type": "integer",
-                             "description": "Max suggestions to list on miss. Default 8." }
+                             "description": "Max suggestions to list on miss. Default 8." },
+                    "semantic": { "type": "boolean",
+                                  "description": "Allow potion-code-16M-v2 semantic fallback alongside FTS5 when exact and fuzzy lookup miss (requires --features semantic-m2v or embeddings). Default true." }
                 },
                 "required": ["symbol"]
             }),
@@ -521,6 +531,8 @@ fn main() {
                     "max": { "type": "integer", "description": "Max callers/callees to list before a continuation page. Default 8." },
                     "token_budget": { "type": "integer",
                                       "description": "Approx max tokens to return. Default 1600." },
+                    "if_none_match": { "type": "string",
+                                       "description": "Optional ETag from a prior symbol_context call; returns 1-line unchanged (etag=...) when source/graph hashes match." },
                     "continuation": continuation::schema_prop()
                 },
                 "required": ["symbol"]
@@ -702,19 +714,25 @@ fn main() {
             description: "Dump the FIELDS of a struct/class/union (C/C++ or Rust) in declaration \
                           order - each field's type and name - and flag members that look non-POD \
                           (std::string/vector/map, smart pointers, std::function, virtuals, Rust \
-                          String/Vec/Box/Rc). Use it to check struct/class fields stay POD-friendly or \
-                          to understand a type's memory shape before changing it.",
+                          String/Vec/Box/Rc). Accepts type, symbol, or name. Use it to check \
+                          struct/class fields stay POD-friendly or to understand a type's memory \
+                          shape before changing it.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "type": { "type": "string",
-                              "description": "Type name to lay out (struct/class/union)." },
+                              "description": "Type name to lay out (struct/class/union). Aliases: symbol, name." },
+                    "symbol": { "type": "string",
+                                "description": "Alias for type." },
+                    "name": { "type": "string",
+                              "description": "Alias for type." },
                     "paths": { "type": "array", "items": { "type": "string" },
                                "description": "Subdirs (relative to root) to search. Default: .wordkeep/config.json default_paths, else src only." },
+                    "profile": { "type": "string",
+                                 "description": "Named path_profiles entry (ignored when paths is set)." },
                     "token_budget": { "type": "integer",
                                       "description": "Approx max tokens to return. Default 1200." }
-                },
-                "required": ["type"]
+                }
             }),
             handler: Box::new(move |args| type_layout::build(&root_layout, args)),
         },
@@ -743,7 +761,7 @@ fn main() {
         },
         mcp::Tool {
             name: "test_map",
-            description: "Given a symbol, list the TEST files that reference it (definitions, \
+            description: "Given a symbol (or name alias), list the TEST files that reference it (definitions, \
                           calls, refs), ranked by hit count, so you can run the narrowest relevant \
                           suite instead of everything. Reuses the symbol_refs tree-sitter classifier, \
                           scoped to the test tree (default [\"tests\"]). Optional \"tags\" filters to \
@@ -752,16 +770,19 @@ fn main() {
                 "type": "object",
                 "properties": {
                     "symbol": { "type": "string",
-                                "description": "Symbol the tests should reference." },
+                                "description": "Symbol the tests should reference. Alias: name." },
+                    "name": { "type": "string",
+                              "description": "Alias for symbol." },
                     "paths": { "type": "array", "items": { "type": "string" },
                                "description": "Test roots (relative to root). Default [\"tests\"]." },
+                    "profile": { "type": "string",
+                                 "description": "Named path_profiles entry (ignored when paths is set)." },
                     "tags": { "type": "array", "items": { "type": "string" },
                               "description": "Catch2 tag filter - file must contain all listed tags (e.g. [\"unit\"])." },
                     "max": { "type": "integer", "description": "Max test files to list. Default 40." },
                     "token_budget": { "type": "integer",
                                       "description": "Approx max tokens to return. Default 1200." }
-                },
-                "required": ["symbol"]
+                }
             }),
             handler: Box::new(move |args| test_map::build(&root_tests, args)),
         },
@@ -855,7 +876,7 @@ fn main() {
                     "token_budget": { "type": "integer",
                                       "description": "Approx max tokens to return. Default 1200." },
                     "semantic": { "type": "boolean",
-                                  "description": "Rerank BM25 hits with embeddings (only when built with --features embeddings). Default true. Without embeddings, semantic:true soft-falls back to SemIf heuristic rerank." },
+                                  "description": "Include dense vector leg in 3-way RRF alongside SQLite FTS5 + BM25 (uses potion-retrieval-32M under --features semantic-m2v, or legacy fastembed under --features embeddings). Default true. Without compiled embeddings, explicit semantic:true soft-falls back to SemIf heuristic rerank." },
                     "semif": { "type": "boolean",
                                "description": "Rerank BM25 head with SemIf heuristic scorer (semantic_decide). Default false. Distinct from embedding semantic." },
                     "optical": { "type": "boolean",
@@ -892,7 +913,7 @@ fn main() {
                     "token_budget": { "type": "integer",
                                       "description": "Approx max tokens for the whole answer+citations output. Default 1200." },
                     "semantic": { "type": "boolean",
-                                  "description": "Rerank BM25 hits with embeddings (only when built with --features embeddings). Default true. Without embeddings, semantic:true soft-falls back to SemIf heuristic rerank." },
+                                  "description": "Include dense vector leg in 3-way RRF alongside SQLite FTS5 + BM25 (uses potion-retrieval-32M under --features semantic-m2v, or legacy fastembed under --features embeddings). Default true. Without compiled embeddings, explicit semantic:true soft-falls back to SemIf heuristic rerank." },
                     "semif": { "type": "boolean",
                                "description": "Rerank BM25 head with SemIf heuristic scorer. Default false." }
                 },
@@ -997,8 +1018,8 @@ fn main() {
                 "properties": {
                     "method": {
                         "type": "string",
-                        "enum": ["check", "lint", "schema", "run", "test", "decide", "stats"],
-                        "description": "check/lint/schema do not need GGUF. run/test/decide/stats need the serve binary + GGUF."
+                        "enum": ["check", "lint", "schema", "run", "test", "decide", "stats", "feedback"],
+                        "description": "check/lint/schema/feedback do not need GGUF. run/test/decide/stats use shared scorer or ereshkigal serve."
                     },
                     "lib": { "type": "string",
                              "description": "Decree library directory (default: semif.decrees)." },
@@ -1006,7 +1027,11 @@ fn main() {
                     "program": { "type": "string", "description": "Program name for method=run." },
                     "state": { "description": "JSON state for decide/run." },
                     "split": { "type": "string",
-                               "description": "Gold split for method=test (dev|test|all)." }
+                               "description": "Gold split for method=test (dev|test|all)." },
+                    "prompt_sha256": { "type": "string", "description": "Prompt digest for method=feedback." },
+                    "chosen": { "type": "string", "description": "Chosen option id for method=feedback." },
+                    "outcome": { "type": "string", "description": "Outcome label for method=feedback." },
+                    "override_id": { "type": "string", "description": "Optional override option id for method=feedback." }
                 },
                 "required": ["method"]
             }),
@@ -1149,12 +1174,19 @@ fn main() {
             name: "index_stale",
             description: "Detect when wordkeep on-disk indexes (call_graph, knowledge chunks) may lag \
                           git changes. Recommends rebuilding wordkeep and reloading the MCP client \
-                          when stale. Call after large diffs if symbol_refs shows 0 callers.",
+                          when stale. Pass mode:\"scip_refresh\" or refresh_scip:true to refresh the \
+                          SCIP semantic overlay (supports MCP async tasks).",
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "ref": { "type": "string",
-                             "description": "Git revision to compare against. Default \"HEAD\"." }
+                             "description": "Git revision to compare against. Default \"HEAD\"." },
+                    "mode": { "type": "string",
+                              "description": "Optional: \"health\" or \"scip_refresh\"." },
+                    "refresh_scip": { "type": "boolean",
+                                      "description": "Force SCIP overlay re-ingest." },
+                    "generate_scip": { "type": "boolean",
+                                       "description": "Run scip-clang / rust-analyzer scip before re-ingesting." }
                 }
             }),
             handler: Box::new(move |args| index_stale::check(&root_stale, args)),
@@ -1164,14 +1196,19 @@ fn main() {
             description: "Profile coverage health: list path_profiles (and which roots exist on disk), \
                           sample web/ and tools/ sources outside all profiles, suggest profile names \
                           for git changes outside coverage, and report proactive index staleness. \
-                          Also available as index_stale with mode:\"health\".",
+                          Pass mode:\"scip_refresh\" or refresh_scip:true to refresh SCIP overlay \
+                          (supports MCP async tasks).",
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "ref": { "type": "string",
                              "description": "Git revision for change/stale checks. Default \"HEAD\"." },
                     "mode": { "type": "string",
-                              "description": "Optional; \"health\" is implied for this tool." }
+                              "description": "Optional; \"health\" (default) or \"scip_refresh\"." },
+                    "refresh_scip": { "type": "boolean",
+                                      "description": "Force SCIP overlay re-ingest before health report." },
+                    "generate_scip": { "type": "boolean",
+                                       "description": "Run scip-clang / rust-analyzer scip before re-ingesting." }
                 }
             }),
             handler: Box::new(move |args| index_stale::health(&root_index_health, args)),
@@ -1326,7 +1363,7 @@ fn main() {
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "session": { "type": "string", "description": "MAS session slug. Required." },
+                    "session": { "type": "string", "description": "Optional MAS session slug; defaults to latest workspace session or workspace-level handoff when omitted." },
                     "result": { "type": "string", "description": "Optional goal/result override." },
                     "finalize": { "type": "boolean", "description": "Also finalize the session. Default false." },
                     "promote": { "type": "boolean", "description": "When finalize, promote to notes." },
@@ -1345,8 +1382,7 @@ fn main() {
                                     "description": "Prefer Copper deepseek-ocr for timeline decode." },
                     "optical_max_pages": { "type": "integer",
                                           "description": "Max timeline PNG pages (default 4)." }
-                },
-                "required": ["session"]
+                }
             }),
             handler: Box::new(move |args| mas::session_handoff(&root_session_handoff, args)),
         },
@@ -1358,13 +1394,12 @@ fn main() {
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "session": { "type": "string", "description": "MAS session slug. Required." },
+                    "session": { "type": "string", "description": "Optional MAS session slug; defaults when omitted." },
                     "result": { "type": "string" },
                     "optical_mode": { "type": "string" },
                     "optical_gpu": { "type": "boolean" },
                     "optical_max_pages": { "type": "integer" }
-                },
-                "required": ["session"]
+                }
             }),
             handler: Box::new(move |args| mas::mas_timeline(&root_mas_timeline, args)),
         },
@@ -1614,14 +1649,20 @@ fn main() {
         mcp::Tool {
             name: "commit_scope",
             description: "Read-only: group git status --porcelain paths by configured commit_scopes \
-                          and warn about secrets, generated dirs, binaries, and large files. \
-                          Skips commit_ignore prefixes (default .cache/, target/, node_modules/). \
-                          Never stages or commits.",
+                          (collapsing large per-scope file lists) and warn about secrets, generated \
+                          dirs, binaries, and large files. Supports token_budget (default 1600) and \
+                          continuation paging. Skips commit_ignore prefixes (default .cache/, target/, \
+                          node_modules/). Never stages or commits.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "large_file_bytes": { "type": "integer",
-                                          "description": "Override large-file warning threshold." }
+                                          "description": "Override large-file warning threshold." },
+                    "max_per_scope": { "type": "integer",
+                                       "description": "Max tracked files shown per scope before collapsing to directory counts. Default 20." },
+                    "token_budget": { "type": "integer",
+                                      "description": "Approx max tokens per page. Default 1600." },
+                    "continuation": continuation::schema_prop()
                 }
             }),
             handler: Box::new(move |args| commit_scope::propose(&root_commit_scope, args)),
@@ -1661,9 +1702,13 @@ fn main() {
     raw_tools.extend(task_lan::mcp_tools(root_task_lan));
     raw_tools.extend(izakaya::mcp_tools(root_izakaya));
 
+    let active_toolset = mcp::Toolset::from_env();
+    let discover_tool = mcp::build_tool_discover(&raw_tools, active_toolset);
+    raw_tools.push(discover_tool);
+
     stats::init_registry(raw_tools.iter().map(|t| t.name).collect());
 
-    let tools: Vec<mcp::Tool> = raw_tools
+    let all_tools: Vec<mcp::Tool> = raw_tools
         .into_iter()
         .map(|t| {
             let name = t.name;
@@ -1675,6 +1720,7 @@ fn main() {
             }
         })
         .collect();
+    let (tools, hidden_tools) = mcp::partition_tools(all_tools, active_toolset);
 
     const README_RESOURCE: &str = include_str!("../README.md");
     const CAPABILITIES_RESOURCE: &str = include_str!("../resources/capabilities.json");
@@ -1694,10 +1740,13 @@ fn main() {
             text: CAPABILITIES_RESOURCE,
         },
     ];
+    let resource_templates = mcp::default_resource_templates();
 
     let server = mcp::Server {
         tools,
+        hidden_tools,
         resources,
+        resource_templates,
         server_name: "wordkeep".to_string(),
         server_version: env!("CARGO_PKG_VERSION").to_string(),
         workspace_root: root_server,
@@ -1717,6 +1766,39 @@ fn main() {
             })
             .ok();
     }
+
+    // Initialize per-workspace SQLite store, emit one-time legacy JSON cleanup
+    // notice if old monolithic DiskMaps remain, and start debounced watcher in
+    // background so MCP startup stays instant.
+    if let Ok(st) = store::Store::open(&server.workspace_root) {
+        st.maybe_emit_legacy_cleanup_notice();
+    }
+    let watcher_disabled = std::env::var("WORDKEEP_DISABLE_WATCHER")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    let _watcher_stop = if !watcher_disabled {
+        let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+        let root_watch = server.workspace_root.clone();
+        let _ = std::thread::Builder::new()
+            .name("wordkeep-watcher".into())
+            .spawn(move || {
+                // Best-effort startup GC of deleted files in background.
+                if let Ok(st) = store::Store::open(&root_watch) {
+                    let _ = st.gc_missing_files();
+                }
+                match store::start_watcher(&root_watch, std::time::Duration::from_millis(250)) {
+                    Ok(_handle) => {
+                        let _ = stop_rx.recv();
+                    }
+                    Err(e) => {
+                        eprintln!("[wordkeep] watcher disabled: {e}");
+                    }
+                }
+            });
+        Some(stop_tx)
+    } else {
+        None
+    };
 
     if let Err(e) = server.run() {
         eprintln!("[wordkeep] fatal: {e}");

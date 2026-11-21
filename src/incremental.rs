@@ -43,6 +43,16 @@ fn store() -> &'static Mutex<HashMap<String, Warm>> {
 /// a full parse is done. Returns `None` only if the language has no grammar or
 /// the file cannot be read/parsed.
 pub fn parse(parser: &mut Parser, lang: Lang, path: &Path, mtime: u64) -> Option<(String, Tree)> {
+    parse_with_stats(parser, lang, path, mtime).map(|(src, tree, _, _)| (src, tree))
+}
+
+/// Like [`parse`], also returning `(cache_hit, bytes_read_from_disk)`.
+pub fn parse_with_stats(
+    parser: &mut Parser,
+    lang: Lang,
+    path: &Path,
+    mtime: u64,
+) -> Option<(String, Tree, bool, u64)> {
     let key = path.to_string_lossy().into_owned();
 
     // Warm hit: skip IO and parsing entirely.
@@ -50,7 +60,7 @@ pub fn parse(parser: &mut Parser, lang: Lang, path: &Path, mtime: u64) -> Option
         let map = store().lock().unwrap_or_else(|e| e.into_inner());
         if let Some(w) = map.get(&key) {
             if w.mtime == mtime {
-                return Some((w.src.clone(), w.tree.clone()));
+                return Some((w.src.clone(), w.tree.clone(), true, 0));
             }
         }
     }
@@ -60,6 +70,7 @@ pub fn parse(parser: &mut Parser, lang: Lang, path: &Path, mtime: u64) -> Option
         return None;
     }
     let raw = std::fs::read_to_string(path).ok()?;
+    let bytes_read = raw.len() as u64;
     let prepared = lang.preprocess(&raw).into_owned();
 
     // Grab a previous tree (if any) to seed an incremental re-parse.
@@ -92,7 +103,7 @@ pub fn parse(parser: &mut Parser, lang: Lang, path: &Path, mtime: u64) -> Option
             },
         );
     }
-    Some((prepared, tree))
+    Some((prepared, tree, false, bytes_read))
 }
 
 /// The single `InputEdit` spanning everything that changed between `old` and

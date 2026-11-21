@@ -13,7 +13,14 @@ use crate::{config, mas};
 pub fn status(root: &Path, args: &Value) -> Result<Value, String> {
     model::reject_unsafe_payload(args)?;
     let snap = store::read(root)?;
-    Ok(render_status(root, &snap.projection, &snap.events, args))
+    let journal_sha = store::journal_sha256(root);
+    Ok(render_status(
+        root,
+        &snap.projection,
+        &snap.events,
+        &journal_sha,
+        args,
+    ))
 }
 
 pub fn check_in(root: &Path, args: &Value) -> Result<Value, String> {
@@ -132,21 +139,7 @@ pub fn update(root: &Path, args: &Value) -> Result<Value, String> {
         return Ok(json!({"idempotent": true, "text": text, "agent_id": agent_id}));
     }
     let agent = live_agent(&snap.projection, &agent_id)?;
-    let lease = match required(args, "lease_id") {
-        Ok(lease) => lease,
-        Err(_) => {
-            return Err(format!(
-                "lease_id is required (agent {agent_id} current lease_id: {})",
-                agent.lease_id
-            ));
-        }
-    };
-    if agent.lease_id != lease {
-        return Err(format!(
-            "lease mismatch for agent {agent_id}: current lease_id is {} — resend that value",
-            agent.lease_id
-        ));
-    }
+    let lease = resolve_lease_id(args, &agent_id, agent)?;
     expect_revision(args, agent)?;
     let now = store::now_secs();
     let from = parse_state(&agent.state)?;
@@ -157,7 +150,7 @@ pub fn update(root: &Path, args: &Value) -> Result<Value, String> {
         .transpose()?
         .unwrap_or(from);
     if to == AgentState::CheckedOut {
-        return Err("use izakaya_check_out to leave; update cannot check out".into());
+        return check_out(root, args);
     }
     model::transition(from, to)?;
     let git = observe(root, args);
@@ -267,10 +260,7 @@ pub fn check_out(root: &Path, args: &Value) -> Result<Value, String> {
             "text": format!("izakaya_check_out - agent {agent_id} already checked out"),
         }));
     }
-    let lease = required(args, "lease_id")?;
-    if agent.lease_id != lease {
-        return Err(format!("lease mismatch for agent {agent_id}"));
-    }
+    let lease = resolve_lease_id(args, &agent_id, agent)?;
     expect_revision(args, agent)?;
     let handoff = args.get("handoff").filter(|v| !v.is_null()).cloned();
     let reason = if let Some(raw) = args.get("reason").and_then(Value::as_str) {
@@ -590,29 +580,89 @@ fn render_outcome(_proj: &Projection, event: &Event) -> Value {
     })
 }
 
-fn render_status(root: &Path, proj: &Projection, events: &[Event], args: &Value) -> Value {
+fn render_status(
+    root: &Path,
+    proj: &Projection,
+    events: &[Event],
+    journal_sha: &str,
+    args: &Value,
+) -> Value {
     let now = store::now_secs();
     let orphan_secs = config::izakaya_orphan_secs(root);
     let want_agent = args
         .get("agent")
         .and_then(Value::as_str)
         .or_else(|| args.get("agent_id").and_then(Value::as_str));
-    let want_state = args.get("state").and_then(Value::as_str);
+    let want_state_norm = args
+        .get("state")
+        .and_then(Value::as_str)
+        .map(|s| match s.trim().to_ascii_lowercase().as_str() {
+            "done" | "completed" => "checked_out".to_string(),
+            other => other.to_string(),
+        });
+    let want_state = want_state_norm.as_deref();
     let want_path = args.get("path").and_then(Value::as_str);
     let since = args.get("since_seq").and_then(Value::as_u64).unwrap_or(0);
     let include_out = flag(args, "include_checked_out") || want_state == Some("checked_out");
     let verbose = flag(args, "verbose");
+    let format = args.get("format").and_then(Value::as_str).unwrap_or("text");
+    let if_none_match = args.get("if_none_match").and_then(Value::as_str);
+
+    let stale: Vec<_> = proj
+        .agents
+        .values()
+        .filter(|a| {
+            AgentState::parse(&a.state)
+                .map(|s| model::is_stale(s, a.expires_at, now))
+                .unwrap_or(false)
+        })
+        .map(|a| a.agent_id.clone())
+        .collect();
+
+    let filters_key = format!(
+        "{}\0{}\0{}\0{since}\0{}\0{}\0{format}",
+        want_agent.unwrap_or(""),
+        want_state.unwrap_or(""),
+        want_path.unwrap_or(""),
+        include_out as u8,
+        verbose as u8,
+    );
+    let state_key = format!(
+        "{}\0{}\0{}\0{}",
+        proj.coordination_id,
+        proj.seq,
+        proj.malformed,
+        stale.join(","),
+    );
+    let etag = crate::store::etag_hex(&[
+        b"izakaya_status\0v1",
+        state_key.as_bytes(),
+        journal_sha.as_bytes(),
+        filters_key.as_bytes(),
+    ]);
+    if crate::store::etag_matches(if_none_match, &etag) {
+        return json!({
+            "unchanged": true,
+            "etag": etag,
+            "coordination_id": proj.coordination_id,
+            "seq": proj.seq,
+            "read_only": true,
+            "text": crate::store::unchanged_etag_line(&etag),
+        });
+    }
+
     let mut lines = vec![format!(
-        "izakaya_status - coordination {} seq {} (read-only)",
+        "izakaya_status - coordination {} seq {} (read-only) etag={etag}",
         proj.coordination_id, proj.seq
     )];
     if proj.malformed > 0 {
         lines.push(format!("malformed_events: {}", proj.malformed));
     }
     let mut listed = Vec::new();
+    let mut listed_json = Vec::new();
     for agent in proj.agents.values() {
         let state = AgentState::parse(&agent.state).unwrap_or(AgentState::CheckedIn);
-        let stale = model::is_stale(state, agent.expires_at, now);
+        let is_stale = model::is_stale(state, agent.expires_at, now);
         if let Some(id) = want_agent {
             if agent.agent_id != id {
                 continue;
@@ -620,14 +670,15 @@ fn render_status(root: &Path, proj: &Projection, events: &[Event], args: &Value)
         }
         if let Some(filter) = want_state {
             let matches = if filter == "stale" {
-                stale
+                is_stale
             } else {
                 agent.state == filter
             };
             if !matches {
                 continue;
             }
-        } else if (agent.state == "checked_out" && !include_out) || (stale && want_agent.is_none())
+        } else if (agent.state == "checked_out" && !include_out)
+            || (is_stale && want_agent.is_none())
         {
             continue;
         }
@@ -644,7 +695,16 @@ fn render_status(root: &Path, proj: &Projection, events: &[Event], args: &Value)
                 continue;
             }
         }
-        listed.push(agent_line(agent, stale));
+        listed.push(agent_line(agent, is_stale));
+        listed_json.push(json!({
+            "agent_id": agent.agent_id,
+            "state": agent.state,
+            "revision": agent.revision,
+            "expires_at": agent.expires_at,
+            "stale": is_stale,
+            "task": agent.task,
+            "claims": agent.claims.iter().map(|c| c.path.clone()).collect::<Vec<_>>(),
+        }));
     }
     if listed.is_empty() {
         lines.push("agents: (none active)".into());
@@ -652,16 +712,6 @@ fn render_status(root: &Path, proj: &Projection, events: &[Event], args: &Value)
         lines.push("agents:".into());
         lines.extend(listed);
     }
-    let stale: Vec<_> = proj
-        .agents
-        .values()
-        .filter(|a| {
-            AgentState::parse(&a.state)
-                .map(|s| model::is_stale(s, a.expires_at, now))
-                .unwrap_or(false)
-        })
-        .map(|a| a.agent_id.clone())
-        .collect();
     if verbose || stale.is_empty() {
         lines.push(format!(
             "stale: {}",
@@ -706,6 +756,7 @@ fn render_status(root: &Path, proj: &Projection, events: &[Event], args: &Value)
         .filter(|m| !m.acked)
         .map(|m| format!("  - #{} {} -> {}: {}", m.seq, m.from, m.to, m.body))
         .collect();
+    let unread_count = inbox.len();
     if inbox.is_empty() {
         // Quiet when there is nothing to say.
     } else if verbose {
@@ -713,8 +764,7 @@ fn render_status(root: &Path, proj: &Projection, events: &[Event], args: &Value)
         lines.extend(inbox);
     } else {
         lines.push(format!(
-            "messages: {} unread (verbose:true lists them)",
-            inbox.len()
+            "messages: {unread_count} unread (verbose:true lists them)"
         ));
     }
     let incremental: Vec<_> = events
@@ -738,9 +788,14 @@ fn render_status(root: &Path, proj: &Projection, events: &[Event], args: &Value)
     let text = lines.join("\n") + "\n";
     json!({
         "text": text,
+        "etag": etag,
         "coordination_id": proj.coordination_id,
         "seq": proj.seq,
+        "agents": listed_json,
         "stale": stale,
+        "handoff_count": proj.handoffs.len(),
+        "unread_messages": unread_count,
+        "advisory_policy": active_policy,
         "read_only": true,
     })
 }
@@ -902,6 +957,35 @@ fn live_agent<'a>(proj: &'a Projection, agent_id: &str) -> Result<&'a Agent, Str
     Ok(agent)
 }
 
+/// Resolve `lease_id` when omitted and `agent_id` has a single active lease.
+/// Explicit wrong `lease_id` values still fail with `lease mismatch`.
+fn resolve_lease_id(args: &Value, agent_id: &str, agent: &Agent) -> Result<String, String> {
+    let provided = args
+        .get("lease_id")
+        .or_else(|| args.get("lease"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    match provided {
+        Some(lease) => {
+            if agent.lease_id != lease {
+                return Err(format!(
+                    "lease mismatch for agent {agent_id}: current lease_id is {} — resend that value",
+                    agent.lease_id
+                ));
+            }
+            Ok(lease.to_string())
+        }
+        None => {
+            if agent.state != AgentState::CheckedOut.as_str() && !agent.lease_id.is_empty() {
+                Ok(agent.lease_id.clone())
+            } else {
+                Err(format!("lease_id is required for agent {agent_id}"))
+            }
+        }
+    }
+}
+
 fn expect_revision(args: &Value, agent: &Agent) -> Result<(), String> {
     if let Some(exp) = args.get("expected_revision").and_then(Value::as_u64) {
         if exp != agent.revision {
@@ -1014,7 +1098,11 @@ mod tests {
     }
 
     fn cleanup(root: &Path) {
-        std::env::remove_var("XDG_CACHE_HOME");
+        // Keep XDG_CACHE_HOME pointed at a temp dir instead of removing it so
+        // later unit tests never fall back to ~/.cache/wordkeep after ONCE ran.
+        let fallback = std::env::temp_dir().join(format!("wk_iza_p_post_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&fallback);
+        std::env::set_var("XDG_CACHE_HOME", &fallback);
         std::env::remove_var("WORDKEEP_IZAKAYA_NOW");
         std::env::remove_var("WORDKEEP_IZAKAYA_ORPHAN_SECS");
         let _ = std::fs::remove_dir_all(root);
@@ -1179,6 +1267,119 @@ mod tests {
         let snap = store::read(&root).unwrap();
         assert!(snap.projection.agents.contains_key("one"));
         assert!(snap.projection.agents.contains_key("two"));
+        cleanup(&root);
+    }
+
+    #[test]
+    fn auto_resolves_single_active_lease_and_aliases_done_state() {
+        let (_g, root) = isolated("autolease");
+        check_in(
+            &root,
+            &json!({"agent_id": "solo", "task": "ergonomics", "observe_git": false}),
+        )
+        .unwrap();
+
+        // Update without lease_id auto-resolves solo's active lease.
+        let upd = update(
+            &root,
+            &json!({"agent_id": "solo", "state": "live_code", "observe_git": false}),
+        )
+        .unwrap();
+        assert_eq!(upd["state"], "live_code", "{upd}");
+
+        // Explicit wrong lease_id still fails.
+        let bad = update(
+            &root,
+            &json!({"agent_id": "solo", "lease_id": "wrong-lease", "observe_git": false}),
+        );
+        assert!(bad.unwrap_err().contains("lease mismatch"));
+
+        // "done" state alias checks out cleanly without lease_id.
+        let done = update(
+            &root,
+            &json!({"agent_id": "solo", "state": "done", "observe_git": false}),
+        )
+        .unwrap();
+        assert_eq!(done["state"], "checked_out", "{done}");
+
+        // check_out without lease_id + reason="done" + status filter state="done" on retained handoff anchor.
+        check_in(
+            &root,
+            &json!({"agent_id": "duo", "task": "checkout", "observe_git": false}),
+        )
+        .unwrap();
+        let out = check_out(
+            &root,
+            &json!({
+                "agent_id": "duo",
+                "handoff": {"to": "trio", "summary": "continue"},
+            }),
+        )
+        .unwrap();
+        assert_eq!(out["state"], "checked_out", "{out}");
+        let done_board = status(&root, &json!({"state": "done"})).unwrap();
+        assert!(done_board["text"].as_str().unwrap().contains("duo"), "{done_board}");
+
+        check_in(
+            &root,
+            &json!({"agent_id": "trio", "task": "reason-done", "observe_git": false}),
+        )
+        .unwrap();
+        let out2 = check_out(&root, &json!({"agent_id": "trio", "reason": "done"})).unwrap();
+        assert_eq!(out2["state"], "checked_out", "{out2}");
+        cleanup(&root);
+    }
+
+    #[test]
+    fn izakaya_status_etag_hit_miss_and_journal_invalidation() {
+        let (_g, root) = isolated("etag");
+        let s1 = status(&root, &json!({})).unwrap();
+        let etag1 = s1["etag"].as_str().unwrap().to_string();
+        assert_eq!(etag1.len(), 16);
+        assert!(
+            s1["text"].as_str().unwrap().contains(&format!("etag={etag1}")),
+            "{s1}"
+        );
+
+        // Matching if_none_match returns 1-line unchanged (etag=...).
+        let hit = status(&root, &json!({ "if_none_match": etag1 })).unwrap();
+        assert_eq!(hit["unchanged"], true);
+        assert_eq!(
+            hit["text"].as_str().unwrap(),
+            format!("unchanged (etag={etag1})\n")
+        );
+
+        // Non-matching if_none_match returns full board.
+        let miss = status(&root, &json!({ "if_none_match": "0000000000000000" })).unwrap();
+        assert!(miss.get("unchanged").is_none());
+        assert!(miss["text"].as_str().unwrap().contains("izakaya_status -"));
+
+        // Appending a journal event invalidates the ETag.
+        check_in(
+            &root,
+            &json!({"agent_id": "alpha", "task": "etag-test", "ttl_secs": 10, "observe_git": false}),
+        )
+        .unwrap();
+        let s2 = status(&root, &json!({ "if_none_match": etag1 })).unwrap();
+        assert!(s2.get("unchanged").is_none(), "{s2}");
+        let etag2 = s2["etag"].as_str().unwrap().to_string();
+        assert_ne!(etag1, etag2);
+        assert!(s2["text"].as_str().unwrap().contains("alpha"), "{s2}");
+
+        // Second check with new ETag hits again.
+        let hit2 = status(&root, &json!({ "if_none_match": format!("etag={etag2}") })).unwrap();
+        assert_eq!(hit2["unchanged"], true);
+        assert_eq!(
+            hit2["text"].as_str().unwrap(),
+            format!("unchanged (etag={etag2})\n")
+        );
+
+        // Lease expiry also invalidates ETag even without new journal bytes.
+        std::env::set_var("WORDKEEP_IZAKAYA_NOW", "2000");
+        let s3 = status(&root, &json!({ "if_none_match": etag2 })).unwrap();
+        assert!(s3.get("unchanged").is_none(), "{s3}");
+        assert_ne!(s3["etag"].as_str().unwrap(), etag2);
+
         cleanup(&root);
     }
 }

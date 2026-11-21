@@ -915,6 +915,16 @@ pub fn read_events(root: &Path) -> Result<Vec<Event>, String> {
     load_events(&dir)
 }
 
+/// SHA-256 hex digest of the on-disk Izakaya journal (`events.ndjson`), or
+/// `"empty"` when no journal exists yet. Used by `izakaya_status` ETags.
+pub fn journal_sha256(root: &Path) -> String {
+    let path = events_path(&group_dir(root));
+    match std::fs::read(&path) {
+        Ok(bytes) => crate::store::sha256_bytes(&bytes),
+        Err(_) => "empty".to_string(),
+    }
+}
+
 /// Estimated tokens an agent would spend re-reading the live board without this tool.
 ///
 /// Credits projection size plus a capped journal tail — not the unbounded historical

@@ -12,17 +12,22 @@
 //! extractor is shared with `outline` (single file, with line numbers).
 
 use serde_json::Value;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::sync::{Mutex, OnceLock};
+use std::process::{Command, Stdio};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tree_sitter::{Node, Parser};
 
-use crate::cache::{self, DiskMap};
+use crate::cache;
+use crate::call_graph;
 use crate::continuation::{self, KIND_FILE_SKIP};
 use crate::lang::Lang;
+use crate::store::{Store, STAGE_REPO_MAP};
 use crate::{progress, stats, walk};
 
 const PER_FILE_CAP: usize = 40;
+/// Minimum matched files in a truncated `alpha` walk before suggesting `rank:"pagerank"`.
+const WIDE_TREE_MIN_FILES: usize = 8;
 
 /// Output density: files-first (paths + counts) vs full per-file symbol dumps.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -31,10 +36,29 @@ enum MapMode {
     Symbols,
 }
 
-/// Symbol cache keyed by absolute path; the stored mtime invalidates the entry
-/// when the file changes. Backed by a JSON file under the shared cache dir, so it
-/// is warm in-process *and* survives a cold spawn over a large tree.
-static SYMBOL_CACHE: OnceLock<Mutex<DiskMap>> = OnceLock::new();
+/// File ordering mode (`alpha` default for deterministic tests; `pagerank` for PPR + git recency).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RankMode {
+    Alpha,
+    PageRank,
+}
+
+fn resolve_rank(args: &Value) -> Result<RankMode, String> {
+    match args
+        .get("rank")
+        .and_then(Value::as_str)
+        .unwrap_or("alpha")
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "" | "alpha" => Ok(RankMode::Alpha),
+        "pagerank" | "pr" => Ok(RankMode::PageRank),
+        other => Err(format!(
+            "invalid repo_map rank '{other}'; expected \"alpha\" or \"pagerank\""
+        )),
+    }
+}
 
 fn normalize_rel(path: &str) -> String {
     path.replace('\\', "/").trim_start_matches("./").to_string()
@@ -83,13 +107,14 @@ fn map_budget(args: &Value, unfiltered: bool) -> usize {
 }
 
 pub fn build(root: &Path, args: &Value) -> Result<String, String> {
-    const FP_KEYS: &[&str] = &["paths", "profile", "mode", "expand", "pattern"];
+    const FP_KEYS: &[&str] = &["paths", "profile", "mode", "expand", "pattern", "rank"];
     let paths = crate::config::paths_from_args(root, args)?;
     let pattern = args
         .get("pattern")
         .and_then(Value::as_str)
         .map(str::to_lowercase);
     let mode = resolve_mode(args, &pattern);
+    let rank = resolve_rank(args)?;
     let expand = expand_set(args);
     let budget = map_budget(args, pattern.is_none() && expand.is_empty());
     let args_fp = continuation::args_fingerprint(args, FP_KEYS);
@@ -99,22 +124,20 @@ pub fn build(root: &Path, args: &Value) -> Result<String, String> {
     // starts language-less and is retargeted as the walk crosses languages.
     let mut parser = Parser::new();
 
-    let mut body = String::new();
-    let mut used_tokens = 0usize;
-    let mut files = 0usize;
-    let mut skipped_files = 0usize;
-    let mut truncated = false;
+    let mut collected: Vec<(String, Vec<String>, u64)> = Vec::new();
     let mut scanned_bytes = 0u64;
-    let mut any_expanded = false;
-    let mut walk_index = 0u64;
-    let mut resume_offset_out = 0u64;
+    let mut bytes_read = 0u64;
+    let mut cache_hits = 0u64;
+    let mut cache_misses = 0u64;
 
     let prune = walk::prune_set(root);
+    let store = Store::open(root).ok();
+    let mut pending: Vec<(String, Lang, u64, u64, Vec<String>)> = Vec::new();
     progress::tick(0, None, "repo_map: scanning");
     for p in &paths {
         let base = root.join(p);
-        for entry in walk::files(&base, &prune) {
-            let path = entry.path();
+        for path_owned in walk::files(&base, &prune) {
+            let path = path_owned.as_path();
             let Some(lang) = Lang::from_path(path) else {
                 continue;
             };
@@ -124,52 +147,116 @@ pub fn build(root: &Path, args: &Value) -> Result<String, String> {
                     continue;
                 }
             }
-            let Ok(meta) = entry.metadata() else { continue };
-            scanned_bytes += meta.len();
-            let symbols = cached_symbols(&mut parser, lang, path, cache::mtime_ns(&meta));
+            let Ok(meta) = path.metadata() else { continue };
+            let sz = meta.len();
+            let mt = cache::mtime_ns(&meta);
+            scanned_bytes += sz;
+            let (symbols, hit, disk_bytes) = cached_symbols_in(
+                store.as_ref(),
+                &mut pending,
+                &mut parser,
+                lang,
+                path,
+                &rel,
+                sz,
+                mt,
+            );
+            bytes_read += disk_bytes;
+            if hit {
+                cache_hits += 1;
+            } else {
+                cache_misses += 1;
+            }
             if symbols.is_empty() {
                 continue;
             }
+            collected.push((rel, symbols, mt));
+        }
+    }
 
-            // Matching file slot in walk order (empty-symbol files already skipped).
-            if walk_index < resume_at {
-                walk_index += 1;
-                continue;
-            }
+    // Persist any newly extracted symbols into the per-workspace SQLite store.
+    if !pending.is_empty() {
+        if let Some(st) = store.as_ref() {
+            let _ = st.with_immediate_tx(|s| {
+                for (rel, lang, mt, sz, syms) in &pending {
+                    let file_id = s.upsert_file(rel, *mt, *sz, lang.label())?;
+                    let payload = serde_json::to_string(syms).unwrap_or_else(|_| "[]".into());
+                    s.set_file_stage(file_id, STAGE_REPO_MAP, *mt, Some(&payload))?;
+                }
+                Ok(())
+            });
+        }
+    }
 
-            let expand_this = expand.contains(&rel);
-            let dump_symbols = mode == MapMode::Symbols || expand_this;
-            if expand_this {
-                any_expanded = true;
-            }
+    let pr_scores: Option<HashMap<String, f64>> = match rank {
+        RankMode::Alpha => {
+            collected.sort_by(|(rel_a, _, _), (rel_b, _, _)| rel_a.cmp(rel_b));
+            None
+        }
+        RankMode::PageRank if !collected.is_empty() => {
+            let scores = compute_personalized_pagerank(root, &paths, &collected, &expand);
+            collected.sort_by(|(rel_a, _, _), (rel_b, _, _)| {
+                let sa = scores.get(rel_a).copied().unwrap_or(0.0);
+                let sb = scores.get(rel_b).copied().unwrap_or(0.0);
+                sb.partial_cmp(&sa)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| rel_a.cmp(rel_b))
+            });
+            Some(scores)
+        }
+        RankMode::PageRank => None,
+    };
 
-            let block = if dump_symbols {
-                format_symbol_block(&rel, &symbols)
-            } else {
-                format!("\n{rel}  ({} symbols)\n", symbols.len())
-            };
+    let mut body = String::new();
+    let mut used_tokens = 0usize;
+    let mut files = 0usize;
+    let mut skipped_files = 0usize;
+    let mut truncated = false;
+    let mut any_expanded = false;
+    let mut walk_index = 0u64;
+    let mut resume_offset_out = 0u64;
+    let total_matched = collected.len();
 
-            let block_tokens = block.len() / 4; // rough chars-per-token estimate
-            if used_tokens + block_tokens > budget && files > 0 {
-                truncated = true;
-                resume_offset_out = walk_index;
-                skipped_files += 1;
-                // Count remaining matching files for the footer, without emitting.
-                walk_index += 1;
-                continue;
-            }
-            if truncated {
-                skipped_files += 1;
-                walk_index += 1;
-                continue;
-            }
-            used_tokens += block_tokens;
-            files += 1;
+    for (rel, symbols, _) in &collected {
+        if walk_index < resume_at {
             walk_index += 1;
-            body.push_str(&block);
-            if files % 32 == 0 {
-                progress::tick(files as u64, None, &format!("repo_map: {files} files"));
-            }
+            continue;
+        }
+        if truncated {
+            skipped_files += 1;
+            walk_index += 1;
+            continue;
+        }
+
+        let expand_this = expand.contains(rel);
+        let dump_symbols = mode == MapMode::Symbols || expand_this;
+        if expand_this {
+            any_expanded = true;
+        }
+
+        let block = if dump_symbols {
+            format_symbol_block(rel, symbols)
+        } else if let Some(ref scores) = pr_scores {
+            let sc = scores.get(rel).copied().unwrap_or(0.0);
+            format!("\n{rel}  [pr={sc:.4}] ({} symbols)\n", symbols.len())
+        } else {
+            format!("\n{rel}  ({} symbols)\n", symbols.len())
+        };
+
+        let block_tokens = block.len() / 4; // rough chars-per-token estimate
+        if used_tokens + block_tokens > budget && files > 0 {
+            truncated = true;
+            resume_offset_out = walk_index;
+            skipped_files += 1;
+            walk_index += 1;
+            continue;
+        }
+        used_tokens += block_tokens;
+        files += 1;
+        walk_index += 1;
+        body.push_str(&block);
+        if files % 32 == 0 {
+            progress::tick(files as u64, None, &format!("repo_map: {files} files"));
         }
     }
     progress::tick(
@@ -178,20 +265,27 @@ pub fn build(root: &Path, args: &Value) -> Result<String, String> {
         "repo_map: done",
     );
 
-    // Persist any newly extracted symbols so the next cold spawn is warm too.
-    if let Some(c) = SYMBOL_CACHE.get() {
-        if let Ok(mut store) = c.lock() {
-            store.save();
-        }
-    }
-
     if body.is_empty() && !truncated {
-        stats::record("repo_map", scanned_bytes / 4, 0);
+        stats::record_ext(
+            "repo_map",
+            stats::RecordMeta {
+                baseline: scanned_bytes / 4,
+                returned: 0,
+                bytes_read,
+                cache_hits,
+                cache_misses,
+                reason: None,
+            },
+        );
         return Ok(format!("repo_map: no source symbols found under {paths:?}"));
     }
     let mode_label = match mode {
         MapMode::Files => "files",
         MapMode::Symbols => "symbols",
+    };
+    let rank_note = match rank {
+        RankMode::Alpha => "",
+        RankMode::PageRank => ", rank=pagerank",
     };
     let page_note = if resume_at > 0 {
         format!(" [continuation from file #{resume_at}]")
@@ -204,7 +298,7 @@ pub fn build(root: &Path, args: &Value) -> Result<String, String> {
         String::new()
     };
     let mut header = format!(
-        "repo_map - {files} file(s), ~{used_tokens} tokens [{mode_label} mode]{page_note}{note}\nroots: {paths:?}"
+        "repo_map - {files} file(s), ~{used_tokens} tokens [{mode_label} mode{rank_note}]{page_note}{note}\nroots: {paths:?}"
     );
     if let Some(pat) = &pattern {
         header.push_str(&format!("\npattern: {pat}"));
@@ -225,35 +319,301 @@ pub fn build(root: &Path, args: &Value) -> Result<String, String> {
             KIND_FILE_SKIP,
             &format!("+{skipped_files} file(s) omitted"),
         );
+        if rank == RankMode::Alpha && total_matched >= WIDE_TREE_MIN_FILES {
+            out.push_str(
+                "hint: wide tree truncated — pass rank:\"pagerank\" to surface high-centrality + recently-touched files first\n",
+            );
+        }
     }
-    stats::record("repo_map", scanned_bytes / 4, (out.len() / 4) as u64);
+    stats::record_ext(
+        "repo_map",
+        stats::RecordMeta {
+            baseline: scanned_bytes / 4,
+            returned: (out.len() / 4) as u64,
+            bytes_read,
+            cache_hits,
+            cache_misses,
+            reason: None,
+        },
+    );
     Ok(out)
 }
 
-/// Return a file's symbols, reusing a cached parse when the on-disk mtime is
-/// unchanged. Falls back to a fresh read+`extract` on cache miss or stat failure.
-fn cached_symbols(parser: &mut Parser, lang: Lang, path: &Path, mtime_ns: u64) -> Vec<String> {
-    let key = path.to_string_lossy();
-    let cell = SYMBOL_CACHE.get_or_init(|| Mutex::new(DiskMap::load("repo_map-symbols.json")));
-    if let Ok(store) = cell.lock() {
-        if let Some(v) = store.get(key.as_ref(), mtime_ns) {
-            return v
-                .as_array()
-                .map(|a| {
-                    a.iter()
+/// Compute Personalized PageRank (damping 0.85) over file-level call edges,
+/// personalized by git-recency (recent commits + dirty working-tree files) and
+/// any explicit `expand` seed files.
+fn compute_personalized_pagerank(
+    root: &Path,
+    paths: &[String],
+    files: &[(String, Vec<String>, u64)],
+    expand_seeds: &HashSet<String>,
+) -> HashMap<String, f64> {
+    let n = files.len();
+    let mut idx_by_rel: HashMap<&str, usize> = HashMap::with_capacity(n);
+    for (i, (rel, _, _)) in files.iter().enumerate() {
+        idx_by_rel.insert(rel.as_str(), i);
+    }
+
+    let (commit_ts_map, dirty_set) = git_recency_signals(root);
+    let now_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let max_mtime = files.iter().map(|(_, _, mt)| *mt).max().unwrap_or(0);
+
+    // Build personalization vector p (sums to 1.0).
+    let mut p = vec![0.0f64; n];
+    for (i, (rel, _, mt)) in files.iter().enumerate() {
+        let mut w = if call_graph::is_test_path(rel) {
+            0.45
+        } else {
+            1.0
+        };
+        if dirty_set.contains(rel.as_str()) {
+            w *= 3.5;
+        } else if let Some(&ts) = commit_ts_map.get(rel.as_str()) {
+            let age_days = (now_secs.saturating_sub(ts) as f64) / 86_400.0;
+            w *= 1.0 + 1.5 * (-age_days / 14.0).exp();
+        } else if commit_ts_map.is_empty() && max_mtime > 0 && *mt > 0 {
+            // Non-git fallback: relative mtime recency within 14-day window.
+            let age_days = (max_mtime.saturating_sub(*mt) as f64) / (86_400.0 * 1_000_000_000.0);
+            w *= 1.0 + 0.5 * (-age_days / 14.0).exp();
+        }
+        if expand_seeds.contains(rel.as_str()) {
+            w *= 3.0;
+        }
+        p[i] = w;
+    }
+    let p_sum: f64 = p.iter().sum();
+    if p_sum > 0.0 {
+        for x in &mut p {
+            *x /= p_sum;
+        }
+    } else {
+        let uniform = 1.0 / (n as f64);
+        p.fill(uniform);
+    }
+
+    // Build weighted directed file->file transition edges from call_graph adjacency.
+    let adj = call_graph::adjacency(root, paths);
+    let mut outgoing: Vec<HashMap<usize, f64>> = vec![HashMap::new(); n];
+    for (callee_seg, (dst_rel, _)) in &adj.sites {
+        let dst_norm = normalize_rel(dst_rel);
+        let Some(&dst_idx) = idx_by_rel.get(dst_norm.as_str()) else {
+            continue;
+        };
+        if let Some(callers) = adj.caller_sites.get(callee_seg) {
+            for cs in callers {
+                let src_norm = normalize_rel(&cs.rel);
+                let Some(&src_idx) = idx_by_rel.get(src_norm.as_str()) else {
+                    continue;
+                };
+                if src_idx == dst_idx {
+                    continue;
+                }
+                let weight = cs.confidence * if cs.is_test { 0.35 } else { 1.0 };
+                *outgoing[src_idx].entry(dst_idx).or_insert(0.0) += weight;
+            }
+        }
+    }
+
+    let out_totals: Vec<f64> = outgoing.iter().map(|m| m.values().sum()).collect();
+    let damping = 0.85f64;
+    let mut ranks = p.clone();
+    let mut next = vec![0.0f64; n];
+
+    for _ in 0..25 {
+        let mut dangling_mass = 0.0f64;
+        for u in 0..n {
+            if out_totals[u] <= 0.0 {
+                dangling_mass += ranks[u];
+            }
+        }
+        let base_factor = (1.0 - damping) + damping * dangling_mass;
+        for v in 0..n {
+            next[v] = base_factor * p[v];
+        }
+        for u in 0..n {
+            let tot = out_totals[u];
+            if tot <= 0.0 {
+                continue;
+            }
+            let share = damping * ranks[u] / tot;
+            for (&v, &w) in &outgoing[u] {
+                next[v] += share * w;
+            }
+        }
+        let delta: f64 = ranks
+            .iter()
+            .zip(next.iter())
+            .map(|(a, b)| (a - b).abs())
+            .sum();
+        std::mem::swap(&mut ranks, &mut next);
+        if delta < 1e-7 {
+            break;
+        }
+    }
+
+    let mut out = HashMap::with_capacity(n);
+    for (i, (rel, _, _)) in files.iter().enumerate() {
+        out.insert(rel.clone(), ranks[i]);
+    }
+    out
+}
+
+/// Collect per-file latest git commit epoch seconds (capped at 200 recent commits
+/// in one subprocess) plus dirty tracked paths from `git diff --name-only HEAD`.
+fn git_recency_signals(root: &Path) -> (HashMap<String, u64>, HashSet<String>) {
+    let mut commits: HashMap<String, u64> = HashMap::new();
+    let mut dirty: HashSet<String> = HashSet::new();
+
+    let top = Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .current_dir(root)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| std::path::PathBuf::from(s.trim()));
+    let Some(top_dir) = top else {
+        return (commits, dirty);
+    };
+    let canon_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let canon_top = top_dir.canonicalize().unwrap_or(top_dir);
+    let prefix = canon_root
+        .strip_prefix(&canon_top)
+        .ok()
+        .map(|p| p.to_string_lossy().replace('\\', "/"))
+        .unwrap_or_default();
+
+    let to_root_rel = |repo_rel: &str| -> Option<String> {
+        let clean = repo_rel.trim().replace('\\', "/");
+        if clean.is_empty() {
+            return None;
+        }
+        if prefix.is_empty() {
+            Some(clean)
+        } else {
+            clean
+                .strip_prefix(&prefix)
+                .and_then(|s| s.strip_prefix('/'))
+                .map(String::from)
+        }
+    };
+
+    if let Ok(out) = Command::new("git")
+        .args(["log", "-n", "200", "--format=COMMIT:%ct", "--name-only"])
+        .current_dir(root)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+    {
+        if out.status.success() {
+            let mut cur_ts: Option<u64> = None;
+            for line in String::from_utf8_lossy(&out.stdout).lines() {
+                let t = line.trim();
+                if t.is_empty() {
+                    continue;
+                }
+                if let Some(rest) = t.strip_prefix("COMMIT:") {
+                    cur_ts = rest.parse::<u64>().ok();
+                } else if let Some(ts) = cur_ts {
+                    if let Some(rel) = to_root_rel(t) {
+                        commits.entry(rel).or_insert(ts);
+                    }
+                }
+            }
+        }
+    }
+
+    if let Ok(out) = Command::new("git")
+        .args(["diff", "--name-only", "HEAD"])
+        .current_dir(root)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+    {
+        if out.status.success() {
+            for line in String::from_utf8_lossy(&out.stdout).lines() {
+                if let Some(rel) = to_root_rel(line) {
+                    dirty.insert(rel);
+                }
+            }
+        }
+    }
+
+    (commits, dirty)
+}
+
+/// Return `(symbols, cache_hit, bytes_read_from_disk)`, reusing the SQLite
+/// `file_stages` payload when the on-disk mtime is unchanged. Queues misses
+/// into `pending` for batch upsert.
+#[allow(clippy::too_many_arguments)]
+fn cached_symbols_in(
+    store: Option<&Store>,
+    pending: &mut Vec<(String, Lang, u64, u64, Vec<String>)>,
+    parser: &mut Parser,
+    lang: Lang,
+    path: &Path,
+    rel: &str,
+    size_bytes: u64,
+    mtime_ns: u64,
+) -> (Vec<String>, bool, u64) {
+    if mtime_ns > 0 {
+        if let Some(st) = store {
+            if let Ok(Some(payload)) = st.get_file_stage_payload(rel, STAGE_REPO_MAP, mtime_ns) {
+                if let Ok(Value::Array(arr)) = serde_json::from_str::<Value>(&payload) {
+                    let syms = arr
+                        .into_iter()
                         .filter_map(|x| x.as_str().map(String::from))
-                        .collect()
-                })
-                .unwrap_or_default();
+                        .collect();
+                    return (syms, true, 0);
+                }
+            }
         }
     }
     let Ok(src) = std::fs::read_to_string(path) else {
-        return Vec::new();
+        return (Vec::new(), false, 0);
     };
+    let read_len = src.len() as u64;
     let syms = extract(parser, lang, &src);
-    if let Ok(mut store) = cell.lock() {
-        let payload = Value::Array(syms.iter().cloned().map(Value::String).collect());
-        store.put(key.as_ref(), mtime_ns, payload);
+    if mtime_ns > 0 {
+        pending.push((rel.to_string(), lang, mtime_ns, size_bytes, syms.clone()));
+    }
+    (syms, false, read_len)
+}
+
+/// Single-file convenience wrapper over [`cached_symbols_in`] for unit tests.
+#[cfg(test)]
+fn cached_symbols(parser: &mut Parser, lang: Lang, path: &Path, mtime_ns: u64) -> Vec<String> {
+    let root = path.parent().unwrap_or(path);
+    let rel = normalize_rel(&path.strip_prefix(root).unwrap_or(path).to_string_lossy());
+    let sz = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    let store = Store::open(root).ok();
+    let mut pending = Vec::new();
+    let (syms, _, _) = cached_symbols_in(
+        store.as_ref(),
+        &mut pending,
+        parser,
+        lang,
+        path,
+        &rel,
+        sz,
+        mtime_ns,
+    );
+    if !pending.is_empty() {
+        if let Some(st) = store.as_ref() {
+            let _ = st.with_immediate_tx(|s| {
+                for (r, l, mt, s_bytes, list) in &pending {
+                    let fid = s.upsert_file(r, *mt, *s_bytes, l.label())?;
+                    let payload = serde_json::to_string(list).unwrap_or_else(|_| "[]".into());
+                    s.set_file_stage(fid, STAGE_REPO_MAP, *mt, Some(&payload))?;
+                }
+                Ok(())
+            });
+        }
     }
     syms
 }
@@ -957,5 +1317,107 @@ int Transform_area(const Transform& t) { return 0; }
         assert!(out.contains("namespace a"), "{out}");
         assert!(!out.contains("src/beta.cpp"), "{out}");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn pagerank_ranks_central_and_git_dirty_files_ahead_of_alpha_and_suggests_on_wide_trunc() {
+        let _g = crate::cache::test_env_lock();
+        let cache =
+            std::env::temp_dir().join(format!("cbtest_repomap_pr_cache_{}", std::process::id()));
+        let root =
+            std::env::temp_dir().join(format!("cbtest_repomap_pr_root_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&cache);
+        let _ = std::fs::remove_dir_all(&root);
+        std::env::set_var("XDG_CACHE_HOME", &cache);
+        std::fs::create_dir_all(root.join("src")).unwrap();
+
+        // Alphabetically last ("src/z_core.rs"), but called by multiple callers!
+        std::fs::write(
+            root.join("src/z_core.rs"),
+            "pub fn core_hub() -> i32 { 42 }\n",
+        )
+        .unwrap();
+        // Alphabetically earlier callers + leaves (9 files total >= WIDE_TREE_MIN_FILES).
+        for idx in 0..7 {
+            std::fs::write(
+                root.join(format!("src/a_caller_{idx}.rs")),
+                format!("pub fn caller_{idx}() -> i32 {{ core_hub() }}\n"),
+            )
+            .unwrap();
+        }
+        std::fs::write(
+            root.join("src/m_recent_leaf.rs"),
+            "pub fn isolated_leaf() -> i32 { 1 }\n",
+        )
+        .unwrap();
+
+        // Initialize git repo and make m_recent_leaf.rs dirty so git-recency boosts it over older callers.
+        let git = |args: &[&str]| {
+            Command::new("git")
+                .args(args)
+                .current_dir(&root)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .unwrap()
+        };
+        assert!(git(&["init"]).success());
+        assert!(git(&["config", "user.email", "test@example.com"]).success());
+        assert!(git(&["config", "user.name", "repomap test"]).success());
+        assert!(git(&["add", "."]).success());
+        assert!(git(&["commit", "-m", "init"]).success());
+        std::fs::write(
+            root.join("src/m_recent_leaf.rs"),
+            "pub fn isolated_leaf() -> i32 { 2 }\n",
+        )
+        .unwrap();
+
+        // 1. Default alpha mode: truncated wide tree (>= 8 files) suggests rank:"pagerank".
+        let alpha_trunc = build(
+            &root,
+            &serde_json::json!({ "paths": ["src"], "mode": "files", "token_budget": 18 }),
+        )
+        .unwrap();
+        assert!(alpha_trunc.contains("src/a_caller_0.rs"), "{alpha_trunc}");
+        assert!(
+            alpha_trunc.contains("rank:\"pagerank\""),
+            "expected pagerank suggestion on truncated wide tree:\n{alpha_trunc}"
+        );
+
+        // 2. rank:"pagerank" floats z_core.rs to #1 (highest incoming call centrality)
+        // and ranks dirty m_recent_leaf.rs ahead of clean leaf callers.
+        let pr_out = build(
+            &root,
+            &serde_json::json!({ "paths": ["src"], "mode": "files", "rank": "pagerank" }),
+        )
+        .unwrap();
+        assert!(pr_out.contains("[files mode, rank=pagerank]"), "{pr_out}");
+        let file_lines: Vec<&str> = pr_out
+            .lines()
+            .filter(|l| l.starts_with("src/") && l.ends_with("symbols)"))
+            .collect();
+        assert_eq!(file_lines.len(), 9, "{file_lines:?}");
+        assert!(
+            file_lines[0].starts_with("src/z_core.rs"),
+            "expected z_core.rs first under pagerank, got: {file_lines:?}"
+        );
+        let pos_dirty = file_lines
+            .iter()
+            .position(|l| l.starts_with("src/m_recent_leaf.rs"))
+            .unwrap();
+        let pos_clean_caller = file_lines
+            .iter()
+            .position(|l| l.starts_with("src/a_caller_0.rs"))
+            .unwrap();
+        assert!(
+            pos_dirty < pos_clean_caller,
+            "dirty file should outrank clean zero-in-degree caller: {file_lines:?}"
+        );
+
+        // 3. Invalid rank errors cleanly.
+        assert!(build(&root, &serde_json::json!({ "paths": ["src"], "rank": "bogus" })).is_err());
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&cache);
     }
 }

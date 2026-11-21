@@ -1,8 +1,12 @@
 #!/usr/bin/env bash
 # MCP launcher: prefer the newest wordkeep binary under this repo's target/.
+# Never blocks the MCP stdio handshake on a synchronous cargo rebuild — stale
+# binaries warn (and may kick a background rebuild) so Cursor does not time out.
 set -euo pipefail
 WK="$(cd "$(dirname "$0")" && pwd)"
 export CARGO_TARGET_DIR="$WK/target"
+ROOT="$(cd "$WK/../.." && pwd)"
+BUILD_LOCK="${WORDKEEP_BUILD_LOCK:-$ROOT/.wordkeep/build.lock}"
 
 # shellcheck source=ereshkigal_gpu.sh
 source "$WK/ereshkigal_gpu.sh"
@@ -12,6 +16,15 @@ wordkeep_features() {
   # Vulkan llama.cpp by default so n_gpu_layers offloads. CPU-only:
   # WORDKEEP_FEATURES=embeddings,daslang,dashboard,ereshkigal
   wordkeep_default_features
+}
+
+# Shared flock with wiki.sh so concurrent launchers never stampede Cargo.
+wordkeep_with_build_lock() {
+  mkdir -p "$(dirname "$BUILD_LOCK")"
+  (
+    flock 8
+    "$@"
+  ) 8>>"$BUILD_LOCK"
 }
 
 pick_bin() {
@@ -30,63 +43,97 @@ pick_bin() {
   return 1
 }
 
-BIN="$(pick_bin)" || {
-  echo "[wordkeep:mcp] missing wordkeep binary." >&2
-  echo "  run: (cd \"$WK\" && CARGO_TARGET_DIR=\"$WK/target\" cargo build --release --features embeddings,daslang,dashboard,ereshkigal-vulkan)" >&2
-  dev_rebuild="$WK/../dev/rebuild_wordkeep.sh"
-  if [[ -x "$dev_rebuild" ]]; then
-    echo "  or: $dev_rebuild  # when wordkeep lives under tools/wordkeep in this repo" >&2
+wordkeep_surface_banner() {
+  local caps="$WK/resources/capabilities.json"
+  local count=""
+  if [[ -f "$caps" ]] && command -v python3 >/dev/null 2>&1; then
+    count="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("tool_count",""))' "$caps" 2>/dev/null || true)"
   fi
-  exit 1
+  if [[ -n "${count:-}" ]]; then
+    echo "[wordkeep:mcp] surface: ${count} tools (capabilities), resources wordkeep://readme + wordkeep://capabilities" >&2
+  else
+    echo "[wordkeep:mcp] surface: full toolset, resources wordkeep://readme + wordkeep://capabilities" >&2
+  fi
+}
+
+# Kick a non-blocking rebuild for the *next* MCP reload. Never wait on cargo
+# during initialize — Cursor times out the handshake.
+wordkeep_bg_rebuild() {
+  local reason="$1"
+  local log="$ROOT/.wordkeep/mcp-bg-rebuild.log"
+  mkdir -p "$ROOT/.wordkeep"
+  echo "[wordkeep:mcp] scheduling background rebuild (${reason}); see $log" >&2
+  (
+    flock 8
+    wordkeep_vulkan_cmake_env || true
+    wordkeep_wipe_cpu_llama_sys || true
+    cd "$WK" && CARGO_TARGET_DIR="$WK/target" cargo build --release --features "$(wordkeep_features)"
+  ) 8>>"$BUILD_LOCK" >>"$log" 2>&1 &
+  disown || true
+}
+
+BIN="$(pick_bin)" || {
+  echo "[wordkeep:mcp] missing wordkeep binary — blocking once under build.lock (first boot only)." >&2
+  echo "  (cd \"$WK\" && CARGO_TARGET_DIR=\"$WK/target\" cargo build --release --features embeddings,daslang,dashboard,ereshkigal-vulkan)" >&2
+  wordkeep_vulkan_cmake_env || true
+  wordkeep_wipe_cpu_llama_sys || true
+  feats="$(wordkeep_features)"
+  if ! wordkeep_with_build_lock env CARGO_TARGET_DIR="$WK/target" cargo build --release --features "$feats" --manifest-path "$WK/Cargo.toml"; then
+    echo "[wordkeep:mcp] first-boot rebuild failed" >&2
+    exit 1
+  fi
+  BIN="$(pick_bin)" || {
+    echo "[wordkeep:mcp] rebuild succeeded but binary still missing" >&2
+    exit 1
+  }
 }
 
 # Warn when sources look newer than the chosen binary (common after a submodule bump).
+# Do NOT block the MCP handshake on cargo — opt into background rebuild instead.
 NEWEST_SRC=0
 if [[ -d "$WK/src" ]]; then
   NEWEST_SRC=$(find "$WK/src" -type f -name '*.rs' -printf '%T@\n' 2>/dev/null \
     | sort -n | tail -1 | cut -d. -f1)
 fi
 BIN_MTIME=$(stat -c '%Y' "$BIN" 2>/dev/null || echo 0)
+STALE=0
 if [[ -n "${NEWEST_SRC:-}" && "$NEWEST_SRC" -gt "$BIN_MTIME" ]]; then
+  STALE=1
   echo "[wordkeep:mcp] warning: $BIN is older than src/; rebuild recommended:" >&2
   echo "  (cd \"$WK\" && CARGO_TARGET_DIR=\"$WK/target\" cargo build --release --features embeddings,daslang,dashboard,ereshkigal-vulkan)  # then reload MCP" >&2
   dev_rebuild="$WK/../dev/rebuild_wordkeep.sh"
   if [[ -x "$dev_rebuild" ]]; then
     echo "  or: $dev_rebuild" >&2
   fi
-  if [[ "${WORDKEEP_AUTO_REBUILD:-}" == "1" ]]; then
-    echo "[wordkeep:mcp] WORDKEEP_AUTO_REBUILD=1 — rebuilding into $WK/target ..." >&2
-    wordkeep_vulkan_cmake_env || true
-    wordkeep_wipe_cpu_llama_sys
-    if ! (cd "$WK" && CARGO_TARGET_DIR="$WK/target" cargo build --release --features "$(wordkeep_features)"); then
-      echo "[wordkeep:mcp] auto-rebuild failed; continuing with stale binary" >&2
-    else
-      BIN="$(pick_bin)" || {
-        echo "[wordkeep:mcp] rebuild succeeded but binary still missing" >&2
-        exit 1
-      }
-    fi
-  fi
 fi
 
-if [[ "${WORDKEEP_AUTO_REBUILD:-}" == "1" ]]; then
-  case ",$(wordkeep_features)," in
-    *,ereshkigal-vulkan,*)
-      if wordkeep_bin_missing_vulkan "$BIN"; then
-        echo "[wordkeep:mcp] release binary has no ggml-vulkan — rebuilding GPU llama.cpp …" >&2
-        wordkeep_vulkan_cmake_env || true
-        wordkeep_wipe_cpu_llama_sys
-        if (cd "$WK" && CARGO_TARGET_DIR="$WK/target" cargo build --release --features "$(wordkeep_features)"); then
-          BIN="$(pick_bin)" || true
-        fi
-      fi
-      ;;
-  esac
+NEED_VULKAN_REBUILD=0
+case ",$(wordkeep_features)," in
+  *,ereshkigal-vulkan,*)
+    if wordkeep_bin_missing_vulkan "$BIN"; then
+      NEED_VULKAN_REBUILD=1
+      echo "[wordkeep:mcp] warning: release binary has no ggml-vulkan — GPU SemIf needs a rebuild" >&2
+    fi
+    ;;
+esac
+
+# WORDKEEP_AUTO_REBUILD=1 formerly blocked handshake; now schedules background only
+# unless WORDKEEP_SYNC_REBUILD=1 is explicitly set (debug/CI).
+if [[ "${WORDKEEP_SYNC_REBUILD:-}" == "1" && ( "$STALE" -eq 1 || "$NEED_VULKAN_REBUILD" -eq 1 ) ]]; then
+  echo "[wordkeep:mcp] WORDKEEP_SYNC_REBUILD=1 — rebuilding under build.lock (handshake delayed) …" >&2
+  wordkeep_vulkan_cmake_env || true
+  wordkeep_wipe_cpu_llama_sys || true
+  if ! wordkeep_with_build_lock bash -c "cd \"$WK\" && CARGO_TARGET_DIR=\"$WK/target\" cargo build --release --features \"$(wordkeep_features)\""; then
+    echo "[wordkeep:mcp] sync rebuild failed; continuing with current binary" >&2
+  else
+    BIN="$(pick_bin)" || true
+  fi
+elif [[ ( "${WORDKEEP_AUTO_REBUILD:-}" == "1" || "${WORDKEEP_BG_REBUILD:-}" == "1" ) && ( "$STALE" -eq 1 || "$NEED_VULKAN_REBUILD" -eq 1 ) ]]; then
+  wordkeep_bg_rebuild "stale=${STALE} vulkan=${NEED_VULKAN_REBUILD}"
 fi
 
 echo "[wordkeep:mcp] using $BIN" >&2
-echo "[wordkeep:mcp] surface: 51 tools, 2 resources (wordkeep://readme, wordkeep://capabilities)" >&2
-ROOT="$(cd "$WK/../.." && pwd)"
+wordkeep_surface_banner
 GGUF_PIN="$ROOT/.wordkeep/models/Qwen3-0.6B-Q8_0.gguf"
 if [[ ! -e "$GGUF_PIN" ]]; then
   echo "[wordkeep:mcp] warning: $GGUF_PIN is missing — ereshkigal decide/rerank will error until the 0.6B Q8 pin is present (gitignored)." >&2

@@ -2,6 +2,8 @@
 # (case-insensitive). New hits outside this list fail the privacy guard.
 # Keep Copper private: add Wordkeep code that is fabric-agnostic instead.
 tools/wordkeep/docs/semif.md
+tools/wordkeep/resources/capabilities.json
+tools/wordkeep/src/coeffects.rs
 tools/wordkeep/src/config.rs
 tools/wordkeep/src/copper_health.rs
 tools/wordkeep/src/lib.rs

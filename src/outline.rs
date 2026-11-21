@@ -16,13 +16,14 @@ use tree_sitter::Parser;
 use crate::config;
 use crate::continuation::{self, KIND_FILE_SKIP};
 use crate::lang::Lang;
-use crate::{repo_map, stats};
+use crate::{repo_map, stats, store};
 
 pub fn build(root: &Path, args: &Value) -> Result<String, String> {
     let budget = args
         .get("token_budget")
         .and_then(Value::as_u64)
         .unwrap_or(2400) as usize;
+    let if_none_match = args.get("if_none_match").and_then(Value::as_str);
 
     let batch: Vec<String> = args
         .get("files")
@@ -37,7 +38,7 @@ pub fn build(root: &Path, args: &Value) -> Result<String, String> {
         .unwrap_or_default();
 
     if !batch.is_empty() {
-        return build_batch(root, args, &batch, budget);
+        return build_batch(root, args, &batch, budget, if_none_match);
     }
 
     let file = args
@@ -50,7 +51,7 @@ pub fn build(root: &Path, args: &Value) -> Result<String, String> {
         return Err("file (or path) is required; or pass files:[...] for a batch".into());
     }
 
-    let (text, baseline) = outline_one(root, args, file, budget, /*header_only_budget*/ true)?;
+    let (text, baseline) = outline_one(root, args, file, budget, if_none_match)?;
     stats::record("outline", baseline, (text.len() / 4) as u64);
     Ok(text)
 }
@@ -60,12 +61,20 @@ fn build_batch(
     args: &Value,
     files: &[String],
     budget: usize,
+    if_none_match: Option<&str>,
 ) -> Result<String, String> {
     const FP_KEYS: &[&str] = &["files", "file", "path"];
     let args_fp = continuation::args_fingerprint(args, FP_KEYS);
     let resume_at = continuation::resume_offset(args, "outline", FP_KEYS, KIND_FILE_SKIP)? as usize;
 
-    let mut out = format!("outline - batch ({} file(s))", files.len());
+    let (batch_etag, batch_bytes) = compute_batch_etag(root, args, files, budget, resume_at);
+    if store::etag_matches(if_none_match, &batch_etag) {
+        let short = store::unchanged_etag_line(&batch_etag);
+        stats::record("outline", batch_bytes / 4, (short.len() / 4) as u64);
+        return Ok(short);
+    }
+
+    let mut out = format!("outline - batch ({} file(s))  etag={batch_etag}", files.len());
     if resume_at > 0 {
         out.push_str(&format!(" [continuation from file #{resume_at}]"));
     }
@@ -84,7 +93,7 @@ fn build_batch(
             break;
         }
         let remaining = budget.saturating_sub(used).max(64);
-        match outline_one_into(root, args, file, remaining, &mut parser) {
+        match outline_one_into(root, args, file, remaining, None, &mut parser) {
             Ok((block, baseline)) => {
                 baseline_total += baseline;
                 let lt = block.len() / 4;
@@ -120,16 +129,47 @@ fn build_batch(
     Ok(out)
 }
 
+fn compute_batch_etag(
+    root: &Path,
+    args: &Value,
+    files: &[String],
+    budget: usize,
+    resume_at: usize,
+) -> (String, u64) {
+    let mut acc = format!("budget={budget}\0resume={resume_at}\n");
+    let mut total_bytes = 0u64;
+    for f in files {
+        match config::resolve_file_with_args(root, f, args) {
+            Ok(p) => {
+                let rel = config::rel_path(root, &p);
+                match std::fs::read(&p) {
+                    Ok(bytes) => {
+                        total_bytes += bytes.len() as u64;
+                        let sha = store::sha256_bytes(&bytes);
+                        acc.push_str(&format!("ok:{rel}:{sha}\n"));
+                    }
+                    Err(_) => acc.push_str(&format!("unreadable:{rel}\n")),
+                }
+            }
+            Err(_) => acc.push_str(&format!("missing:{f}\n")),
+        }
+    }
+    (
+        store::etag_hex(&[b"outline-batch\0v1", acc.as_bytes()]),
+        total_bytes,
+    )
+}
+
 /// Outline a single file; returns (text, baseline_tokens).
 fn outline_one(
     root: &Path,
     args: &Value,
     file: &str,
     budget: usize,
-    _header_only_budget: bool,
+    if_none_match: Option<&str>,
 ) -> Result<(String, u64), String> {
     let mut parser = Parser::new();
-    outline_one_into(root, args, file, budget, &mut parser)
+    outline_one_into(root, args, file, budget, if_none_match, &mut parser)
 }
 
 fn outline_one_into(
@@ -137,6 +177,7 @@ fn outline_one_into(
     args: &Value,
     file: &str,
     budget: usize,
+    if_none_match: Option<&str>,
     parser: &mut Parser,
 ) -> Result<(String, u64), String> {
     let path = match config::resolve_file_with_args(root, file, args) {
@@ -153,6 +194,23 @@ fn outline_one_into(
         }
     };
     let rel = config::rel_path(root, &path);
+    let budget_s = budget.to_string();
+    if is_markdown_path(&path) {
+        let Ok(src) = std::fs::read_to_string(&path) else {
+            return Ok((format!("outline - {rel}: cannot read file"), 0));
+        };
+        let baseline = (src.len() / 4) as u64;
+        let etag = store::etag_hex(&[
+            b"outline\0v1",
+            rel.as_bytes(),
+            budget_s.as_bytes(),
+            src.as_bytes(),
+        ]);
+        if store::etag_matches(if_none_match, &etag) {
+            return Ok((store::unchanged_etag_line(&etag), baseline));
+        }
+        return Ok(outline_markdown(&rel, &src, budget, &etag));
+    }
     let Some(lang) = Lang::from_path(&path) else {
         return Ok((format!("outline - {rel}: unsupported file type"), 0));
     };
@@ -160,11 +218,21 @@ fn outline_one_into(
         return Ok((format!("outline - {rel}: cannot read file"), 0));
     };
 
-    let located = repo_map::symbols_located(parser, lang, &src);
     let baseline = (src.len() / 4) as u64;
+    let etag = store::etag_hex(&[
+        b"outline\0v1",
+        rel.as_bytes(),
+        budget_s.as_bytes(),
+        src.as_bytes(),
+    ]);
+    if store::etag_matches(if_none_match, &etag) {
+        return Ok((store::unchanged_etag_line(&etag), baseline));
+    }
+
+    let located = repo_map::symbols_located(parser, lang, &src);
     if located.is_empty() {
         return Ok((
-            format!("outline - {rel}: no top-level symbols found"),
+            format!("outline - {rel}: no top-level symbols found  etag={etag}"),
             baseline,
         ));
     }
@@ -172,7 +240,7 @@ fn outline_one_into(
     let starts = line_starts(&src);
     let total = located.len();
 
-    let mut out = format!("outline - {rel}  ({total} symbol(s))\n\n");
+    let mut out = format!("outline - {rel}  ({total} symbol(s))  etag={etag}\n\n");
     let mut used = out.len() / 4;
     for (idx, (off, sym)) in located.iter().enumerate() {
         let line = line_of(&starts, *off);
@@ -190,6 +258,92 @@ fn outline_one_into(
     }
 
     Ok((out, baseline))
+}
+
+fn is_markdown_path(path: &Path) -> bool {
+    matches!(
+        path.extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase())
+            .as_deref(),
+        Some("md" | "mdc" | "markdown")
+    )
+}
+
+fn clip_inline(s: &str, max_chars: usize) -> String {
+    let flat: String = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut chars = flat.chars();
+    let head: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() {
+        format!("{head}…")
+    } else {
+        head
+    }
+}
+
+fn outline_markdown(rel: &str, src: &str, budget: usize, etag: &str) -> (String, u64) {
+    let baseline = (src.len() / 4) as u64;
+    let parsed = wordkeep_knowledge::parse_markdown(rel, src);
+    let has_fm = !parsed.frontmatter.values.is_empty() || !parsed.tags.is_empty();
+    if parsed.sections.is_empty() && !has_fm {
+        return (
+            format!("outline - {rel}: no top-level headings found  etag={etag}"),
+            baseline,
+        );
+    }
+
+    let heading_count = parsed
+        .sections
+        .iter()
+        .filter(|s| s.heading_level > 0)
+        .count();
+    let mut out = format!("outline - {rel}  ({heading_count} heading(s))  etag={etag}\n");
+
+    if has_fm {
+        let mut keys: Vec<&String> = parsed.frontmatter.values.keys().collect();
+        keys.sort();
+        let mut pairs: Vec<String> = Vec::new();
+        for k in keys {
+            if let Some(v) = parsed.frontmatter.values.get(k) {
+                if !v.trim().is_empty() {
+                    pairs.push(format!("{k}={}", clip_inline(v, 96)));
+                }
+            }
+        }
+        if !parsed.tags.is_empty() && !parsed.frontmatter.values.contains_key("tags") {
+            pairs.push(format!("tags=[{}]", parsed.tags.join(", ")));
+        }
+        if !pairs.is_empty() {
+            out.push_str(&format!("frontmatter: {}\n", pairs.join("; ")));
+        }
+    }
+    out.push('\n');
+
+    let total = parsed.sections.len();
+    let mut used = out.len() / 4;
+    for (idx, sec) in parsed.sections.iter().enumerate() {
+        let range = format!("{}-{}", sec.start_line, sec.end_line);
+        let label = if sec.heading_level == 0 {
+            sec.heading.clone()
+        } else {
+            let indent = "  ".repeat((sec.heading_level.saturating_sub(1)) as usize);
+            let hashes = "#".repeat(sec.heading_level as usize);
+            format!("{indent}{hashes} {}", sec.heading)
+        };
+        let row = format!("  {range:>11}  {label}\n");
+        let lt = row.len() / 4;
+        if used + lt > budget && idx > 0 {
+            out.push_str(&format!(
+                "  … (+{} more; raise token_budget)\n",
+                total - idx
+            ));
+            break;
+        }
+        used += lt;
+        out.push_str(&row);
+    }
+
+    (out, baseline)
 }
 
 fn basename_candidate_list(root: &Path, args: &Value, file: &str) -> Option<String> {
@@ -348,6 +502,120 @@ mod tests {
             out.contains("unique_outline_cand") || out.contains("not found"),
             "{out}"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn outlines_markdown_with_frontmatter_and_line_ranges() {
+        let dir = std::env::temp_dir().join(format!("cbtest_outline_md_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mdc = "---\ndescription: Test rule doc\nalwaysApply: false\ntags: [ergonomics, mcp]\n---\n\n# Overview\n\nIntro line.\n```bash\n# inside code fence\necho hi\n```\n\n## Details\n\nBody text.\n";
+        std::fs::write(dir.join("rule.mdc"), mdc).unwrap();
+        std::fs::write(dir.join("notes.markdown"), "# First\n\nalpha\n\n## Second\n\nbeta\n").unwrap();
+
+        let out = build(&dir, &serde_json::json!({ "file": "rule.mdc" })).unwrap();
+        assert!(out.contains("(2 heading(s))"), "{out}");
+        assert!(out.contains("frontmatter:"), "{out}");
+        assert!(out.contains("description=Test rule doc"), "{out}");
+        assert!(out.contains("alwaysapply=false"), "{out}");
+        assert!(out.contains("# Overview"), "{out}");
+        assert!(out.contains("## Details"), "{out}");
+        assert!(!out.contains("inside code fence"), "{out}");
+        assert!(out.contains("7-14"), "expected Overview line range 7-14: {out}");
+        assert!(out.contains("15-17"), "expected Details line range 15-17: {out}");
+
+        let batch = build(
+            &dir,
+            &serde_json::json!({ "files": ["rule.mdc", "notes.markdown"] }),
+        )
+        .unwrap();
+        assert!(batch.contains("rule.mdc"), "{batch}");
+        assert!(batch.contains("notes.markdown"), "{batch}");
+        assert!(batch.contains("# First"), "{batch}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn extract_etag(text: &str) -> String {
+        text.lines()
+            .next()
+            .and_then(|l| l.split("etag=").nth(1))
+            .and_then(|rest| rest.split_whitespace().next())
+            .expect("etag= missing from header")
+            .to_string()
+    }
+
+    #[test]
+    fn outline_etag_hit_miss_and_invalidation_single_and_batch() {
+        let dir = std::env::temp_dir().join(format!("cbtest_outline_etag_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("src/a.rs"), "pub fn alpha() {}\n").unwrap();
+        std::fs::write(dir.join("src/b.rs"), "pub fn beta() {}\n").unwrap();
+
+        // Single-file ETag hit & miss.
+        let first = build(&dir, &serde_json::json!({ "file": "src/a.rs" })).unwrap();
+        let etag1 = extract_etag(&first);
+        assert_eq!(etag1.len(), 16);
+        assert!(first.contains("alpha"), "{first}");
+
+        let hit = build(
+            &dir,
+            &serde_json::json!({ "file": "src/a.rs", "if_none_match": etag1 }),
+        )
+        .unwrap();
+        assert_eq!(hit, format!("unchanged (etag={etag1})\n"));
+
+        let miss = build(
+            &dir,
+            &serde_json::json!({ "file": "src/a.rs", "if_none_match": "deadbeef00000000" }),
+        )
+        .unwrap();
+        assert!(miss.contains("alpha"), "{miss}");
+
+        // Edit invalidates ETag.
+        std::fs::write(
+            dir.join("src/a.rs"),
+            "pub fn alpha() {}\npub fn alpha2() {}\n",
+        )
+        .unwrap();
+        let changed = build(
+            &dir,
+            &serde_json::json!({ "file": "src/a.rs", "if_none_match": etag1 }),
+        )
+        .unwrap();
+        assert!(changed.contains("alpha2"), "{changed}");
+        assert_ne!(extract_etag(&changed), etag1);
+
+        // Batch ETag hit & invalidation.
+        let b1 = build(
+            &dir,
+            &serde_json::json!({ "files": ["src/a.rs", "src/b.rs"] }),
+        )
+        .unwrap();
+        let betag1 = extract_etag(&b1);
+        let bhit = build(
+            &dir,
+            &serde_json::json!({
+                "files": ["src/a.rs", "src/b.rs"],
+                "if_none_match": format!("\"{betag1}\"")
+            }),
+        )
+        .unwrap();
+        assert_eq!(bhit, format!("unchanged (etag={betag1})\n"));
+
+        std::fs::write(dir.join("src/b.rs"), "pub fn beta_v2() {}\n").unwrap();
+        let bmiss = build(
+            &dir,
+            &serde_json::json!({
+                "files": ["src/a.rs", "src/b.rs"],
+                "if_none_match": betag1
+            }),
+        )
+        .unwrap();
+        assert!(bmiss.contains("beta_v2"), "{bmiss}");
+        assert_ne!(extract_etag(&bmiss), betag1);
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -107,15 +107,15 @@ pub fn find(root: &Path, args: &Value) -> Result<String, String> {
     let mut scanned_bytes = 0u64;
     for p in &paths {
         let base = root.join(p);
-        for entry in walk::files(&base, &prune) {
-            let path = entry.path();
+        for path_owned in walk::files(&base, &prune) {
+            let path = path_owned.as_path();
             let Some(lang) = Lang::from_path(path) else {
                 continue;
             };
             if !refs_supported(lang) {
                 continue;
             }
-            let Ok(meta) = entry.metadata() else { continue };
+            let Ok(meta) = path.metadata() else { continue };
             // File sizes are the raw material an agent would otherwise grep, so
             // they form the stats baseline whether or not the parse is cached.
             scanned_bytes += meta.len();
@@ -126,16 +126,24 @@ pub fn find(root: &Path, args: &Value) -> Result<String, String> {
     // 2. Split warm (memoized, mtime match) from cold (needs a parse).
     let cell = OCC_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     let mut cold: Vec<(PathBuf, Lang, u64)> = Vec::new();
+    let mut cache_hits = 0u64;
+    let mut bytes_read = 0u64;
     {
         let store = cell.lock().unwrap_or_else(|e| e.into_inner());
         for (path, lang, mt) in &candidates {
             let key = path.to_string_lossy();
             match store.get(key.as_ref()) {
-                Some((cached_mt, _)) if cached_mt == mt => {}
-                _ => cold.push((path.clone(), *lang, *mt)),
+                Some((cached_mt, _)) if cached_mt == mt => cache_hits += 1,
+                _ => {
+                    if let Ok(m) = path.metadata() {
+                        bytes_read += m.len();
+                    }
+                    cold.push((path.clone(), *lang, *mt));
+                }
             }
         }
     }
+    let cache_misses = cold.len() as u64;
 
     // 3. Parse cold files in parallel, then publish into the memo.
     let fresh = parallel_extract(&cold);
@@ -277,7 +285,17 @@ pub fn find(root: &Path, args: &Value) -> Result<String, String> {
         );
     }
     progress::tick(shown as u64, None, "symbol_refs: done");
-    stats::record("symbol_refs", scanned_bytes / 4, (out.len() / 4) as u64);
+    stats::record_ext(
+        "symbol_refs",
+        stats::RecordMeta {
+            baseline: scanned_bytes / 4,
+            returned: (out.len() / 4) as u64,
+            bytes_read,
+            cache_hits,
+            cache_misses,
+            reason: None,
+        },
+    );
     Ok(out)
 }
 
@@ -306,15 +324,15 @@ pub fn refs_by_file(root: &Path, symbol: &str, paths: &[String]) -> (Vec<FileRef
     let mut scanned_bytes = 0u64;
     for p in paths {
         let base = root.join(p);
-        for entry in walk::files(&base, &prune) {
-            let path = entry.path();
+        for path_owned in walk::files(&base, &prune) {
+            let path = path_owned.as_path();
             let Some(lang) = Lang::from_path(path) else {
                 continue;
             };
             if !refs_supported(lang) {
                 continue;
             }
-            let Ok(meta) = entry.metadata() else { continue };
+            let Ok(meta) = path.metadata() else { continue };
             scanned_bytes += meta.len();
             candidates.push((path.to_path_buf(), lang, cache::mtime_ns(&meta)));
         }
@@ -407,15 +425,15 @@ pub fn call_sites(root: &Path, symbol: &str, paths: &[String]) -> (Vec<CallSite>
     let mut scanned_bytes = 0u64;
     for p in paths {
         let base = root.join(p);
-        for entry in walk::files(&base, &prune) {
-            let path = entry.path();
+        for path_owned in walk::files(&base, &prune) {
+            let path = path_owned.as_path();
             let Some(lang) = Lang::from_path(path) else {
                 continue;
             };
             if !refs_supported(lang) {
                 continue;
             }
-            let Ok(meta) = entry.metadata() else { continue };
+            let Ok(meta) = path.metadata() else { continue };
             scanned_bytes += meta.len();
             candidates.push((path.to_path_buf(), lang, cache::mtime_ns(&meta)));
         }
@@ -488,15 +506,15 @@ pub fn occurrence_counts(
     let mut scanned_bytes = 0u64;
     for p in paths {
         let base = root.join(p);
-        for entry in walk::files(&base, &prune) {
-            let path = entry.path();
+        for path_owned in walk::files(&base, &prune) {
+            let path = path_owned.as_path();
             let Some(lang) = Lang::from_path(path) else {
                 continue;
             };
             if !refs_supported(lang) {
                 continue;
             }
-            let Ok(meta) = entry.metadata() else { continue };
+            let Ok(meta) = path.metadata() else { continue };
             scanned_bytes += meta.len();
             candidates.push((path.to_path_buf(), lang, cache::mtime_ns(&meta)));
         }

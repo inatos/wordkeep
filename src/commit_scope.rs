@@ -15,9 +15,13 @@ use std::process::Command;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+use crate::continuation::{self, KIND_SCOPE_SKIP};
 use crate::{config, progress, stats};
 
 const PORCELAIN_TTL: Duration = Duration::from_secs(2);
+const DEFAULT_TOKEN_BUDGET: usize = 1600;
+const DEFAULT_PER_SCOPE_CAP: usize = 20;
+const UNTRACKED_BUCKET_CAP: usize = 12;
 
 #[derive(Clone, Debug)]
 struct Dirty {
@@ -178,10 +182,24 @@ fn is_submodule_dirty(status: &str) -> bool {
 
 /// Propose reviewable path groups for the next commit(s).
 pub fn propose(root: &Path, args: &Value) -> Result<String, String> {
+    const FP_KEYS: &[&str] = &["large_file_bytes", "max_per_scope"];
+    let budget = args
+        .get("token_budget")
+        .and_then(Value::as_u64)
+        .unwrap_or(DEFAULT_TOKEN_BUDGET as u64)
+        .max(1) as usize;
+    let per_scope_cap = args
+        .get("max_per_scope")
+        .and_then(Value::as_u64)
+        .unwrap_or(DEFAULT_PER_SCOPE_CAP as u64)
+        .max(1) as usize;
     let large_threshold = args
         .get("large_file_bytes")
         .and_then(Value::as_u64)
         .unwrap_or_else(|| config::large_file_bytes(root));
+    let args_fp = continuation::args_fingerprint(args, FP_KEYS);
+    let resume_at =
+        continuation::resume_offset(args, "commit_scope", FP_KEYS, KIND_SCOPE_SKIP)? as usize;
 
     progress::tick(0, None, "commit_scope: porcelain");
     let ignore = config::commit_ignore(root);
@@ -256,36 +274,85 @@ pub fn propose(root: &Path, args: &Value) -> Result<String, String> {
     warnings.sort();
     warnings.dedup();
 
-    let mut out = format!(
-        "commit_scope - {} dirty path(s) (read-only; never stages/commits)\n",
+    let mut header = format!(
+        "commit_scope - {} dirty path(s) (read-only; never stages/commits)",
         dirty.len()
     );
-    if !ignore.is_empty() {
-        out.push_str(&format!("ignored prefixes: {ignore:?}\n"));
+    if resume_at > 0 {
+        header.push_str(&format!(" [continuation from scope #{resume_at}]"));
     }
     if dirty.is_empty() {
+        let mut out = format!("{header}\n");
+        if !ignore.is_empty() && resume_at == 0 {
+            out.push_str(&format!("ignored prefixes: {ignore:?}\n"));
+        }
         out.push_str("\nWorking tree clean.\n");
         stats::record("commit_scope", 16, (out.len() / 4) as u64);
         return Ok(out);
     }
 
+    let mut sections: Vec<String> = Vec::new();
     for (name, members) in &grouped {
-        out.push_str(&format!("\n## scope `{name}` ({} files)\n", members.len()));
-        append_paths(&mut out, members);
-        out.push_str("  suggested: review then `git add` these paths as one commit\n");
+        let mut sec = format!("\n## scope `{name}` ({} files)\n", members.len());
+        append_paths_capped(&mut sec, members, per_scope_cap);
+        sec.push_str("  suggested: review then `git add` these paths as one commit\n");
+        sections.push(sec);
     }
     if !unscoped.is_empty() {
-        out.push_str(&format!("\n## unscoped ({} files)\n", unscoped.len()));
-        append_paths(&mut out, &unscoped);
+        let mut sec = format!("\n## unscoped ({} files)\n", unscoped.len());
+        append_paths_capped(&mut sec, &unscoped, per_scope_cap);
+        sections.push(sec);
     }
     if !warnings.is_empty() {
-        out.push_str("\n## warnings\n");
-        for w in warnings.iter().take(30) {
-            out.push_str(&format!("  • {w}\n"));
+        let mut sec = String::from("\n## warnings\n");
+        for w in warnings.iter().take(20) {
+            sec.push_str(&format!("  • {w}\n"));
         }
-        if warnings.len() > 30 {
-            out.push_str(&format!("  … (+{} more)\n", warnings.len() - 30));
+        if warnings.len() > 20 {
+            sec.push_str(&format!("  … (+{} more)\n", warnings.len() - 20));
         }
+        sections.push(sec);
+    }
+
+    let mut meta_lines = String::new();
+    if !ignore.is_empty() && resume_at == 0 {
+        meta_lines.push_str(&format!("ignored prefixes: {ignore:?}\n"));
+    }
+
+    let mut body = String::new();
+    let mut used = (header.len() + 1 + meta_lines.len()) / 4;
+    let mut truncated_at: Option<usize> = None;
+
+    for (idx, sec) in sections.iter().enumerate() {
+        if idx < resume_at {
+            continue;
+        }
+        let sec_tokens = sec.len() / 4;
+        if idx > resume_at && used + sec_tokens > budget {
+            truncated_at = Some(idx);
+            break;
+        }
+        used += sec_tokens;
+        body.push_str(sec);
+    }
+
+    if let Some(idx) = truncated_at {
+        let omitted = sections.len().saturating_sub(idx);
+        header.push_str(&format!(
+            " (truncated by token_budget; +{omitted} section(s) omitted)"
+        ));
+    }
+    let mut out = format!("{header}\n{meta_lines}{body}");
+    if let Some(idx) = truncated_at {
+        let omitted = sections.len().saturating_sub(idx);
+        continuation::append_footer(
+            &mut out,
+            "commit_scope",
+            args_fp,
+            idx as u64,
+            KIND_SCOPE_SKIP,
+            &format!("+{omitted} section(s) omitted"),
+        );
     }
     stats::record(
         "commit_scope",
@@ -310,20 +377,69 @@ fn untracked_bucket(path: &str) -> String {
     }
 }
 
-/// List modified and staged paths in full. Collapse untracked files to a
-/// directory count so a dirty tree does not dump every new file.
+/// List modified and staged paths up to `DEFAULT_PER_SCOPE_CAP`, collapsing
+/// overflow and untracked files to directory counts so huge dirty trees stay bounded.
+#[cfg(test)]
 fn append_paths(out: &mut String, members: &[&Dirty]) {
+    append_paths_capped(out, members, DEFAULT_PER_SCOPE_CAP);
+}
+
+fn append_paths_capped(out: &mut String, members: &[&Dirty], max_tracked: usize) {
+    let mut tracked_shown = 0usize;
+    let mut tracked_overflow: BTreeMap<String, usize> = BTreeMap::new();
+    let mut tracked_extra = 0usize;
     let mut untracked: BTreeMap<String, usize> = BTreeMap::new();
+
     for d in members {
         if is_untracked(&d.status) {
             *untracked.entry(untracked_bucket(&d.path)).or_default() += 1;
-        } else {
+        } else if tracked_shown < max_tracked {
             out.push_str(&format!("  {} {}\n", d.status, d.path));
+            tracked_shown += 1;
+        } else {
+            tracked_extra += 1;
+            *tracked_overflow
+                .entry(untracked_bucket(&d.path))
+                .or_default() += 1;
         }
     }
-    for (dir, n) in untracked {
-        let label = if dir == "." { "repo root" } else { dir.as_str() };
-        out.push_str(&format!("  ?? {label}/ ({n} untracked)\n"));
+
+    if tracked_extra > 0 {
+        let dirs: Vec<String> = tracked_overflow
+            .iter()
+            .take(6)
+            .map(|(dir, n)| {
+                let label = if dir == "." { "repo root" } else { dir.as_str() };
+                format!("{label}/ ({n})")
+            })
+            .collect();
+        let more_dirs = if tracked_overflow.len() > 6 {
+            format!(", +{} more dir(s)", tracked_overflow.len() - 6)
+        } else {
+            String::new()
+        };
+        out.push_str(&format!(
+            "  … +{tracked_extra} more tracked across {} dir(s): {}{more_dirs}\n",
+            tracked_overflow.len(),
+            dirs.join(", ")
+        ));
+    }
+
+    let total_untracked_dirs = untracked.len();
+    let mut extra_untracked_files = 0usize;
+    for (idx, (dir, n)) in untracked.into_iter().enumerate() {
+        if idx < UNTRACKED_BUCKET_CAP {
+            let label = if dir == "." { "repo root" } else { dir.as_str() };
+            out.push_str(&format!("  ?? {label}/ ({n} untracked)\n"));
+        } else {
+            extra_untracked_files += n;
+        }
+    }
+    if total_untracked_dirs > UNTRACKED_BUCKET_CAP {
+        out.push_str(&format!(
+            "  … (+{} more untracked dir(s), {extra_untracked_files} file(s))\n",
+            total_untracked_dirs - UNTRACKED_BUCKET_CAP
+        ));
     }
 }
 
@@ -425,5 +541,62 @@ mod tests {
         let ignore = vec!["pacman-overlay".into()];
         assert!(path_matches_ignore("pacman-overlay/pkg", &ignore));
         assert!(!path_matches_ignore("src/pacman-overlay.rs", &ignore));
+    }
+
+    #[test]
+    fn per_scope_tracked_collapse_and_continuation_paging() {
+        let members = vec![
+            Dirty { status: " M".into(), path: "src/a.rs".into(), size: None },
+            Dirty { status: " M".into(), path: "src/b.rs".into(), size: None },
+            Dirty { status: " M".into(), path: "src/sub/c.rs".into(), size: None },
+            Dirty { status: " M".into(), path: "src/sub/d.rs".into(), size: None },
+        ];
+        let refs: Vec<&Dirty> = members.iter().collect();
+        let mut collapsed = String::new();
+        append_paths_capped(&mut collapsed, &refs, 2);
+        assert!(collapsed.contains(" M src/a.rs"), "{collapsed}");
+        assert!(collapsed.contains(" M src/b.rs"), "{collapsed}");
+        assert!(collapsed.contains("+2 more tracked"), "{collapsed}");
+        assert!(collapsed.contains("src/sub/ (2)"), "{collapsed}");
+
+        // End-to-end continuation paging over a real git working tree with multiple scopes.
+        let dir = std::env::temp_dir().join(format!("wk_cs_page_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("alpha")).unwrap();
+        std::fs::create_dir_all(dir.join("beta")).unwrap();
+        std::fs::create_dir_all(dir.join(".wordkeep")).unwrap();
+        std::fs::write(
+            dir.join(".wordkeep/config.json"),
+            r#"{"commit_scopes":{"alpha":["alpha"],"beta":["beta"]}}"#,
+        )
+        .unwrap();
+        assert!(Command::new("git").arg("init").current_dir(&dir).status().unwrap().success());
+        assert!(Command::new("git").args(["config", "user.email", "t@t"]).current_dir(&dir).status().unwrap().success());
+        assert!(Command::new("git").args(["config", "user.name", "t"]).current_dir(&dir).status().unwrap().success());
+        std::fs::write(dir.join("alpha/one.rs"), "fn a() {}\n").unwrap();
+        std::fs::write(dir.join("beta/two.rs"), "fn b() {}\n").unwrap();
+        assert!(Command::new("git").args(["add", "."]).current_dir(&dir).status().unwrap().success());
+        assert!(Command::new("git").args(["commit", "-m", "init"]).current_dir(&dir).status().unwrap().success());
+        std::fs::write(dir.join("alpha/one.rs"), "fn a() { 1; }\n").unwrap();
+        std::fs::write(dir.join("beta/two.rs"), "fn b() { 2; }\n").unwrap();
+
+        let p1 = propose(&dir, &serde_json::json!({ "token_budget": 20 })).unwrap();
+        assert!(p1.contains("scope `alpha`"), "{p1}");
+        assert!(!p1.contains("scope `beta`"), "{p1}");
+        assert!(p1.contains("truncated by token_budget"), "{p1}");
+        let tok = p1
+            .lines()
+            .find_map(|l| l.strip_prefix("continuation: ").map(str::trim))
+            .expect("continuation token");
+
+        let p2 = propose(
+            &dir,
+            &serde_json::json!({ "token_budget": 20, "continuation": tok }),
+        )
+        .unwrap();
+        assert!(p2.contains("[continuation from scope #1]"), "{p2}");
+        assert!(p2.contains("scope `beta`"), "{p2}");
+        assert!(!p2.contains("scope `alpha`"), "{p2}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

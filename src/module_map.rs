@@ -98,7 +98,17 @@ pub fn build(root: &Path, args: &Value) -> Result<String, String> {
         Some(visible.len() as u64),
         "module_map: done",
     );
-    stats::record("module_map", adj.scanned_bytes / 4, (out.len() / 4) as u64);
+    stats::record_ext(
+        "module_map",
+        stats::RecordMeta {
+            baseline: adj.scanned_bytes / 4,
+            returned: (out.len() / 4) as u64,
+            bytes_read: adj.bytes_read,
+            cache_hits: adj.cache_hits,
+            cache_misses: adj.cache_misses,
+            reason: None,
+        },
+    );
     Ok(out)
 }
 

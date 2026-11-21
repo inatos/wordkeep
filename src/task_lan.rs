@@ -506,7 +506,28 @@ pub fn submit(root: &Path, args: &Value) -> Result<String, String> {
     write_task(root, &task_id, &rec)?;
 
     if wait {
-        let status = child.wait().map_err(|e| e.to_string())?;
+        let status = if crate::mcp::is_async_task_context() {
+            loop {
+                if crate::mcp::is_current_task_cancelled() {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    if let Some(obj) = rec.as_object_mut() {
+                        obj.insert("status".into(), json!("cancelled"));
+                        obj.insert("finished_at".into(), json!(now_secs()));
+                    }
+                    let _ = write_task(root, &task_id, &rec);
+                    notify_terminal(root, &rec, "cancelled");
+                    release_gpu_lease(root, &lease_id);
+                    return Err("task_submit cancelled".into());
+                }
+                match child.try_wait().map_err(|e| e.to_string())? {
+                    Some(st) => break st,
+                    None => std::thread::sleep(std::time::Duration::from_millis(25)),
+                }
+            }
+        } else {
+            child.wait().map_err(|e| e.to_string())?
+        };
         let code = status.code().unwrap_or(-1);
         let terminal = if status.success() { "done" } else { "failed" };
         if let Some(obj) = rec.as_object_mut() {
@@ -523,7 +544,9 @@ pub fn submit(root: &Path, args: &Value) -> Result<String, String> {
         mirror_craft_receipt(root, &rec);
         notify_terminal(root, &rec, terminal);
         release_gpu_lease(root, &lease_id);
-        return Ok(serde_json::to_string_pretty(&rec).unwrap_or_else(|_| "{}".into()));
+        let pretty = serde_json::to_string_pretty(&rec).unwrap_or_else(|_| "{}".into());
+        crate::mcp::set_structured_content(rec);
+        return Ok(pretty);
     }
 
     let mut guard = ACTIVE.lock().map_err(|e| e.to_string())?;
@@ -533,7 +556,9 @@ pub fn submit(root: &Path, args: &Value) -> Result<String, String> {
         last_progress_phase: None,
     });
     mirror_craft_receipt(root, &rec);
-    Ok(serde_json::to_string_pretty(&rec).unwrap_or_else(|_| "{}".into()))
+    let pretty = serde_json::to_string_pretty(&rec).unwrap_or_else(|_| "{}".into());
+    crate::mcp::set_structured_content(rec);
+    Ok(pretty)
 }
 
 pub fn status(root: &Path, args: &Value) -> Result<String, String> {
@@ -603,6 +628,17 @@ pub fn fetch(root: &Path, args: &Value) -> Result<String, String> {
         "files": files,
     }))
     .unwrap_or_else(|_| "{}".into()))
+}
+
+/// Best-effort cancel of any currently active background Palaestra task (invoked by MCP `tasks/cancel`).
+pub fn cancel_active(root: &Path) {
+    let active_id = ACTIVE
+        .lock()
+        .ok()
+        .and_then(|g| g.as_ref().map(|a| a.task_id.clone()));
+    if let Some(tid) = active_id {
+        let _ = cancel(root, &json!({ "task_id": tid }));
+    }
 }
 
 pub fn cancel(root: &Path, args: &Value) -> Result<String, String> {
@@ -738,7 +774,9 @@ fn copper_status(root: &Path, args: &Value) -> Result<String, String> {
         obj.insert("prefer_copper".into(), json!(prefer));
         obj.insert("transport_hint".into(), json!(hint));
     }
-    Ok(serde_json::to_string_pretty(&out).unwrap_or_else(|_| "{}".into()))
+    let text = serde_json::to_string_pretty(&out).unwrap_or_else(|_| "{}".into());
+    crate::mcp::set_structured_content(out);
+    Ok(text)
 }
 
 fn dispatch(name: &str, root: &Path, args: &Value) -> Result<String, String> {
@@ -760,7 +798,7 @@ mod tests {
     static LOCK: Mutex<()> = Mutex::new(());
 
     fn isolated(name: &str) -> (std::sync::MutexGuard<'static, ()>, PathBuf) {
-        let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = crate::cache::test_env_lock();
         let cache = std::env::temp_dir().join(format!("wk_task_lan_cache_{name}_{}", std::process::id()));
         let root = std::env::temp_dir().join(format!("wk_task_lan_root_{name}_{}", std::process::id()));
         let _ = fs::remove_dir_all(&cache);

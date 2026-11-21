@@ -13,10 +13,13 @@ pub fn build(root: &Path, args: &Value) -> Result<String, String> {
     let budget = args
         .get("token_budget")
         .and_then(Value::as_u64)
-        .unwrap_or(2400) as usize;
-    let per_section = budget / 3;
+        .unwrap_or(1800) as usize;
+    let per_section = (budget / 3).max(400);
 
     progress::tick(0, Some(3), "trace_profile: summary");
+    if crate::mcp::is_current_task_cancelled() {
+        return Err("trace_profile cancelled".into());
+    }
     let mut trace_args = args.clone();
     if trace_args.get("sort_by").is_none() {
         trace_args["sort_by"] = json!("max");
@@ -30,9 +33,19 @@ pub fn build(root: &Path, args: &Value) -> Result<String, String> {
 
     let mut out = String::from("trace_profile - Tracy hitch workflow (sort_by=max default)\n\n");
     out.push_str("## 1. Zone ranking\n\n");
-    match trace::summary(root, &trace_args) {
-        Ok(t) => out.push_str(&t),
-        Err(e) => out.push_str(&format!("trace_summary error: {e}\n")),
+    let zone_ok = match trace::summary(root, &trace_args) {
+        Ok(t) => {
+            out.push_str(&t);
+            true
+        }
+        Err(e) => {
+            out.push_str(&format!("trace_summary error: {e}\n"));
+            false
+        }
+    };
+
+    if crate::mcp::is_current_task_cancelled() {
+        return Err("trace_profile cancelled".into());
     }
 
     if args.get("baseline").and_then(Value::as_str).is_some() {
@@ -59,12 +72,22 @@ pub fn build(root: &Path, args: &Value) -> Result<String, String> {
         Err(e) => out.push_str(&format!("diff_map error: {e}\n")),
     }
 
+    if crate::mcp::is_current_task_cancelled() {
+        return Err("trace_profile cancelled".into());
+    }
+
     out.push_str("\n\n## 3. Index freshness (index_stale)\n\n");
     let stale_args = json!({ "ref": gitref, "token_budget": per_section / 2 });
     match index_stale::check(root, &stale_args) {
         Ok(s) => out.push_str(&s),
         Err(e) => out.push_str(&format!("index_stale error: {e}\n")),
     }
+
+    crate::mcp::set_structured_content(json!({
+        "git_ref": gitref,
+        "zone_ranking_ok": zone_ok,
+        "token_budget": budget,
+    }));
 
     stats::record(
         "trace_profile",

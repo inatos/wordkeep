@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Idempotent wiki/dashboard launcher for Cursor folder-open tasks.
-# Starts Meilisearch (compose) + wordkeep-wiki serve --watch --runtime-attach on :8787.
+# Starts wordkeep-wiki serve --watch --runtime-attach on :8787 using native workspace
+# SQLite FTS5 by default (WIKI_SEARCH_BACKEND=auto|sqlite|meili); Docker Meilisearch is
+# optional and only started when WIKI_SEARCH_BACKEND=meili or MEILI_URL/WIKI_MEILI_URL is set.
 # On each run: rebuild wordkeep-wiki into $WK/target when missing or older than sources.
 # Opt out of attach: WIKI_RUNTIME_ATTACH=0 ./wiki.sh
 # Opt out of auto-rebuild: WIKI_AUTO_REBUILD=0 ./wiki.sh
@@ -17,6 +19,8 @@ else
   ROOT="$(cd "$WK/../.." && pwd)"
 fi
 export CARGO_TARGET_DIR="$WK/target"
+BUILD_LOCK="${WORDKEEP_BUILD_LOCK:-$ROOT/.wordkeep/build.lock}"
+WIKI_BIND_LOCK="${WORDKEEP_WIKI_BIND_LOCK:-$ROOT/.wordkeep/wiki-bind.lock}"
 
 BIND="${WIKI_BIND:-127.0.0.1:8787}"
 PORT="${BIND##*:}"
@@ -47,6 +51,36 @@ wordkeep_features() {
   # Vulkan llama.cpp by default (n_gpu_layers offload). CPU-only:
   # WORDKEEP_FEATURES=embeddings,daslang,dashboard,ereshkigal
   wordkeep_default_features
+}
+
+# Shared with mcp.sh so concurrent Cargo builds never stampede.
+wordkeep_with_build_lock() {
+  mkdir -p "$(dirname "$BUILD_LOCK")"
+  (
+    flock 8
+    "$@"
+  ) 8>>"$BUILD_LOCK"
+}
+
+# Acquire exclusive wiki-bind lock (held for the rest of this launcher).
+# Prevents concurrent wiki.sh from racing cargo restart + Address already in use.
+wordkeep_acquire_wiki_bind_lock() {
+  mkdir -p "$(dirname "$WIKI_BIND_LOCK")" "$STATE_DIR"
+  exec 7>>"$WIKI_BIND_LOCK" || {
+    echo "[wordkeep:wiki] warning: could not open $WIKI_BIND_LOCK" >&2
+    return 0
+  }
+  if flock -n 7; then
+    return 0
+  fi
+  local holder
+  holder="$(cat "$PIDFILE" 2>/dev/null || echo unknown)"
+  if ui_up; then
+    echo "[wordkeep:wiki] bind lock held (pid ${holder}); already serving http://${BIND}"
+    exit 0
+  fi
+  echo "[wordkeep:wiki] waiting on wiki-bind.lock (holder pid ${holder}) …" >&2
+  flock 7
 }
 
 # Dashboard reads $XDG_CACHE_HOME/wordkeep/savings.json (same file MCP writes).
@@ -185,8 +219,12 @@ build_wiki_bin() {
       wordkeep_wipe_cpu_llama_sys
       ;;
   esac
-  (cd "$WK" && CARGO_TARGET_DIR="$WK/target" cargo build -p wordkeep-wiki --release \
-    && CARGO_TARGET_DIR="$WK/target" cargo build -p wordkeep --release --features "$feats")
+  wordkeep_with_build_lock bash -c "
+    set -euo pipefail
+    cd \"$WK\"
+    CARGO_TARGET_DIR=\"$WK/target\" cargo build -p wordkeep-wiki --release
+    CARGO_TARGET_DIR=\"$WK/target\" cargo build -p wordkeep --release --features \"$feats\"
+  "
   REBUILT_BIN=1
 }
 
@@ -451,6 +489,8 @@ elif ui_up; then
   stop_existing
 fi
 
+wordkeep_acquire_wiki_bind_lock
+
 ensure_wiki_bin
 
 if [[ "$REBUILT_BIN" -eq 1 ]]; then
@@ -561,7 +601,39 @@ fi
   return 0
 }
 
-ensure_meilisearch || true
+want_meilisearch() {
+  local mode="${WIKI_SEARCH_BACKEND:-}"
+  if [[ -z "$mode" && -f "$ROOT/.wordkeep/config.json" ]]; then
+    mode="$(sed -n 's/.*"search_backend"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$ROOT/.wordkeep/config.json" | head -n1)"
+  fi
+  mode="$(printf '%s' "${mode:-auto}" | tr '[:upper:]' '[:lower:]')"
+  case "$mode" in
+    sqlite|fts5)
+      return 1
+      ;;
+    meili|meilisearch)
+      return 0
+      ;;
+    auto|"")
+      if [[ -n "${WIKI_MEILI_URL:-}" || -n "${MEILI_URL:-}" ]]; then
+        return 0
+      fi
+      if [[ -f "$ROOT/.wordkeep/config.json" ]] && grep -Eq '"meili_url"[[:space:]]*:[[:space:]]*"[^"]+"' "$ROOT/.wordkeep/config.json" 2>/dev/null; then
+        return 0
+      fi
+      return 1
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+if want_meilisearch; then
+  ensure_meilisearch || true
+else
+  echo "[wordkeep:wiki] search backend: ${WIKI_SEARCH_BACKEND:-auto} (native SQLite FTS5 — Docker Meilisearch skipped)" >&2
+fi
 
 if ! ensure_ui_dist; then
   exit 1

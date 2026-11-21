@@ -31,6 +31,8 @@ struct Layout {
 pub fn build(root: &Path, args: &Value) -> Result<String, String> {
     let raw = args
         .get("type")
+        .or_else(|| args.get("symbol"))
+        .or_else(|| args.get("name"))
         .and_then(Value::as_str)
         .unwrap_or("")
         .trim();
@@ -88,10 +90,8 @@ pub fn layout_block(
         let base = root.join(p);
         // Deterministic order so "first match wins" is stable across runs.
         let mut files: Vec<PathBuf> = walk::files(&base, &prune)
-            .filter_map(|e| {
-                let path = e.path().to_path_buf();
-                matches!(Lang::from_path(&path), Some(Lang::Cpp) | Some(Lang::Rust)).then_some(path)
-            })
+            .into_iter()
+            .filter(|path| matches!(Lang::from_path(path), Some(Lang::Cpp) | Some(Lang::Rust)))
             .collect();
         files.sort();
         for path in files {
@@ -449,6 +449,18 @@ mod tests {
         write(&dir, "src/a.hpp", "struct Other { int x; };\n");
         let out = build(&dir, &serde_json::json!({ "type": "Nope" })).unwrap();
         assert!(out.contains("no struct/class/union"), "{out}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn accepts_symbol_and_name_aliases() {
+        let dir = std::env::temp_dir().join(format!("cbtest_layout_alias_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        write(&dir, "src/a.hpp", "struct Vec2 { float x; float y; };\n");
+        let by_sym = build(&dir, &serde_json::json!({ "symbol": "Vec2" })).unwrap();
+        assert!(by_sym.contains("Vec2") && by_sym.contains("float") && by_sym.contains("POD"), "{by_sym}");
+        let by_name = build(&dir, &serde_json::json!({ "name": "Vec2" })).unwrap();
+        assert!(by_name.contains("Vec2") && by_name.contains("float") && by_name.contains("POD"), "{by_name}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

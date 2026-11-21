@@ -20,9 +20,67 @@ pub fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {
     LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Redirect durable Wordkeep caches away from `~/.cache/wordkeep` during unit
+/// tests so workspaces/ and semif-events.jsonl never pollute the user cache.
+/// Honors an already-set `XDG_CACHE_HOME` (eval harnesses / per-test temps).
+/// Opt out with `WORDKEEP_TEST_CACHE_ALLOW_USER=1`.
+#[cfg(test)]
+pub fn ensure_test_cache_home() {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        if std::env::var_os("WORDKEEP_TEST_CACHE_ALLOW_USER").is_some() {
+            return;
+        }
+        if std::env::var_os("XDG_CACHE_HOME").is_some() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!(
+            "wordkeep-test-cache-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        std::env::set_var("XDG_CACHE_HOME", &dir);
+    });
+}
+
 /// Root directory for all on-disk caches.
 pub fn dir() -> PathBuf {
+    #[cfg(test)]
+    ensure_test_cache_home();
     wordkeep_knowledge::wordkeep_cache_dir()
+}
+
+#[cfg(test)]
+mod test_isolation {
+    use super::*;
+
+    #[test]
+    fn unit_tests_do_not_default_to_user_cache() {
+        let _g = test_env_lock();
+        // Force the ensure path even if a prior test set XDG.
+        std::env::remove_var("WORDKEEP_TEST_CACHE_ALLOW_USER");
+        ensure_test_cache_home();
+        let d = dir();
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        if let Some(h) = home {
+            let user = h.join(".cache/wordkeep");
+            assert_ne!(
+                d, user,
+                "unit-test cache must not be ~/.cache/wordkeep (got {})",
+                d.display()
+            );
+        }
+        assert!(
+            d.to_string_lossy().contains("wordkeep"),
+            "expected wordkeep cache path, got {}",
+            d.display()
+        );
+    }
 }
 
 /// Modified time as whole nanoseconds since the Unix epoch (`0` if unavailable).
@@ -87,6 +145,7 @@ impl DiskMap {
     }
 
     /// Remove an entry; returns whether a key was present.
+    #[allow(dead_code)]
     pub fn remove(&mut self, key: &str) -> bool {
         if self.map.remove(key).is_some() {
             self.dirty = true;

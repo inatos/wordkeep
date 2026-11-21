@@ -349,6 +349,7 @@ pub fn semif_peer_djev_url(root: &Path) -> Option<String> {
 }
 
 /// Optional mmproj GGUF for vision logits (`semif.mmproj` or `ERESHKIGAL_MMPROJ`).
+#[allow(dead_code)] // Wired when OCT / vision SemIf path is enabled (default-off).
 pub fn semif_mmproj_path(root: &Path) -> Option<PathBuf> {
     if let Ok(p) = std::env::var("ERESHKIGAL_MMPROJ") {
         if !p.trim().is_empty() {
@@ -906,11 +907,10 @@ pub fn basename_matches(
         if !start.is_dir() {
             continue;
         }
-        for entry in walk::files(&start, prune) {
-            if entry.file_name().to_string_lossy() == name {
-                let p = entry.into_path();
-                if !matches.contains(&p) {
-                    matches.push(p);
+        for path in walk::files(&start, prune) {
+            if path.file_name().map(|n| n.to_string_lossy() == name).unwrap_or(false) {
+                if !matches.contains(&path) {
+                    matches.push(path);
                 }
             }
         }
@@ -952,6 +952,7 @@ pub fn coverage_hint(root: &Path, paths: &[String]) -> String {
 }
 
 /// Card kinds rendered by the wiki telemetry dashboard (provider-generic).
+#[allow(dead_code)] // Parsed for wiki Providers board; bin may not call yet.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TelemetryCardKind {
     Metric,
@@ -961,6 +962,7 @@ pub enum TelemetryCardKind {
     Activity,
 }
 
+#[allow(dead_code)]
 impl TelemetryCardKind {
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -985,6 +987,7 @@ impl TelemetryCardKind {
 }
 
 /// One chart/metric card declared under a telemetry provider.
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TelemetryCardSpec {
     pub kind: TelemetryCardKind,
@@ -998,6 +1001,7 @@ pub struct TelemetryCardSpec {
 }
 
 /// Config-declared telemetry sidecar provider (fabric-agnostic).
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TelemetryProviderSpec {
     pub name: String,
@@ -1008,10 +1012,13 @@ pub struct TelemetryProviderSpec {
     pub cards: Vec<TelemetryCardSpec>,
 }
 
+#[allow(dead_code)]
 const DEFAULT_PROVIDER_REFRESH_SECS: u64 = 30;
+#[allow(dead_code)]
 const DEFAULT_PROVIDER_STALE_MULT: u64 = 3;
 
 /// Parse `telemetry_providers` from `.wordkeep/config.json` (empty when missing).
+#[allow(dead_code)]
 pub fn telemetry_providers(root: &Path) -> Result<Vec<TelemetryProviderSpec>, String> {
     let Some(cfg) = load_config(root) else {
         return Ok(Vec::new());
@@ -1020,6 +1027,7 @@ pub fn telemetry_providers(root: &Path) -> Result<Vec<TelemetryProviderSpec>, St
 }
 
 /// Parse provider specs from an already-loaded config document.
+#[allow(dead_code)]
 pub fn parse_telemetry_providers(cfg: &Value) -> Result<Vec<TelemetryProviderSpec>, String> {
     let Some(arr) = cfg.get("telemetry_providers").and_then(Value::as_array) else {
         return Ok(Vec::new());
@@ -1157,12 +1165,14 @@ mod tests {
 
     #[test]
     fn semif_defaults_and_overrides() {
+        let _guard = crate::cache::test_env_lock();
         let dir = tmp("semif");
         // Parallel cargo tests may leak WORDKEEP_SEMIF_BACKEND / ERESHKIGAL_BACKEND.
         std::env::remove_var("WORDKEEP_SEMIF_BACKEND");
         std::env::remove_var("ERESHKIGAL_BACKEND");
         std::env::remove_var("ERESHKIGAL_ADAPTER_SCALE");
         std::env::remove_var("ERESHKIGAL_TEMPERATURE");
+        std::env::remove_var("ERESHKIGAL_N_SEQ_MAX");
         assert!(semif_enabled(&dir));
         assert_eq!(semif_backend(&dir), default_semif_backend());
         assert_eq!(semif_knowledge_debias(&dir), "none");
@@ -1190,6 +1200,7 @@ mod tests {
 
     #[test]
     fn semif_n_seq_max_allows_shared_wavefront_size() {
+        let _guard = crate::cache::test_env_lock();
         let dir = tmp("n_seq");
         std::env::remove_var("ERESHKIGAL_N_SEQ_MAX");
         fs::write(
@@ -1212,6 +1223,7 @@ mod tests {
 
     #[test]
     fn semif_max_prompt_tokens_defaults_and_overrides() {
+        let _guard = crate::cache::test_env_lock();
         let dir = tmp("max_prompt");
         std::env::remove_var("ERESHKIGAL_MAX_PROMPT_TOKENS");
         assert_eq!(semif_max_prompt_tokens(&dir), 1024);
@@ -1229,6 +1241,7 @@ mod tests {
 
     #[test]
     fn semif_adapter_scale_env_overrides_config() {
+        let _guard = crate::cache::test_env_lock();
         let dir = tmp("adapter_scale_env");
         fs::write(
             dir.join(".wordkeep/config.json"),
@@ -1245,6 +1258,7 @@ mod tests {
 
     #[test]
     fn semif_n_gpu_layers_env_overrides_config() {
+        let _guard = crate::cache::test_env_lock();
         let dir = tmp("n_gpu_env");
         fs::write(
             dir.join(".wordkeep/config.json"),
@@ -1261,6 +1275,7 @@ mod tests {
 
     #[test]
     fn semif_backend_env_overrides_config() {
+        let _guard = crate::cache::test_env_lock();
         let dir = tmp("backend_env");
         fs::write(
             dir.join(".wordkeep/config.json"),

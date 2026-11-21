@@ -66,12 +66,12 @@ pub fn build(root: &Path, args: &Value) -> Result<String, String> {
 
     for p in &paths {
         let base = root.join(p);
-        for entry in walk::files(&base, &prune) {
-            let path = entry.path();
+        for path_owned in walk::files(&base, &prune) {
+            let path = path_owned.as_path();
             if Lang::from_path(path) != Some(Lang::Cpp) {
                 continue;
             }
-            if let Ok(meta) = entry.metadata() {
+            if let Ok(meta) = path.metadata() {
                 scanned_bytes += meta.len();
             }
             let Ok(src) = std::fs::read_to_string(path) else {

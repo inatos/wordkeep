@@ -57,6 +57,14 @@ fn required_str(args: &Value, key: &str) -> Result<String, String> {
     optional_str(args, key).ok_or_else(|| format!("{key} is required"))
 }
 
+fn normalize_status(raw: &str) -> String {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "pass" | "ok" => "passed".to_string(),
+        "fail" => "failed".to_string(),
+        other => other.to_string(),
+    }
+}
+
 fn validate_status(s: &str) -> Result<(), String> {
     match s {
         "running" | "passed" | "failed" | "cancelled" => Ok(()),
@@ -177,7 +185,9 @@ fn missing_flags(root: &Path, r: &Run) -> Vec<String> {
 pub fn record(root: &Path, args: &Value) -> Result<String, String> {
     crate::tacet::gate_write(root, "run_record")?;
     let command = required_str(args, "command")?;
-    let status = optional_str(args, "status").unwrap_or_else(|| "running".into());
+    let status = optional_str(args, "status")
+        .map(|s| normalize_status(&s))
+        .unwrap_or_else(|| "running".into());
     validate_status(&status)?;
     let summary = optional_str(args, "summary").unwrap_or_default();
     let exit_code = args.get("exit_code").and_then(Value::as_i64);
@@ -252,7 +262,7 @@ pub fn record(root: &Path, args: &Value) -> Result<String, String> {
 
 /// Filter recent run history.
 pub fn history(root: &Path, args: &Value) -> Result<String, String> {
-    let status_filter = optional_str(args, "status");
+    let status_filter = optional_str(args, "status").map(|s| normalize_status(&s));
     let tag = optional_str(args, "tag");
     let limit = args
         .get("limit")
@@ -484,6 +494,19 @@ mod tests {
         let out = history(&root, &json!({"status":"failed"})).unwrap();
         assert!(out.contains("r1"));
         assert!(out.contains("boom"));
+
+        // Coerce pass/ok -> passed and fail -> failed
+        let p1 = record(&root, &json!({"id":"r2","command":"cargo test","status":"pass"})).unwrap();
+        assert!(p1.contains("status=passed"), "{p1}");
+        let p2 = record(&root, &json!({"id":"r3","command":"cargo check","status":"ok"})).unwrap();
+        assert!(p2.contains("status=passed"), "{p2}");
+        let f1 = record(&root, &json!({"id":"r4","command":"ctest","status":"fail"})).unwrap();
+        assert!(f1.contains("status=failed"), "{f1}");
+        let passed_hist = history(&root, &json!({"status":"pass"})).unwrap();
+        assert!(passed_hist.contains("r2") && passed_hist.contains("r3"), "{passed_hist}");
+        let failed_hist = history(&root, &json!({"status":"fail"})).unwrap();
+        assert!(failed_hist.contains("r4"), "{failed_hist}");
+
         let _ = fs::remove_dir_all(&root);
         let _ = fs::remove_dir_all(&cache);
     }
